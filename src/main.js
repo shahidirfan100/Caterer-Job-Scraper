@@ -27,7 +27,12 @@ async function main() {
         } catch (error) {
             log.error('Error in Actor.getInput():', error);
             log.error('Error details:', { name: error.name, message: error.message, validationErrors: error.validationErrors });
-            throw error;
+            if (error.name === 'ArgumentError') {
+                log.warning('Input validation failed, using default empty input');
+                input = {};
+            } else {
+                throw error;
+            }
         }
         input = input || {};
         log.info('Raw input received:', input);
