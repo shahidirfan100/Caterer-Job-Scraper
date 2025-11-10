@@ -22,12 +22,6 @@
       "description": "Location to search for jobs (e.g., 'London', 'Manchester', 'Birmingham'). Leave empty for all locations.",
       "editor": "textfield"
     },
-    "category": {
-      "title": "Category (optional)",
-      "type": "string",
-      "description": "Optional job category to filter by (as used on Caterer.com).",
-      "editor": "textfield"
-    },
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
