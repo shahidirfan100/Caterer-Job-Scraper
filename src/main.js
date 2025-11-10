@@ -3,6 +3,7 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
+import fs from 'fs/promises';
 
 // Try to import header-generator, fallback if not available
 let HeaderGenerator;
@@ -15,10 +16,20 @@ try {
 }
 
 // Single-entrypoint main
-await Actor.init();
+// Install useful global handlers to capture unexpected errors during runtime
+process.on('unhandledRejection', (reason, p) => {
+    log && log.error && log.error('Unhandled Rejection at:', { reason, promise: p });
+    console.error('Unhandled Rejection at:', reason);
+});
+process.on('uncaughtException', (err) => {
+    log && log.error && log.error('Uncaught Exception thrown:', err.stack || err);
+    console.error('Uncaught Exception thrown:', err.stack || err);
+});
 
 async function main() {
     try {
+        // Initialize Actor inside main so initialization errors are captured by main() try/catch
+        await Actor.init();
         log.info('Starting actor initialization...');
         let input;
         try {
@@ -27,9 +38,16 @@ async function main() {
         } catch (error) {
             log.error('Error in Actor.getInput():', error);
             log.error('Error details:', { name: error.name, message: error.message, validationErrors: error.validationErrors });
-            if (error.name === 'ArgumentError') {
-                log.warning('Input validation failed, using default empty input');
-                input = {};
+            if (error && error.name === 'ArgumentError') {
+                // Try to fall back to a local INPUT.json if present (useful for local runs or malformed platform input)
+                try {
+                    const raw = await fs.readFile(new URL('../INPUT.json', import.meta.url));
+                    input = JSON.parse(String(raw));
+                    log.warning('Loaded fallback INPUT.json from repository root');
+                } catch (fsErr) {
+                    log.warning('Could not read fallback INPUT.json, using empty input instead:', fsErr.message || fsErr);
+                    input = {};
+                }
             } else {
                 throw error;
             }
