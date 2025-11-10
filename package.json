@@ -12,6 +12,6 @@
     "cheerio": "^1.0.0-rc.12",
     "got-scraping": "^4.0.3",
     "jsdom": "^27.1.0",
-  "header-generator": "^2.1.75"
+    "header-generator": "^2.1.75"
   }
 }

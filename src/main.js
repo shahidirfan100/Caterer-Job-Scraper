@@ -3,7 +3,16 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
-import HeaderGenerator from 'header-generator';
+
+// Try to import header-generator, fallback if not available
+let HeaderGenerator;
+try {
+    const hg = await import('header-generator');
+    HeaderGenerator = hg.default;
+} catch (error) {
+    log.warning('header-generator not available, using fallback headers:', error.message);
+    HeaderGenerator = null;
+}
 
 // Single-entrypoint main
 await Actor.init();
@@ -42,12 +51,31 @@ async function main() {
 
         // Dynamic header generation for anti-bot evasion
         const getHeaders = () => {
-            const headerGenerator = new HeaderGenerator({
-                browsers: ['chrome', 'firefox'],
-                operatingSystems: ['windows', 'macos', 'linux'],
-                devices: ['desktop'],
-            });
-            return headerGenerator.getHeaders();
+            try {
+                const headerGenerator = new HeaderGenerator({
+                    browsers: ['chrome', 'firefox'],
+                    operatingSystems: ['windows', 'macos', 'linux'],
+                    devices: ['desktop'],
+                });
+                return headerGenerator.getHeaders();
+            } catch (error) {
+                log.warning('HeaderGenerator failed, using fallback headers:', error.message);
+                // Fallback headers if header-generator fails
+                return {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Cache-Control': 'max-age=0',
+                };
+            }
         };
 
         const toAbs = (href, base = 'https://www.caterer.com') => {
@@ -78,13 +106,16 @@ async function main() {
 
         // Defensive proxyConfiguration handling
         let proxyConf = undefined;
-        if (input.proxyConfiguration && typeof input.proxyConfiguration === 'object') {
+        if (proxyConfiguration && typeof proxyConfiguration === 'object') {
             try {
-                proxyConf = await Actor.createProxyConfiguration({ ...input.proxyConfiguration });
+                proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
+                log.info('Proxy configuration created successfully');
             } catch (e) {
-                log.error('Invalid proxyConfiguration:', input.proxyConfiguration, e);
-                throw new Error('INPUT_ERROR: Invalid proxyConfiguration.');
+                log.warning('Failed to create proxy configuration, proceeding without proxy:', e.message);
+                proxyConf = undefined;
             }
+        } else {
+            log.info('No proxy configuration provided, proceeding without proxy');
         }
 
         let saved = 0;
