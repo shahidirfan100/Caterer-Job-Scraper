@@ -10,12 +10,26 @@
       "description": "Start scraping from a specific Caterer.com search URL. If provided, this will be used instead of Keyword/Location.",
       "editor": "textfield"
     },
+    "url": {
+      "title": "URL (alternative to startUrl)",
+      "type": "string",
+      "description": "Alternative field for start URL.",
+      "editor": "textfield"
+    },
+    "startUrls": {
+      "title": "Start URLs (array)",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Array of Caterer.com search URLs to start scraping from.",
+      "editor": "json"
+    },
     "keyword": {
       "title": "Keyword (if not using Start URL)",
       "type": "string",
       "description": "Job search keyword(s), e.g., 'Head Chef', 'Restaurant Manager', 'Sous Chef', 'Bartender'.",
-      "editor": "textfield",
-      "prefill": "head chef"
+      "editor": "textfield"
     },
     "location": {
       "title": "Location (if not using Start URL)",
@@ -60,5 +74,5 @@
     }
   },
   "required": [],
-  "additionalProperties": false
+  "additionalProperties": true
 }

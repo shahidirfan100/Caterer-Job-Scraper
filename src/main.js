@@ -19,7 +19,17 @@ await Actor.init();
 
 async function main() {
     try {
-        const input = (await Actor.getInput()) || {};
+        log.info('Starting actor initialization...');
+        let input;
+        try {
+            input = await Actor.getInput();
+            log.info('Actor.getInput() succeeded');
+        } catch (error) {
+            log.error('Error in Actor.getInput():', error);
+            log.error('Error details:', { name: error.name, message: error.message, validationErrors: error.validationErrors });
+            throw error;
+        }
+        input = input || {};
         log.info('Raw input received:', input);
         // Defensive defaults and type-casting for all fields
         const safeInt = (v, def) => (Number.isFinite(+v) && +v > 0 ? +v : def);
