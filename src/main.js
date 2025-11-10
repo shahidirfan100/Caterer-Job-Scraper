@@ -16,6 +16,12 @@ async function main() {
             max_pages: MAX_PAGES_RAW = 999, collectDetails = true, startUrl, startUrls, url, proxyConfiguration,
         } = input;
 
+        // Defensive input validation and logging
+        if (typeof input !== 'object' || Array.isArray(input)) {
+            log.error('Input must be a JSON object. Received:', input);
+            throw new Error('INPUT_ERROR: Input must be a JSON object.');
+        }
+
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
         
@@ -57,7 +63,16 @@ async function main() {
         if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location, category));
 
-        const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration({ ...proxyConfiguration }) : undefined;
+        // Defensive proxyConfiguration handling
+        let proxyConf = undefined;
+        if (input.proxyConfiguration && typeof input.proxyConfiguration === 'object') {
+            try {
+                proxyConf = await Actor.createProxyConfiguration({ ...input.proxyConfiguration });
+            } catch (e) {
+                log.error('Invalid proxyConfiguration:', input.proxyConfiguration, e);
+                throw new Error('INPUT_ERROR: Invalid proxyConfiguration.');
+            }
+        }
 
         let saved = 0;
 
