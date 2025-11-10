@@ -32,9 +32,9 @@
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description.",
+      "description": "If enabled, scraper opens job detail pages (Note: Caterer.com detail pages require authentication, so this extracts data from listing pages).",
       "editor": "checkbox",
-      "default": true
+      "default": false
     },
     "results_wanted": {
       "title": "Maximum number of jobs",

@@ -11,11 +11,13 @@ async function main() {
         const input = (await Actor.getInput()) || {};
         const {
             keyword = '', location = '', category = '', results_wanted: RESULTS_WANTED_RAW = 100,
-            max_pages: MAX_PAGES_RAW = 999, collectDetails = true, startUrl, startUrls, url, proxyConfiguration,
+            max_pages: MAX_PAGES_RAW = 999, collectDetails = false, startUrl, startUrls, url, proxyConfiguration,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+        
+        log.info('Starting Caterer.com Job Scraper', { keyword, location, category, results_wanted: RESULTS_WANTED, max_pages: MAX_PAGES });
 
         const toAbs = (href, base = 'https://www.caterer.com') => {
             try { return new URL(href, base).href; } catch { return null; }
@@ -29,7 +31,8 @@ async function main() {
         };
 
         const buildStartUrl = (kw, loc, cat) => {
-            const u = new URL('https://www.caterer.com/jobs');
+            // Caterer.com uses /jobs/search for search results
+            const u = new URL('https://www.caterer.com/jobs/search');
             if (kw) u.searchParams.set('keywords', String(kw).trim());
             if (loc) u.searchParams.set('location', String(loc).trim());
             if (cat) u.searchParams.set('category', String(cat).trim());
@@ -72,46 +75,43 @@ async function main() {
 
         function findJobLinks($, base) {
             const links = new Set();
-            // Caterer.com job links - adjust selectors based on actual site structure
-            $('.job-card a[href], .job-listing a[href], article.job a[href], .job-item a[href]').each((_, a) => {
+            // Caterer.com job URLs follow pattern: /job/{title-slug}/{company-slug}-job{id}
+            // Example: https://www.caterer.com/job/bar-staff/search-job106117278
+            $('a[href]').each((_, a) => {
                 const href = $(a).attr('href');
                 if (!href) return;
-                const abs = toAbs(href, base);
-                if (abs && /caterer\.com\/jobs\//i.test(abs)) links.add(abs);
-            });
-            // Fallback: look for any job-related links
-            if (links.size === 0) {
-                $('a[href]').each((_, a) => {
-                    const href = $(a).attr('href');
-                    if (!href) return;
-                    if (/\/jobs\/|job-\d+|vacancy/i.test(href)) {
-                        const abs = toAbs(href, base);
-                        if (abs) links.add(abs);
+                
+                // Match actual job posting URLs, not location/category links
+                // Job URLs: /job/{slug}/{company}-job{number}
+                // Exclude: /jobs/search/in-{location}, /jobs/{category}, /jobs?{params}
+                if (/^\/job\/[^\/]+\/[^\/]+-job\d+$/i.test(href) || 
+                    /caterer\.com\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href)) {
+                    const abs = toAbs(href, base);
+                    if (abs) {
+                        links.add(abs);
                     }
-                });
-            }
+                }
+            });
             return [...links];
         }
 
         function findNextPage($, base) {
-            // Try standard pagination patterns
-            const rel = $('a[rel="next"]').attr('href');
-            if (rel) return toAbs(rel, base);
-            
-            // Look for pagination with "Next" text
-            const next = $('a.pagination__next, a.next, .pagination a').filter((_, el) => {
-                const text = $(el).text().trim();
-                return /(^|\s)(next|›|»|>)(\s|$)/i.test(text);
+            // Caterer.com uses ?page=N pagination (seen in fetched HTML: ?page=2, ?page=3, etc.)
+            const nextLink = $('a[href*="page="]').filter((_, el) => {
+                const text = $(el).text().trim().toLowerCase();
+                return text === 'next' || text.includes('next');
             }).first().attr('href');
-            if (next) return toAbs(next, base);
             
-            // Look for numbered pagination - find current page and get next
-            const currentPage = $('.pagination .active, .pagination .current').text().trim();
-            if (currentPage) {
-                const nextPageNum = parseInt(currentPage) + 1;
-                const nextLink = $(`.pagination a`).filter((_, el) => $(el).text().trim() === String(nextPageNum)).first().attr('href');
-                if (nextLink) return toAbs(nextLink, base);
-            }
+            if (nextLink) return toAbs(nextLink, base);
+            
+            // Fallback: try to find current page and calculate next
+            const currentUrl = new URL(base);
+            const currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
+            
+            // Check if a link to next page number exists
+            const nextPageNum = currentPage + 1;
+            const nextPageLink = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
+            if (nextPageLink) return toAbs(nextPageLink, base);
             
             return null;
         }
@@ -120,86 +120,127 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
-            maxConcurrency: 10,
-            requestHandlerTimeoutSecs: 60,
+            maxConcurrency: 5,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
+            async failedRequestHandler({ request, error }, context) {
+                log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { error: error.message });
+            },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
 
                 if (label === 'LIST') {
-                    const links = findJobLinks($, request.url);
-                    crawlerLog.info(`LIST ${request.url} -> found ${links.length} links`);
-
-                    if (collectDetails) {
+                    crawlerLog.info(`Processing LIST page: ${request.url}`);
+                    
+                    // Extract jobs directly from listing page since detail pages require authentication
+                    const jobs = [];
+                    
+                    // Each job is in an h2 with a link pattern: /job/{slug}/{company}-job{id}
+                    $('h2 a[href*="/job/"]').each((_, el) => {
+                        const $link = $(el);
+                        const href = $link.attr('href');
+                        
+                        // Validate it's a proper job URL
+                        if (!href || !/\/job\/[^\/]+\/[^\/]+-job\d+$/i.test(href)) return;
+                        
+                        const jobUrl = toAbs(href, request.url);
+                        const title = $link.text().trim();
+                        
+                        // Try to find the parent container for this job to extract other details
+                        const $jobContainer = $link.closest('article, .job, div').first();
+                        
+                        // Extract company - usually appears after the title in the listing
+                        let company = null;
+                        const companySelectors = [
+                            $jobContainer.find('a[href*="/jobs/"]').not($link).first(),
+                            $jobContainer.find('.company, [class*="company"]').first(),
+                            $link.parent().next().find('a').first()
+                        ];
+                        for (const $comp of companySelectors) {
+                            const text = $comp.text().trim();
+                            if (text && text !== title) {
+                                company = text;
+                                break;
+                            }
+                        }
+                        
+                        // Extract location - typically in the job container
+                        const locationText = $jobContainer.text();
+                        let location = null;
+                        const locationMatch = locationText.match(/([A-Z]{1,3}\d{1,2}[A-Z]?\s?\d?[A-Z]{2}|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s*[A-Z]{2,}(?:\s\d)?)/);
+                        if (locationMatch) location = locationMatch[0].trim();
+                        
+                        // Extract salary - look for £ signs
+                        let salary = null;
+                        const salaryMatch = locationText.match(/£[\d,]+(?:\.\d{2})?\s*-?\s*£?[\d,]+(?:\.\d{2})?\s*per\s*(?:hour|annum|day|year|week)|Up to £[\d,]+(?:\.\d{2})?\s*per\s*(?:hour|annum|day|year|week)|£[\d,]+(?:\.\d{2})?\s*per\s*(?:hour|annum|day|year|week)/i);
+                        if (salaryMatch) salary = salaryMatch[0].trim();
+                        
+                        // Extract date posted
+                        let datePosted = null;
+                        const dateMatch = locationText.match(/(\d+\s*(?:hours?|days?|weeks?|months?)\s*ago|NEW|FEATURED)/i);
+                        if (dateMatch) datePosted = dateMatch[0].trim();
+                        
+                        if (title && jobUrl) {
+                            jobs.push({
+                                title,
+                                company,
+                                category: category || null,
+                                location,
+                                salary,
+                                job_type: null,
+                                date_posted: datePosted,
+                                description_html: null,
+                                description_text: null,
+                                url: jobUrl,
+                            });
+                        }
+                    });
+                    
+                    crawlerLog.info(`Extracted ${jobs.length} jobs from ${request.url}`);
+                    
+                    if (jobs.length > 0) {
                         const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
-                    } else {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) { await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'caterer.com' }))); saved += toPush.length; }
+                        const toPush = jobs.slice(0, Math.max(0, remaining));
+                        if (toPush.length > 0) {
+                            await Dataset.pushData(toPush);
+                            saved += toPush.length;
+                            crawlerLog.info(`Saved ${toPush.length} jobs. Total: ${saved}/${RESULTS_WANTED}`);
+                        }
                     }
 
+                    // Handle pagination
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
-                        if (next) await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
+                        if (next) {
+                            crawlerLog.info(`Enqueueing next page: ${next}`);
+                            await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
+                        } else {
+                            crawlerLog.info('No next page found');
+                        }
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
-                    if (saved >= RESULTS_WANTED) return;
-                    try {
-                        const json = extractFromJsonLd($);
-                        const data = json || {};
-                        
-                        // Enhanced selectors for Caterer.com job pages
-                        if (!data.title) {
-                            data.title = $('h1.job-title, h1[class*="job"], h1').first().text().trim() || null;
-                        }
-                        
-                        if (!data.company) {
-                            data.company = $('.company-name, [class*="company"], .employer, .recruiter-name').first().text().trim() || null;
-                        }
-                        
-                        if (!data.description_html) {
-                            const desc = $('.job-description, [class*="job-description"], .description, .job-details, .entry-content, #job-description').first();
-                            data.description_html = desc && desc.length ? String(desc.html()).trim() : null;
-                        }
-                        data.description_text = data.description_html ? cleanText(data.description_html) : null;
-                        
-                        if (!data.location) {
-                            data.location = $('.job-location, [class*="location"], .location, [class*="address"]').first().text().trim() || null;
-                        }
-                        
-                        // Extract salary if available
-                        const salary = $('.salary, [class*="salary"], .wage, [class*="wage"]').first().text().trim() || null;
-                        
-                        // Extract job type if available
-                        const jobType = $('.job-type, [class*="job-type"], .employment-type').first().text().trim() || null;
-
-                        const item = {
-                            title: data.title || null,
-                            company: data.company || null,
-                            category: category || null,
-                            location: data.location || null,
-                            salary: salary || null,
-                            job_type: jobType || null,
-                            date_posted: data.date_posted || null,
-                            description_html: data.description_html || null,
-                            description_text: data.description_text || null,
-                            url: request.url,
-                        };
-
-                        await Dataset.pushData(item);
-                        saved++;
-                    } catch (err) { crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`); }
+                    // Detail pages require authentication on Caterer.com
+                    // All data is extracted from the listing page instead
+                    crawlerLog.warning(`DETAIL page skipped (requires auth): ${request.url}`);
+                    return;
                 }
             }
         });
 
+        log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
-        log.info(`Finished. Saved ${saved} items`);
+        log.info(`✓ Finished successfully. Saved ${saved} job listings`);
+        
+        if (saved === 0) {
+            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
+        }
+    } catch (error) {
+        log.error('Fatal error in main():', error);
+        throw error;
     } finally {
         await Actor.exit();
     }
