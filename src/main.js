@@ -3,7 +3,7 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
-import { generateHeadersV2 } from 'header-generator';
+import HeaderGenerator from 'header-generator';
 
 // Single-entrypoint main
 await Actor.init();
@@ -23,10 +23,10 @@ async function main() {
 
         // Dynamic header generation for anti-bot evasion
         const getHeaders = () => {
-            const headerGenerator = new generateHeadersV2({
-                browsers: [{ name: 'chrome', minVersion: 90 }, { name: 'firefox', minVersion: 88 }],
-                devices: ['desktop'],
+            const headerGenerator = new HeaderGenerator({
+                browsers: ['chrome', 'firefox'],
                 operatingSystems: ['windows', 'macos', 'linux'],
+                devices: ['desktop'],
             });
             return headerGenerator.getHeaders();
         };
