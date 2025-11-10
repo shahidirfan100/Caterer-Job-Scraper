@@ -11,10 +11,23 @@ await Actor.init();
 async function main() {
     try {
         const input = (await Actor.getInput()) || {};
-        const {
-            keyword = '', location = '', category = '', results_wanted: RESULTS_WANTED_RAW = 100,
-            max_pages: MAX_PAGES_RAW = 999, collectDetails = true, startUrl, startUrls, url, proxyConfiguration,
-        } = input;
+        log.info('Raw input received:', input);
+        // Defensive defaults and type-casting for all fields
+        const safeInt = (v, def) => (Number.isFinite(+v) && +v > 0 ? +v : def);
+        const safeBool = (v, def) => (typeof v === 'boolean' ? v : def);
+        const safeStr = (v, def) => (typeof v === 'string' ? v : def);
+        const safeObj = (v, def) => (v && typeof v === 'object' && !Array.isArray(v) ? v : def);
+
+        const keyword = safeStr(input.keyword, '');
+        const location = safeStr(input.location, '');
+        const category = safeStr(input.category, '');
+        const results_wanted = safeInt(input.results_wanted, 100);
+        const max_pages = safeInt(input.max_pages, 20);
+        const collectDetails = safeBool(input.collectDetails, true);
+        const startUrl = safeStr(input.startUrl, '');
+        const url = safeStr(input.url, '');
+        const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
+        const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
 
         // Defensive input validation and logging
         if (typeof input !== 'object' || Array.isArray(input)) {
@@ -22,8 +35,8 @@ async function main() {
             throw new Error('INPUT_ERROR: Input must be a JSON object.');
         }
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+        const RESULTS_WANTED = Number.isFinite(+results_wanted) ? Math.max(1, +results_wanted) : Number.MAX_SAFE_INTEGER;
+        const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : 999;
         
         log.info('Starting Caterer.com Job Scraper', { keyword, location, category, results_wanted: RESULTS_WANTED, max_pages: MAX_PAGES });
 
