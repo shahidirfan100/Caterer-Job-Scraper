@@ -168,6 +168,51 @@ async function main() {
             $('script, style, noscript, iframe').remove();
             return $.root().text().replace(/\s+/g, ' ').trim();
         };
+        const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
+        const extractJobTypeFromPage = ($) => {
+            if (!$) return null;
+            const keywords = ['job type', 'employment type', 'contract type'];
+            const candidateSelectors = [
+                'li',
+                '.job-summary__item',
+                '.job-details__item',
+                '.job-info li',
+                '.job-card__meta li',
+                '.job-meta li',
+                '[class*="summary"] li',
+            ];
+            for (const selector of candidateSelectors) {
+                const items = $(selector);
+                if (!items.length) continue;
+                for (let i = 0; i < items.length; i++) {
+                    const el = items[i];
+                    const $el = $(el);
+                    const rawText = normalizeText($el.text());
+                    if (!rawText) continue;
+                    const lower = rawText.toLowerCase();
+                    if (!keywords.some((keyword) => lower.includes(keyword))) continue;
+                    const spans = $el.find('span');
+                    if (spans.length > 1) {
+                        const candidate = normalizeText($(spans[spans.length - 1]).text());
+                        if (candidate && !keywords.some((keyword) => candidate.toLowerCase().includes(keyword))) {
+                            return candidate;
+                        }
+                    }
+                    const cleaned = keywords.reduce((acc, keyword) => acc.replace(new RegExp(keyword, 'ig'), ''), rawText)
+                        .replace(/[:\-]/g, '')
+                        .trim();
+                    if (cleaned) return cleaned;
+                }
+            }
+            const schemaNode = $('[itemprop="employmentType"], meta[itemprop="employmentType"]').first();
+            if (schemaNode.length) {
+                const value = schemaNode.attr('content') || schemaNode.text();
+                if (value) return normalizeText(value);
+            }
+            const dataTestId = $('[data-testid*="employment-type"], [data-testid*="job-type"]').first().text();
+            if (dataTestId) return normalizeText(dataTestId);
+            return null;
+        };
 
         const buildStartUrl = (kw, loc, cat) => {
             // Caterer.com uses /jobs/search for search results
@@ -544,7 +589,13 @@ async function main() {
                         }
                         
                         const salary = $('[class*="salary"], .wage').first().text().trim() || null;
-                        const jobType = $('[class*="job-type"], .employment-type').first().text().trim() || null;
+                        const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
+                        const jobType =
+                            jobTypeFromJson ||
+                            extractJobTypeFromPage($) ||
+                            listingStub?.job_type ||
+                            $('[class*="job-type"], .employment-type').first().text().trim() ||
+                            null;
 
                         const merged = {
                             ...(listingStub || {}),
