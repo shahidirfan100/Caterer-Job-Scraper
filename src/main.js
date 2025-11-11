@@ -29,8 +29,23 @@ process.on('uncaughtException', (err) => {
 async function main() {
     try {
         // Initialize Actor inside main so initialization errors are captured by main() try/catch
-        await Actor.init();
-        log.info('Starting actor initialization...');
+        try {
+            await Actor.init();
+            log.info('Actor.init() succeeded');
+        } catch (initErr) {
+            // Provide more actionable diagnostics when Actor.init() fails with ArgumentError
+            log.error('Actor.init() failed:', { name: initErr.name, message: initErr.message, stack: initErr.stack, validationErrors: initErr.validationErrors });
+            // If this appears to be an input validation problem, log the raw environment input if available
+            try {
+                if (process.env.APIFY_INPUT) {
+                    log.warning('APIFY_INPUT env var present; logging its type and truncated content');
+                    const raw = String(process.env.APIFY_INPUT);
+                    log.warning('APIFY_INPUT (truncated 1k):', raw.slice(0, 1024));
+                }
+            } catch (envErr) { /* ignore env logging errors */ }
+            // Re-throw so outer catch still handles termination, but with richer logs
+            throw initErr;
+        }
         let input;
         try {
             input = await Actor.getInput();
@@ -460,10 +475,29 @@ async function main() {
             log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
         }
     } catch (error) {
-        log.error('Fatal error in main():', error);
+        // Log enriched error details to help debugging on the platform
+        try {
+            const details = {
+                name: error?.name,
+                message: error?.message,
+                stack: error?.stack,
+                validationErrors: error?.validationErrors || null,
+            };
+            log.error('Fatal error in main():', details);
+            console.error('Fatal error in main():', JSON.stringify(details, null, 2));
+        } catch (logErr) {
+            // Fallback log
+            log.error('Fatal error in main():', error);
+            console.error(error);
+        }
+        // Re-throw so the caller/process sees non-zero exit. This ensures platform marks the run as failed.
         throw error;
     } finally {
-        await Actor.exit();
+        try {
+            await Actor.exit();
+        } catch (exitErr) {
+            log.warning('Actor.exit() failed:', exitErr && exitErr.message ? exitErr.message : exitErr);
+        }
     }
 }
 
