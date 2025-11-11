@@ -50,6 +50,24 @@
       "type": "object",
       "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
       "editor": "proxy"
+    },
+    "postedWithin": {
+      "title": "Jobs posted within",
+      "type": "string",
+      "description": "Only keep jobs posted within this time window.",
+      "enum": [
+        "any",
+        "24h",
+        "7d",
+        "30d"
+      ],
+      "enumTitles": [
+        "Any time",
+        "Last 24 hours",
+        "Last 7 days",
+        "Last 30 days"
+      ],
+      "default": "any"
     }
   },
   "required": [],

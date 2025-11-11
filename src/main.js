@@ -6,6 +6,67 @@ import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const RELATIVE_UNIT_MS = {
+    minute: 60 * 1000,
+    hour: 60 * 60 * 1000,
+    day: 24 * 60 * 60 * 1000,
+    week: 7 * 24 * 60 * 60 * 1000,
+    month: 30 * 24 * 60 * 60 * 1000,
+    year: 365 * 24 * 60 * 60 * 1000,
+};
+const RECENCY_WINDOWS = {
+    '24h': RELATIVE_UNIT_MS.day,
+    '7d': 7 * RELATIVE_UNIT_MS.day,
+    '30d': 30 * RELATIVE_UNIT_MS.day,
+};
+let recencyWindowMs = null;
+let postedWithinLabel = 'any';
+const normalizePostedWithin = (value) => {
+    const allowed = new Set(['any', '24h', '7d', '30d']);
+    if (!value || typeof value !== 'string') return 'any';
+    const trimmed = value.trim().toLowerCase();
+    return allowed.has(trimmed) ? trimmed : 'any';
+};
+const parsePostedDate = (value) => {
+    if (!value && value !== 0) return null;
+    if (value instanceof Date) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return new Date(value);
+    }
+    const text = String(value).trim();
+    if (!text) return null;
+    const parsed = Date.parse(text);
+    if (!Number.isNaN(parsed)) {
+        return new Date(parsed);
+    }
+    const lower = text.toLowerCase();
+    if (lower.includes('just') || lower.includes('today') || lower.includes('new') || lower.includes('feature')) {
+        return new Date();
+    }
+    if (lower.includes('yesterday')) {
+        return new Date(Date.now() - RELATIVE_UNIT_MS.day);
+    }
+    const relMatch = lower.match(/(\d+)\s*(minute|hour|day|week|month|year)s?\s*ago/);
+    if (relMatch) {
+        const count = Number(relMatch[1]);
+        const unit = relMatch[2];
+        const multiplier = RELATIVE_UNIT_MS[unit];
+        if (multiplier) {
+            return new Date(Date.now() - count * multiplier);
+        }
+    }
+    return null;
+};
+const normalizePostedDateValue = (value) => {
+    const parsed = parsePostedDate(value);
+    return parsed ? parsed.toISOString() : (value || null);
+};
+const shouldKeepByRecency = (dateValue) => {
+    if (!recencyWindowMs) return true;
+    const parsed = parsePostedDate(dateValue);
+    if (!parsed) return true;
+    return (Date.now() - parsed.getTime()) <= recencyWindowMs;
+};
 
 // Try to import header-generator, fallback if not available
 let HeaderGenerator;
@@ -102,6 +163,7 @@ async function main() {
         const url = safeStr(input.url, '');
         const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
         const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
+        const postedWithinInput = safeStr(input.postedWithin, 'any');
 
         // Defensive input validation and logging
         if (typeof input !== 'object' || Array.isArray(input)) {
@@ -111,8 +173,18 @@ async function main() {
 
         const RESULTS_WANTED = Number.isFinite(+results_wanted) ? Math.max(1, +results_wanted) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : 999;
+        postedWithinLabel = normalizePostedWithin(postedWithinInput);
+        recencyWindowMs = RECENCY_WINDOWS[postedWithinLabel] || null;
         
-        log.info('Starting Caterer.com Job Scraper', { keyword, location, category, results_wanted: RESULTS_WANTED, max_pages: MAX_PAGES });
+        log.info('Starting Caterer.com Job Scraper', { 
+            keyword, 
+            location, 
+            category, 
+            results_wanted: RESULTS_WANTED, 
+            max_pages: MAX_PAGES,
+            collect_details: collectDetails,
+            posted_within: postedWithinLabel,
+        });
 
         initHeaderGenerator();
         let fallbackHeaderHits = 0;
@@ -131,13 +203,14 @@ async function main() {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
+                'sec-ch-ua': '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
                 'Cache-Control': 'max-age=0',
             };
         };
@@ -255,6 +328,13 @@ async function main() {
             detailPagesEnqueued: 0,
             listPagesEnqueued: initial.length,
             pendingListingFlushes: 0,
+            recencyFiltered: 0,
+        };
+        const passesRecency = (dateValue, url, logger = log) => {
+            if (shouldKeepByRecency(dateValue)) return true;
+            stats.recencyFiltered += 1;
+            logger.info('Skipping job due to postedWithin filter', { url, date: dateValue, postedWithin: postedWithinLabel });
+            return false;
         };
 
         const pushJob = async (job, sourceLabel) => {
@@ -264,6 +344,7 @@ async function main() {
                 stats.duplicateJobsSkipped += 1;
                 return false;
             }
+            if (!passesRecency(job.date_posted, job.url)) return false;
             await Dataset.pushData(job);
             pushedUrls.add(job.url);
             saved += 1;
@@ -284,7 +365,7 @@ async function main() {
                             return {
                                 title: e.title || e.name || null,
                                 company: e.hiringOrganization?.name || null,
-                                date_posted: e.datePosted || null,
+                                date_posted: normalizePostedDateValue(e.datePosted || e.datepublished || e.date),
                                 description_html: e.description || null,
                                 location: (e.jobLocation && e.jobLocation.address && (e.jobLocation.address.addressLocality || e.jobLocation.address.addressRegion)) || null,
                             };
@@ -342,28 +423,54 @@ async function main() {
             maxRequestRetries: 5,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 10,
+            maxConcurrency: 6,
             autoscaledPoolOptions: {
-                desiredConcurrency: 4,
+                desiredConcurrency: 3,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
+            sessionPoolOptions: {
+                maxPoolSize: 50,
+                sessionOptions: {
+                    maxUsageCount: 15,
+                    maxAgeSecs: 600,
+                },
+            },
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
                 async ({ request }) => {
                     const headers = getHeaders();
+                    const referer = request.userData?.referrer || 'https://www.caterer.com/';
+                    const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
                     request.headers = {
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
-                        'Referer': 'https://www.caterer.com/',
+                        'Referer': referer,
                         'Origin': 'https://www.caterer.com',
+                        'Sec-Fetch-Site': fetchSite,
+                        'Priority': 'u=1, i',
                     };
                     await sleep((Math.random() * 1.5 + 0.5) * 1000);
                 },
             ],
 
+            async errorHandler({ request, error, session, log: crawlerLog }) {
+                const retries = request.retryCount ?? 0;
+                if (session) session.retire();
+                const message = error?.message || '';
+                const isHttp2Reset = /nghttp2/i.test(message);
+                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
+                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
+                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
+                    url: request.url,
+                    message,
+                    waitMs,
+                    retryCount: retries,
+                });
+                await sleep(waitMs);
+            },
             async failedRequestHandler({ request, error }, { session }) {
                 log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
                     error: error.message,
@@ -459,10 +566,13 @@ async function main() {
                                 /(?:posted\s)?(?:(\d+)\s*(?:hours?|days?|weeks?|months?)\s*ago|NEW|FEATURED|\d+\s*ago)/i
                             );
                             if (dateMatch) {
-                                datePosted = dateMatch[0].trim();
+                                datePosted = normalizePostedDateValue(dateMatch[0]);
                             }
                             
                             if (title && jobUrl && title.length > 2) {
+                                if (!passesRecency(datePosted, jobUrl, crawlerLog)) {
+                                    return;
+                                }
                                 jobs.push({
                                     title,
                                     company,
@@ -520,7 +630,7 @@ async function main() {
                             crawlerLog.info(`Enqueueing ${toEnqueue.length} detail pages`);
                             await enqueueLinks({ 
                                 urls: toEnqueue, 
-                                userData: { label: 'DETAIL' }
+                                userData: { label: 'DETAIL', referrer: request.url }
                             });
                             stats.detailPagesEnqueued += toEnqueue.length;
                         }
@@ -533,13 +643,14 @@ async function main() {
                             crawlerLog.info(`Enqueueing next page (${pageNo + 1}): ${next}`);
                             await enqueueLinks({ 
                                 urls: [next], 
-                                userData: { label: 'LIST', pageNo: pageNo + 1 }
+                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
+                    await sleep((Math.random() * 0.6 + 0.4) * 1000);
                     return;
                 }
 
@@ -547,6 +658,7 @@ async function main() {
                     stats.detailPagesProcessed += 1;
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping detail page');
+                        await sleep((Math.random() * 0.3 + 0.2) * 1000);
                         return;
                     }
                     
@@ -588,6 +700,25 @@ async function main() {
                             data.location = $('[class*="location"]').first().text().trim() || null;
                         }
                         
+                        if (data.date_posted) {
+                            data.date_posted = normalizePostedDateValue(data.date_posted);
+                        }
+                        if (!data.date_posted) {
+                            const timeNode = $('time[datetime]').first();
+                            if (timeNode.length) {
+                                data.date_posted = normalizePostedDateValue(timeNode.attr('datetime') || timeNode.text());
+                            }
+                        }
+                        if (!data.date_posted) {
+                            const postedNode = $('[class*="posted"], [class*="date"]').filter((_, el) => {
+                                const text = $(el).text().toLowerCase();
+                                return text.includes('posted') || text.includes('hour') || text.includes('day');
+                            }).first();
+                            if (postedNode.length) {
+                                data.date_posted = normalizePostedDateValue(postedNode.text());
+                            }
+                        }
+                        
                         const salary = $('[class*="salary"], .wage').first().text().trim() || null;
                         const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
                         const jobType =
@@ -610,6 +741,7 @@ async function main() {
                             description_text: data.description_text || listingStub?.description_text || null,
                             url: request.url,
                         };
+                        merged.date_posted = normalizePostedDateValue(merged.date_posted);
 
                         if (!merged.description_text && merged.description_html) {
                             merged.description_text = cleanText(merged.description_html);
@@ -623,12 +755,13 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
+                    await sleep((Math.random() * 0.6 + 0.4) * 1000);
                 }
             }
         });
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
+        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
@@ -644,6 +777,8 @@ async function main() {
         stats.pendingListings = pendingListings.size;
         stats.detailQueueSize = queuedDetailUrls.size;
         stats.fallbackHeaderHits = fallbackHeaderHits;
+        stats.postedWithin = postedWithinLabel;
+        stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
         await Actor.setValue('RUN_STATS', stats);
         
