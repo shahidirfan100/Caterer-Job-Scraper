@@ -1,6 +1,10 @@
 {
+  "startUrls": [],
   "keyword": "head chef",
   "location": "London",
-  "results_wanted": 10,
-  "max_pages": 3
+  "category": "",
+  "results_wanted": 100,
+  "max_pages": 20,
+  "collectDetails": true,
+  "postedWithin": "any"
 }

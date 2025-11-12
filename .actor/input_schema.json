@@ -4,57 +4,70 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "startUrl": {
-      "title": "Start URL",
-      "type": "string",
-      "description": "Start scraping from a specific Caterer.com search URL. If provided, this will be used instead of Keyword/Location.",
-      "editor": "textfield"
+    "startUrls": {
+      "title": "Start URLs",
+      "type": "array",
+      "description": "Caterer.com search URLs to start scraping from. Leave empty to use Keyword/Location/Category instead.",
+      "editor": "stringlist",
+      "items": {
+        "type": "string",
+        "pattern": "^https?://"
+      }
     },
     "keyword": {
       "title": "Keyword (if not using Start URL)",
       "type": "string",
       "description": "Job search keyword(s), e.g., 'Head Chef', 'Restaurant Manager', 'Sous Chef', 'Bartender'.",
-      "editor": "textfield"
+      "editor": "textfield",
+      "maxLength": 200
     },
     "location": {
       "title": "Location (if not using Start URL)",
       "type": "string",
       "description": "Location to search for jobs (e.g., 'London', 'Manchester', 'Birmingham'). Leave empty for all locations.",
-      "editor": "textfield"
+      "editor": "textfield",
+      "maxLength": 100
+    },
+    "category": {
+      "title": "Job Category",
+      "type": "string",
+      "description": "Job category to filter by (e.g., 'head-chefs', 'sous-chefs'). Leave empty to search all categories.",
+      "editor": "textfield",
+      "maxLength": 100
     },
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description and additional information.",
+      "description": "If enabled, scraper opens job detail pages for full description and additional information. Disable for faster results.",
       "editor": "checkbox",
       "default": true
     },
     "results_wanted": {
       "title": "Maximum number of jobs",
       "type": "integer",
-      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
-      "minimum": 1,
+      "description": "The maximum number of jobs to collect. Leave empty or set to 0 to collect all available jobs.",
+      "minimum": 0,
       "default": 100,
       "editor": "number"
     },
     "max_pages": {
       "title": "Maximum number of pages",
       "type": "integer",
-      "description": "A safety cap on the number of search result pages to visit.",
+      "description": "A safety cap on the number of search result pages to visit. Each page typically contains 5-20 jobs.",
       "minimum": 1,
-      "editor": "number",
-      "default": 20
+      "default": 20,
+      "editor": "number"
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
+      "description": "Proxy configuration for requests. Leave empty to use Apify Proxy with datacenter IPs (recommended for Caterer.com).",
       "editor": "proxy"
     },
     "postedWithin": {
       "title": "Jobs posted within",
       "type": "string",
-      "description": "Only keep jobs posted within this time window.",
+      "description": "Only keep jobs posted within this time window. Select 'any' to include all jobs regardless of posting date.",
       "enum": [
         "any",
         "24h",

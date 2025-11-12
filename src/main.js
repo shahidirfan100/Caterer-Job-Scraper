@@ -427,22 +427,23 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
+            maxRequestRetries: 8,
             useSessionPool: true,
-            minConcurrency: 1,
-            maxConcurrency: 7,
+            minConcurrency: 2,
+            maxConcurrency: 8,
             autoscaledPoolOptions: {
                 desiredConcurrency: 4,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 150,
                 sessionOptions: {
-                    maxUsageCount: 10,
-                    maxAgeSecs: 600,
+                    maxUsageCount: 3,
+                    maxAgeSecs: 180,
                 },
             },
+            reclaim: true,
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -459,7 +460,8 @@ async function main() {
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=1, i',
                     };
-                    await sleep((Math.random() * 0.8 + 0.2) * 1000);
+                    // Minimal delay - stealth via headers, not delay
+                    await sleep((Math.random() * 0.15 + 0.05) * 1000);
                 },
             ],
 
@@ -467,20 +469,27 @@ async function main() {
                 const retries = request.retryCount ?? 0;
                 if (session) session.retire();
                 const message = error?.message || '';
-                const isHttp2Reset = /nghttp2/i.test(message);
-                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
-                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
-                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
+                const isHttp2Reset = /nghttp2|http2|stream.*closed|early.*termin/i.test(message);
+                const isNetworkError = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket.*hang|broken.*pipe/i.test(message);
+                
+                // For HTTP/2 errors, use longer backoff
+                let baseWait = Math.min(30000, (2 ** Math.min(retries, 5)) * 800 + Math.random() * 1200);
+                const waitMs = isHttp2Reset ? Math.min(45000, baseWait * 2) : (isNetworkError ? Math.min(35000, baseWait * 1.5) : baseWait);
+                
+                const logLevel = retries >= 3 ? 'warning' : 'info';
+                const errorType = isHttp2Reset ? 'HTTP/2 stream reset' : (isNetworkError ? 'Network error' : 'Request error');
+                crawlerLog[logLevel](`${errorType} detected, backing off before retry`, {
                     url: request.url,
-                    message,
+                    message: message.slice(0, 100),
                     waitMs,
                     retryCount: retries,
                 });
                 await sleep(waitMs);
             },
             async failedRequestHandler({ request, error }, { session }) {
-                log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
-                    error: error.message,
+                const retries = request.retryCount ?? 0;
+                log.warning(`Request failed after ${retries} retries: ${request.url}`, { 
+                    error: error.message?.slice(0, 200),
                     statusCode: error.statusCode 
                 });
                 if (session) session.retire();
@@ -659,7 +668,7 @@ async function main() {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
-                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
+                    await sleep((Math.random() * 0.1 + 0.05) * 1000);
                     return;
                 }
 
@@ -763,7 +772,7 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
+                    await sleep((Math.random() * 0.1 + 0.05) * 1000);
                 }
             }
         });
@@ -781,6 +790,9 @@ async function main() {
         }
 
         log.info(`✓ Finished successfully. Saved ${saved} job listings`);
+        if (saved === 0) {
+            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
+        }
         stats.totalSaved = saved;
         stats.pendingListings = pendingListings.size;
         stats.detailQueueSize = queuedDetailUrls.size;
@@ -789,10 +801,6 @@ async function main() {
         stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
         await Actor.setValue('RUN_STATS', stats);
-        
-        if (saved === 0) {
-            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
-        }
     } catch (error) {
         // Log enriched error details to help debugging on the platform
         try {
