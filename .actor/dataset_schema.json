@@ -1,43 +1,6 @@
 {
   "actorSpecification": 1,
-  "fields": {
-    "title": {
-      "type": "string",
-      "description": "Job position title"
-    },
-    "company": {
-      "type": "string",
-      "description": "Hiring company or organization name"
-    },
-    "location": {
-      "type": "string",
-      "description": "Job location or region"
-    },
-    "salary": {
-      "type": "string",
-      "description": "Salary information when available"
-    },
-    "job_type": {
-      "type": "string",
-      "description": "Employment type (Full-time, Part-time, etc.)"
-    },
-    "date_posted": {
-      "type": "string",
-      "description": "ISO 8601 formatted posting date"
-    },
-    "description_html": {
-      "type": "string",
-      "description": "Full job description in HTML format"
-    },
-    "description_text": {
-      "type": "string",
-      "description": "Plain text version of the job description"
-    },
-    "url": {
-      "type": "string",
-      "description": "Direct link to the job listing on Caterer.com"
-    }
-  },
+  "fields": {},
   "views": {
     "overview": {
       "title": "Overview",
