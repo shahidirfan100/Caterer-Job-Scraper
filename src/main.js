@@ -576,7 +576,6 @@ async function main() {
                                 jobs.push({
                                     title,
                                     company,
-                                    category: category || null,
                                     location,
                                     salary,
                                     job_type: null,
@@ -732,7 +731,6 @@ async function main() {
                             ...(listingStub || {}),
                             title: data.title || listingStub?.title || null,
                             company: data.company || listingStub?.company || null,
-                            category: listingStub?.category || category || null,
                             location: data.location || listingStub?.location || null,
                             salary: salary || listingStub?.salary || null,
                             job_type: jobType || listingStub?.job_type || null,
