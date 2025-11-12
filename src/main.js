@@ -462,24 +462,11 @@ async function main() {
                 },
             },
             persistCookiesPerSession: false,
-            
+
             // Force HTTP/1.1 to avoid HTTP/2 stream errors
             additionalMimeTypes: ['application/json', 'text/plain'],
             suggestResponseEncoding: 'utf-8',
-            
-            // Enhanced got-scraping options for better connection handling
-            requestOptions: {
-                http2: false,
-                timeout: {
-                    request: 90000,
-                    connect: 20000,
-                    secureConnect: 20000,
-                },
-                retry: {
-                    limit: 0, // Let Crawlee handle retries
-                },
-            },
-            
+
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
                 async ({ request, session, log: crawlerLog }) => {
