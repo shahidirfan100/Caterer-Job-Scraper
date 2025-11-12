@@ -159,8 +159,6 @@ async function main() {
         const results_wanted = safeInt(input.results_wanted, 100);
         const max_pages = safeInt(input.max_pages, 20);
         const collectDetails = safeBool(input.collectDetails, true);
-        const startUrl = safeStr(input.startUrl, '');
-        const url = safeStr(input.url, '');
         const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
         const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
         const postedWithinInput = safeStr(input.postedWithin, 'any');
@@ -305,8 +303,6 @@ async function main() {
 
         const initial = [];
         if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-        if (startUrl) initial.push(startUrl);
-        if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location, category));
 
         // Defensive proxyConfiguration handling
@@ -427,23 +423,22 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 8,
+            maxRequestRetries: 5,
             useSessionPool: true,
-            minConcurrency: 2,
-            maxConcurrency: 8,
+            minConcurrency: 1,
+            maxConcurrency: 7,
             autoscaledPoolOptions: {
                 desiredConcurrency: 4,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
             sessionPoolOptions: {
-                maxPoolSize: 150,
+                maxPoolSize: 50,
                 sessionOptions: {
-                    maxUsageCount: 3,
-                    maxAgeSecs: 180,
+                    maxUsageCount: 10,
+                    maxAgeSecs: 600,
                 },
             },
-            reclaim: true,
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -460,8 +455,7 @@ async function main() {
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=1, i',
                     };
-                    // Minimal delay - stealth via headers, not delay
-                    await sleep((Math.random() * 0.15 + 0.05) * 1000);
+                    await sleep((Math.random() * 0.8 + 0.2) * 1000);
                 },
             ],
 
@@ -469,27 +463,20 @@ async function main() {
                 const retries = request.retryCount ?? 0;
                 if (session) session.retire();
                 const message = error?.message || '';
-                const isHttp2Reset = /nghttp2|http2|stream.*closed|early.*termin/i.test(message);
-                const isNetworkError = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket.*hang|broken.*pipe/i.test(message);
-                
-                // For HTTP/2 errors, use longer backoff
-                let baseWait = Math.min(30000, (2 ** Math.min(retries, 5)) * 800 + Math.random() * 1200);
-                const waitMs = isHttp2Reset ? Math.min(45000, baseWait * 2) : (isNetworkError ? Math.min(35000, baseWait * 1.5) : baseWait);
-                
-                const logLevel = retries >= 3 ? 'warning' : 'info';
-                const errorType = isHttp2Reset ? 'HTTP/2 stream reset' : (isNetworkError ? 'Network error' : 'Request error');
-                crawlerLog[logLevel](`${errorType} detected, backing off before retry`, {
+                const isHttp2Reset = /nghttp2/i.test(message);
+                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
+                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
+                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
                     url: request.url,
-                    message: message.slice(0, 100),
+                    message,
                     waitMs,
                     retryCount: retries,
                 });
                 await sleep(waitMs);
             },
             async failedRequestHandler({ request, error }, { session }) {
-                const retries = request.retryCount ?? 0;
-                log.warning(`Request failed after ${retries} retries: ${request.url}`, { 
-                    error: error.message?.slice(0, 200),
+                log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
+                    error: error.message,
                     statusCode: error.statusCode 
                 });
                 if (session) session.retire();
@@ -505,16 +492,16 @@ async function main() {
                 const statusCode = response?.statusCode ?? response?.status;
                 if (statusCode && [403, 429].includes(Number(statusCode))) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}`);
+                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session but continuing`);
                     if (session) session.retire();
-                    throw new Error(`Blocked with status ${statusCode}`);
+                    return; // Continue to next request instead of throwing
                 }
                 const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
                 if ($ && (pageTitle.includes('access denied') || pageTitle.includes('temporarily blocked'))) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Detected access denial content on ${request.url}`);
+                    crawlerLog.warning(`Detected access denial content on ${request.url}, skipping this page`);
                     if (session) session.retire();
-                    throw new Error('Access denied or captcha detected');
+                    return; // Skip this page instead of throwing
                 }
 
                 if (label === 'LIST') {
@@ -668,7 +655,7 @@ async function main() {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
-                    await sleep((Math.random() * 0.1 + 0.05) * 1000);
+                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
                     return;
                 }
 
@@ -772,13 +759,17 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    await sleep((Math.random() * 0.1 + 0.05) * 1000);
+                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
                 }
             }
         });
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.google.com/' } })));
+        try {
+            await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.google.com/' } })));
+        } catch (crawlerError) {
+            log.warning('Crawler encountered errors but continuing with post-processing:', crawlerError.message);
+        }
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
@@ -790,9 +781,6 @@ async function main() {
         }
 
         log.info(`✓ Finished successfully. Saved ${saved} job listings`);
-        if (saved === 0) {
-            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
-        }
         stats.totalSaved = saved;
         stats.pendingListings = pendingListings.size;
         stats.detailQueueSize = queuedDetailUrls.size;
@@ -801,6 +789,10 @@ async function main() {
         stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
         await Actor.setValue('RUN_STATS', stats);
+        
+        if (saved === 0) {
+            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
+        }
     } catch (error) {
         // Log enriched error details to help debugging on the platform
         try {

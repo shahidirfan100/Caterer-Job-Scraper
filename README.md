@@ -23,15 +23,13 @@ None - all parameters are optional for maximum flexibility
 
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|---------|
+| `startUrls` | array | Custom Caterer.com URL(s) to start scraping from | ["https://www.caterer.com/jobs/search/chef"] |
 | `keyword` | string | Job title, skill, or keyword to search for | "Head Chef", "Restaurant Manager", "Sous Chef" |
 | `location` | string | Geographic location for job search | "London", "Manchester", "Birmingham" |
-| `category` | string | Job category filter (when available on Caterer.com) | "Chef", "Management", "Catering" |
-| `startUrl` / `url` / `startUrls` | string/array | Custom Caterer.com URL(s) to start scraping from | "https://www.caterer.com/jobs/search/chef" |
+| `postedWithin` | string | Filter jobs by posting recency: "any", "24h", "7d", "30d" | "7d" |
+| `collectDetails` | boolean | Whether to fetch full job descriptions from detail pages (default: true) | false |
 | `results_wanted` | integer | Maximum number of job listings to collect (default: 100) | 50 |
 | `max_pages` | integer | Maximum number of search pages to visit | 10 |
-| `collectDetails` | boolean | Whether to fetch full job descriptions from detail pages (default: true) | false |
-| `postedWithin` | string | Filter jobs by posting recency: "any", "24h", "7d", "30d" | "7d" |
-| `cookies` / `cookiesJson` | string/object | Custom cookies for requests | |
 | `proxyConfiguration` | object | Proxy settings for enhanced scraping reliability | |
 
 ## Output Schema
