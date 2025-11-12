@@ -443,45 +443,6 @@ async function main() {
                     maxAgeSecs: 300, // Reduced from 600
                 },
             },
-            additionalHttpClientOptions: {
-                http2: false, // Force HTTP/1.1 to avoid NGHTTP2 errors
-                timeout: {
-                    request: 45000, // 45s request timeout
-                    lookup: 10000,
-                    connect: 15000,
-                    secureConnect: 15000,
-                    socket: 30000,
-                    send: 30000,
-                    response: 45000,
-                },
-                retry: {
-                    limit: 5,
-                    methods: ['GET', 'HEAD'],
-                    statusCodes: [408, 413, 429, 500, 502, 503, 504, 521, 522, 524],
-                    errorCodes: [
-                        'ETIMEDOUT',
-                        'ECONNRESET',
-                        'EADDRINUSE',
-                        'ECONNREFUSED',
-                        'EPIPE',
-                        'ENOTFOUND',
-                        'ENETUNREACH',
-                        'EAI_AGAIN',
-                        'NGHTTP2_INTERNAL_ERROR', // Explicitly retry on HTTP/2 errors
-                        'NGHTTP2_PROTOCOL_ERROR',
-                        'NGHTTP2_REFUSED_STREAM',
-                        'NGHTTP2_CANCEL',
-                        'NGHTTP2_COMPRESSION_ERROR',
-                        'NGHTTP2_CONNECT_ERROR',
-                        'NGHTTP2_ENHANCE_YOUR_CALM',
-                        'NGHTTP2_INADEQUATE_SECURITY',
-                        'NGHTTP2_HTTP_1_1_REQUIRED',
-                    ],
-                },
-                headers: {
-                    'Connection': 'close', // Force connection close to avoid keep-alive issues
-                },
-            },
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -497,6 +458,7 @@ async function main() {
                         'Origin': 'https://www.caterer.com',
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=1, i',
+                        'Connection': 'close', // Force HTTP/1.1 connection close to avoid HTTP/2 stream issues
                     };
                     await sleep((Math.random() * 0.8 + 0.2) * 1000);
                 },
