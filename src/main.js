@@ -445,20 +445,20 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 6,
             useSessionPool: true,
-            minConcurrency: 2,
-            maxConcurrency: 5,
+            minConcurrency: 3,
+            maxConcurrency: 8,
             autoscaledPoolOptions: {
-                desiredConcurrency: 3,
-                maxConcurrency: 5,
-                minConcurrency: 2,
+                desiredConcurrency: 5,
+                maxConcurrency: 8,
+                minConcurrency: 3,
             },
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 90,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
             sessionPoolOptions: {
-                maxPoolSize: 80,
+                maxPoolSize: 60,
                 sessionOptions: {
-                    maxUsageCount: 6,
-                    maxAgeSecs: 400,
+                    maxUsageCount: 8,
+                    maxAgeSecs: 500,
                 },
             },
             persistCookiesPerSession: false,
@@ -470,15 +470,15 @@ async function main() {
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
                 async ({ request, session, log: crawlerLog }) => {
-                    // Optimized delays: faster for detail pages, slower for list/pagination
+                    // Highly optimized delays: minimal but realistic
                     const label = request.userData?.label || 'LIST';
                     const isListPage = label === 'LIST';
-                    
-                    // List pages need more caution, detail pages can be faster
-                    const baseDelay = isListPage 
-                        ? 800 + Math.random() * 1200  // 0.8-2s for list pages
-                        : 400 + Math.random() * 600;   // 0.4-1s for detail pages
-                    
+
+                    // List pages: 0.3-0.8s, Detail pages: 0.15-0.4s
+                    const baseDelay = isListPage
+                        ? 300 + Math.random() * 500  // 0.3-0.8s for list pages
+                        : 150 + Math.random() * 250;  // 0.15-0.4s for detail pages
+
                     await sleep(baseDelay);
                     
                     const headers = getHeaders();
@@ -510,10 +510,10 @@ async function main() {
                         request.options.http2 = false;
                     }
                     
-                    // Retire sessions more aggressively to rotate fingerprints
-                    if (session && session.usageCount >= 4) {
+                    // Retire sessions less aggressively for better speed
+                    if (session && session.usageCount >= 6) {
                         session.retire();
-                        crawlerLog.debug('Retiring session proactively after 4 uses');
+                        crawlerLog.debug('Retiring session proactively after 6 uses');
                     }
                 },
             ],
@@ -533,21 +533,21 @@ async function main() {
                 const isBlockedError = [403, 429].includes(Number(statusCode)) || /blocked|denied/i.test(message);
                 const isNetworkError = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(message);
                 
-                // Optimized exponential backoff - faster initial retries
-                let baseWait = Math.min(30000, (2 ** Math.min(retries, 6)) * 600);
+                // Fast exponential backoff - optimized for speed
+                let baseWait = Math.min(25000, (2 ** Math.min(retries, 5)) * 300);
                 
                 // Apply multipliers based on error type
                 if (isBlockedError) {
-                    baseWait *= 2;
-                    crawlerLog.warning('Detected blocking (403/429), applying aggressive backoff', {
+                    baseWait *= 1.5;
+                    crawlerLog.warning('Detected blocking (403/429), applying moderate backoff', {
                         url: request.url,
                         statusCode,
                         waitMs: baseWait,
                         retryCount: retries,
                     });
                 } else if (isHttp2Error) {
-                    baseWait *= 1.5;
-                    crawlerLog.warning('HTTP/2 error detected, backing off and forcing HTTP/1.1', {
+                    baseWait *= 1.2;
+                    crawlerLog.warning('HTTP/2 error detected, applying light backoff and forcing HTTP/1.1', {
                         url: request.url,
                         message,
                         waitMs: baseWait,
@@ -558,8 +558,8 @@ async function main() {
                         request.options.http2 = false;
                     }
                 } else if (isNetworkError) {
-                    baseWait *= 1.2;
-                    crawlerLog.warning('Network error, applying moderate backoff', {
+                    baseWait *= 1.1;
+                    crawlerLog.warning('Network error, applying minimal backoff', {
                         url: request.url,
                         message,
                         waitMs: baseWait,
@@ -567,9 +567,9 @@ async function main() {
                     });
                 }
                 
-                // Add random jitter (±20%)
-                const jitter = baseWait * (0.8 + Math.random() * 0.4);
-                const waitMs = Math.min(45000, jitter);
+                // Add random jitter (±15%)
+                const jitter = baseWait * (0.85 + Math.random() * 0.3);
+                const waitMs = Math.min(30000, jitter);
                 
                 crawlerLog.info(`Waiting ${Math.round(waitMs)}ms before retry ${retries + 1}/6`);
                 await sleep(waitMs);
@@ -595,10 +595,10 @@ async function main() {
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
                 const label = request.userData?.label || 'LIST';
                 
-                // Optimized reading delay based on page type
+                // Ultra-fast reading delay based on page type
                 const readingDelay = label === 'DETAIL' 
-                    ? 300 + Math.random() * 500  // 0.3-0.8s for detail pages
-                    : 400 + Math.random() * 800; // 0.4-1.2s for list pages
+                    ? 100 + Math.random() * 200  // 0.1-0.3s for detail pages
+                    : 200 + Math.random() * 300; // 0.2-0.5s for list pages
                 await sleep(readingDelay);
                 
                 if (saved >= RESULTS_WANTED) {
@@ -615,8 +615,8 @@ async function main() {
                     if (session) {
                         session.retire();
                     }
-                    // Moderate delay before continuing
-                    await sleep(3000 + Math.random() * 3000);
+                    // Fast cooldown before continuing
+                    await sleep(1500 + Math.random() * 1500);
                     return;
                 }
                 
@@ -636,7 +636,7 @@ async function main() {
                     if (session) {
                         session.retire();
                     }
-                    await sleep(3000 + Math.random() * 3000);
+                    await sleep(1500 + Math.random() * 1500);
                     return;
                 }
 
@@ -792,8 +792,8 @@ async function main() {
                         }
                     }
                     
-                    // Moderate delay after list page - pagination will have pre-navigation delay
-                    await sleep(800 + Math.random() * 1200);
+                    // Minimal delay after list page
+                    await sleep(300 + Math.random() * 400);
                     return;
                 }
 
@@ -898,8 +898,8 @@ async function main() {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
                     
-                    // Shorter delay after detail page - they're less scrutinized than list pages
-                    await sleep(600 + Math.random() * 900);
+                    // Minimal delay after detail page
+                    await sleep(200 + Math.random() * 300);
                 }
             }
         });
