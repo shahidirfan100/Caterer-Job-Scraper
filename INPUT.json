@@ -3,8 +3,8 @@
   "keyword": "head chef",
   "location": "London",
   "category": "",
-  "results_wanted": 100,
-  "max_pages": 20,
+  "results_wanted": 20,
+  "max_pages": 3,
   "collectDetails": true,
   "postedWithin": "any"
 }
