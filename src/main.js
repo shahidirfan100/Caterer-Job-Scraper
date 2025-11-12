@@ -445,20 +445,20 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 6,
             useSessionPool: true,
-            minConcurrency: 1,
-            maxConcurrency: 3,
+            minConcurrency: 2,
+            maxConcurrency: 5,
             autoscaledPoolOptions: {
-                desiredConcurrency: 2,
-                maxConcurrency: 3,
-                minConcurrency: 1,
+                desiredConcurrency: 3,
+                maxConcurrency: 5,
+                minConcurrency: 2,
             },
-            requestHandlerTimeoutSecs: 180,
-            navigationTimeoutSecs: 120,
+            requestHandlerTimeoutSecs: 120,
+            navigationTimeoutSecs: 90,
             sessionPoolOptions: {
-                maxPoolSize: 100,
+                maxPoolSize: 80,
                 sessionOptions: {
-                    maxUsageCount: 5,
-                    maxAgeSecs: 300,
+                    maxUsageCount: 6,
+                    maxAgeSecs: 400,
                 },
             },
             persistCookiesPerSession: false,
@@ -466,30 +466,32 @@ async function main() {
             // Force HTTP/1.1 to avoid HTTP/2 stream errors
             additionalMimeTypes: ['application/json', 'text/plain'],
             suggestResponseEncoding: 'utf-8',
-            forceResponseEncoding: false,
             
             // Enhanced got-scraping options for better connection handling
             requestOptions: {
                 http2: false,
                 timeout: {
-                    request: 120000,
-                    connect: 30000,
-                    secureConnect: 30000,
+                    request: 90000,
+                    connect: 20000,
+                    secureConnect: 20000,
                 },
                 retry: {
                     limit: 0, // Let Crawlee handle retries
-                },
-                agent: {
-                    http: undefined,
-                    https: undefined,
                 },
             },
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
-                async ({ request, session }) => {
-                    // More aggressive random delays to appear human-like
-                    const baseDelay = 1500 + Math.random() * 2500;
+                async ({ request, session, log: crawlerLog }) => {
+                    // Optimized delays: faster for detail pages, slower for list/pagination
+                    const label = request.userData?.label || 'LIST';
+                    const isListPage = label === 'LIST';
+                    
+                    // List pages need more caution, detail pages can be faster
+                    const baseDelay = isListPage 
+                        ? 800 + Math.random() * 1200  // 0.8-2s for list pages
+                        : 400 + Math.random() * 600;   // 0.4-1s for detail pages
+                    
                     await sleep(baseDelay);
                     
                     const headers = getHeaders();
@@ -522,9 +524,9 @@ async function main() {
                     }
                     
                     // Retire sessions more aggressively to rotate fingerprints
-                    if (session && session.usageCount >= 3) {
+                    if (session && session.usageCount >= 4) {
                         session.retire();
-                        crawlerLog.debug('Retiring session proactively after 3 uses');
+                        crawlerLog.debug('Retiring session proactively after 4 uses');
                     }
                 },
             ],
@@ -544,12 +546,12 @@ async function main() {
                 const isBlockedError = [403, 429].includes(Number(statusCode)) || /blocked|denied/i.test(message);
                 const isNetworkError = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(message);
                 
-                // Calculate exponential backoff with jitter
-                let baseWait = Math.min(45000, (2 ** Math.min(retries, 7)) * 1000);
+                // Optimized exponential backoff - faster initial retries
+                let baseWait = Math.min(30000, (2 ** Math.min(retries, 6)) * 600);
                 
                 // Apply multipliers based on error type
                 if (isBlockedError) {
-                    baseWait *= 2.5;
+                    baseWait *= 2;
                     crawlerLog.warning('Detected blocking (403/429), applying aggressive backoff', {
                         url: request.url,
                         statusCode,
@@ -557,7 +559,7 @@ async function main() {
                         retryCount: retries,
                     });
                 } else if (isHttp2Error) {
-                    baseWait *= 2;
+                    baseWait *= 1.5;
                     crawlerLog.warning('HTTP/2 error detected, backing off and forcing HTTP/1.1', {
                         url: request.url,
                         message,
@@ -569,7 +571,7 @@ async function main() {
                         request.options.http2 = false;
                     }
                 } else if (isNetworkError) {
-                    baseWait *= 1.5;
+                    baseWait *= 1.2;
                     crawlerLog.warning('Network error, applying moderate backoff', {
                         url: request.url,
                         message,
@@ -578,9 +580,9 @@ async function main() {
                     });
                 }
                 
-                // Add random jitter (±25%)
-                const jitter = baseWait * (0.75 + Math.random() * 0.5);
-                const waitMs = Math.min(60000, jitter);
+                // Add random jitter (±20%)
+                const jitter = baseWait * (0.8 + Math.random() * 0.4);
+                const waitMs = Math.min(45000, jitter);
                 
                 crawlerLog.info(`Waiting ${Math.round(waitMs)}ms before retry ${retries + 1}/6`);
                 await sleep(waitMs);
@@ -604,16 +606,18 @@ async function main() {
                 // This prevents the entire run from failing due to a few problematic URLs
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
-                // Add random reading time before processing
-                const readingDelay = 500 + Math.random() * 1500;
+                const label = request.userData?.label || 'LIST';
+                
+                // Optimized reading delay based on page type
+                const readingDelay = label === 'DETAIL' 
+                    ? 300 + Math.random() * 500  // 0.3-0.8s for detail pages
+                    : 400 + Math.random() * 800; // 0.4-1.2s for list pages
                 await sleep(readingDelay);
                 
                 if (saved >= RESULTS_WANTED) {
                     crawlerLog.info('Results limit reached, skipping further processing');
                     return;
                 }
-
-                const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
                 const statusCode = response?.statusCode ?? response?.status;
                 
@@ -624,8 +628,8 @@ async function main() {
                     if (session) {
                         session.retire();
                     }
-                    // Add substantial delay before continuing
-                    await sleep(5000 + Math.random() * 5000);
+                    // Moderate delay before continuing
+                    await sleep(3000 + Math.random() * 3000);
                     return;
                 }
                 
@@ -645,7 +649,7 @@ async function main() {
                     if (session) {
                         session.retire();
                     }
-                    await sleep(5000 + Math.random() * 5000);
+                    await sleep(3000 + Math.random() * 3000);
                     return;
                 }
 
@@ -786,16 +790,11 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination with enhanced rate limiting
+                    // Handle pagination with optimized rate limiting
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next) {
                             crawlerLog.info(`Enqueueing next page (${pageNo + 1}): ${next}`);
-                            
-                            // Add longer delay before pagination to avoid rate limiting
-                            const paginationDelay = 3000 + Math.random() * 3000;
-                            await sleep(paginationDelay);
-                            
                             await enqueueLinks({ 
                                 urls: [next], 
                                 userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
@@ -806,8 +805,8 @@ async function main() {
                         }
                     }
                     
-                    // Longer delay after processing list page
-                    await sleep(2000 + Math.random() * 2000);
+                    // Moderate delay after list page - pagination will have pre-navigation delay
+                    await sleep(800 + Math.random() * 1200);
                     return;
                 }
 
@@ -912,8 +911,8 @@ async function main() {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
                     
-                    // Longer delay after detail page to reduce server load detection
-                    await sleep(1500 + Math.random() * 2000);
+                    // Shorter delay after detail page - they're less scrutinized than list pages
+                    await sleep(600 + Math.random() * 900);
                 }
             }
         });
