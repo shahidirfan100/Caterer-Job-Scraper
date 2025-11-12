@@ -430,17 +430,65 @@ async function main() {
             maxRequestRetries: 5,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 8,
+            maxConcurrency: 6, // Reduced from 8 to avoid overwhelming servers
             autoscaledPoolOptions: {
-                desiredConcurrency: 4,
+                desiredConcurrency: 3, // Reduced from 4
             },
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 90,
+            requestHandlerTimeoutSecs: 180, // Increased from 120
+            navigationTimeoutSecs: 120, // Increased from 90
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 30, // Reduced from 50
                 sessionOptions: {
-                    maxUsageCount: 10,
-                    maxAgeSecs: 600,
+                    maxUsageCount: 5, // Reduced from 10
+                    maxAgeSecs: 300, // Reduced from 600
+                },
+            },
+            requestOptions: {
+                http2: false, // Force HTTP/1.1 to avoid NGHTTP2 errors
+                timeout: {
+                    request: 45000, // 45s request timeout
+                    lookup: 10000,
+                    connect: 15000,
+                    secureConnect: 15000,
+                    socket: 30000,
+                    send: 30000,
+                    response: 45000,
+                },
+                retry: {
+                    limit: 5,
+                    methods: ['GET', 'HEAD'],
+                    statusCodes: [408, 413, 429, 500, 502, 503, 504, 521, 522, 524],
+                    errorCodes: [
+                        'ETIMEDOUT',
+                        'ECONNRESET',
+                        'EADDRINUSE',
+                        'ECONNREFUSED',
+                        'EPIPE',
+                        'ENOTFOUND',
+                        'ENETUNREACH',
+                        'EAI_AGAIN',
+                        'NGHTTP2_INTERNAL_ERROR', // Explicitly retry on HTTP/2 errors
+                        'NGHTTP2_PROTOCOL_ERROR',
+                        'NGHTTP2_REFUSED_STREAM',
+                        'NGHTTP2_CANCEL',
+                        'NGHTTP2_COMPRESSION_ERROR',
+                        'NGHTTP2_CONNECT_ERROR',
+                        'NGHTTP2_ENHANCE_YOUR_CALM',
+                        'NGHTTP2_INADEQUATE_SECURITY',
+                        'NGHTTP2_HTTP_1_1_REQUIRED',
+                    ],
+                },
+                headers: {
+                    'Connection': 'close', // Force connection close to avoid keep-alive issues
+                },
+                hooks: {
+                    beforeRequest: [
+                        (options) => {
+                            // Additional got-scraping stealth options
+                            options.context = options.context || {};
+                            options.context.userAgent = options.headers['User-Agent'];
+                        },
+                    ],
                 },
             },
             
@@ -467,14 +515,23 @@ async function main() {
                 const retries = request.retryCount ?? 0;
                 if (session) session.retire();
                 const message = error?.message || '';
-                const isHttp2Reset = /nghttp2/i.test(message);
-                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
-                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
-                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
+                const isHttp2Reset = /nghttp2|NGHTTP2/i.test(message);
+                const isTimeout = /timeout|ETIMEDOUT/i.test(message);
+                const isConnectionError = /ECONNRESET|EPIPE|ENOTFOUND/i.test(message);
+                const baseWait = Math.min(30000, (2 ** Math.min(retries, 6)) * 500 + Math.random() * 1000);
+                const waitMs = isHttp2Reset ? Math.min(45000, baseWait * 2) : 
+                              isTimeout ? Math.min(60000, baseWait * 1.5) : 
+                              isConnectionError ? Math.min(40000, baseWait * 1.2) : baseWait;
+                crawlerLog.warning(
+                    isHttp2Reset ? 'HTTP/2 error detected, extended backoff' :
+                    isTimeout ? 'Timeout error, extended backoff' :
+                    isConnectionError ? 'Connection error, moderate backoff' :
+                    'Request error, applying exponential backoff', {
                     url: request.url,
                     message,
                     waitMs,
                     retryCount: retries,
+                    errorType: isHttp2Reset ? 'HTTP2' : isTimeout ? 'TIMEOUT' : isConnectionError ? 'CONNECTION' : 'OTHER',
                 });
                 await sleep(waitMs);
             },
