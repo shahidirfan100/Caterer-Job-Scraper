@@ -443,7 +443,7 @@ async function main() {
                     maxAgeSecs: 300, // Reduced from 600
                 },
             },
-            requestOptions: {
+            additionalHttpClientOptions: {
                 http2: false, // Force HTTP/1.1 to avoid NGHTTP2 errors
                 timeout: {
                     request: 45000, // 45s request timeout
@@ -480,15 +480,6 @@ async function main() {
                 },
                 headers: {
                     'Connection': 'close', // Force connection close to avoid keep-alive issues
-                },
-                hooks: {
-                    beforeRequest: [
-                        (options) => {
-                            // Additional got-scraping stealth options
-                            options.context = options.context || {};
-                            options.context.userAgent = options.headers['User-Agent'];
-                        },
-                    ],
                 },
             },
             
