@@ -186,33 +186,53 @@ async function main() {
 
         initHeaderGenerator();
         let fallbackHeaderHits = 0;
-        // Dynamic header generation for anti-bot evasion
+        
+        // Multiple realistic user agent strings for rotation
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+        ];
+        
+        // Dynamic header generation for anti-bot evasion with consistent fingerprints
         const getHeaders = () => {
             if (headerGeneratorInstance) {
                 try {
-                    return headerGeneratorInstance.getHeaders();
+                    const headers = headerGeneratorInstance.getHeaders();
+                    // Ensure no bot-identifying headers
+                    delete headers['DNT'];
+                    delete headers['dnt'];
+                    return headers;
                 } catch (error) {
                     log.warning('HeaderGenerator getHeaders failed, using fallback headers:', error.message);
                 }
             }
             fallbackHeaderHits += 1;
-            return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br, zstd',
+            
+            // Rotate user agent on fallback
+            const ua = userAgents[fallbackHeaderHits % userAgents.length];
+            const isChrome = ua.includes('Chrome') && !ua.includes('Firefox');
+            
+            const baseHeaders = {
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-User': '?1',
-                'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-ch-ua-platform-version': '"15.0.0"',
-                'sec-ch-ua-model': '""',
                 'Cache-Control': 'max-age=0',
             };
+            
+            // Add Chrome-specific client hints only for Chrome UA
+            if (isChrome) {
+                baseHeaders['sec-ch-ua'] = '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"';
+                baseHeaders['sec-ch-ua-mobile'] = '?0';
+                baseHeaders['sec-ch-ua-platform'] = ua.includes('Mac') ? '"macOS"' : '"Windows"';
+            }
+            
+            return baseHeaders;
         };
 
         const toAbs = (href, base = 'https://www.caterer.com') => {
@@ -423,65 +443,171 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
+            maxRequestRetries: 6,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 7,
+            maxConcurrency: 3,
             autoscaledPoolOptions: {
-                desiredConcurrency: 4,
+                desiredConcurrency: 2,
+                maxConcurrency: 3,
+                minConcurrency: 1,
             },
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 90,
+            requestHandlerTimeoutSecs: 180,
+            navigationTimeoutSecs: 120,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 100,
                 sessionOptions: {
-                    maxUsageCount: 10,
-                    maxAgeSecs: 600,
+                    maxUsageCount: 5,
+                    maxAgeSecs: 300,
+                },
+            },
+            persistCookiesPerSession: false,
+            
+            // Force HTTP/1.1 to avoid HTTP/2 stream errors
+            additionalMimeTypes: ['application/json', 'text/plain'],
+            suggestResponseEncoding: 'utf-8',
+            forceResponseEncoding: false,
+            
+            // Enhanced got-scraping options for better connection handling
+            requestOptions: {
+                http2: false,
+                timeout: {
+                    request: 120000,
+                    connect: 30000,
+                    secureConnect: 30000,
+                },
+                retry: {
+                    limit: 0, // Let Crawlee handle retries
+                },
+                agent: {
+                    http: undefined,
+                    https: undefined,
                 },
             },
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
-                async ({ request }) => {
+                async ({ request, session }) => {
+                    // More aggressive random delays to appear human-like
+                    const baseDelay = 1500 + Math.random() * 2500;
+                    await sleep(baseDelay);
+                    
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
+                    
+                    // Enhanced headers with better fingerprinting consistency
                     request.headers = {
                         ...headers,
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept-Encoding': 'gzip, deflate, br, zstd',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': referer,
-                        'Origin': 'https://www.caterer.com',
                         'Sec-Fetch-Site': fetchSite,
-                        'Priority': 'u=1, i',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-User': '?1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Cache-Control': 'max-age=0',
+                        'Connection': 'keep-alive',
                     };
-                    await sleep((Math.random() * 0.8 + 0.2) * 1000);
+                    
+                    // Remove DNT and bot-identifying headers
+                    delete request.headers['DNT'];
+                    delete request.headers['dnt'];
+                    
+                    // Force HTTP/1.1 to avoid HTTP/2 stream errors
+                    if (request.options) {
+                        request.options.http2 = false;
+                    }
+                    
+                    // Retire sessions more aggressively to rotate fingerprints
+                    if (session && session.usageCount >= 3) {
+                        session.retire();
+                        crawlerLog.debug('Retiring session proactively after 3 uses');
+                    }
                 },
             ],
 
             async errorHandler({ request, error, session, log: crawlerLog }) {
                 const retries = request.retryCount ?? 0;
-                if (session) session.retire();
                 const message = error?.message || '';
-                const isHttp2Reset = /nghttp2/i.test(message);
-                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
-                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
-                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
-                    url: request.url,
-                    message,
-                    waitMs,
-                    retryCount: retries,
-                });
+                const statusCode = error?.statusCode || error?.status;
+                
+                // Retire session on any error
+                if (session) {
+                    session.retire();
+                }
+                
+                // Identify error types
+                const isHttp2Error = /nghttp2|http2|stream closed/i.test(message);
+                const isBlockedError = [403, 429].includes(Number(statusCode)) || /blocked|denied/i.test(message);
+                const isNetworkError = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(message);
+                
+                // Calculate exponential backoff with jitter
+                let baseWait = Math.min(45000, (2 ** Math.min(retries, 7)) * 1000);
+                
+                // Apply multipliers based on error type
+                if (isBlockedError) {
+                    baseWait *= 2.5;
+                    crawlerLog.warning('Detected blocking (403/429), applying aggressive backoff', {
+                        url: request.url,
+                        statusCode,
+                        waitMs: baseWait,
+                        retryCount: retries,
+                    });
+                } else if (isHttp2Error) {
+                    baseWait *= 2;
+                    crawlerLog.warning('HTTP/2 error detected, backing off and forcing HTTP/1.1', {
+                        url: request.url,
+                        message,
+                        waitMs: baseWait,
+                        retryCount: retries,
+                    });
+                    // Force HTTP/1.1 for retry
+                    if (request.options) {
+                        request.options.http2 = false;
+                    }
+                } else if (isNetworkError) {
+                    baseWait *= 1.5;
+                    crawlerLog.warning('Network error, applying moderate backoff', {
+                        url: request.url,
+                        message,
+                        waitMs: baseWait,
+                        retryCount: retries,
+                    });
+                }
+                
+                // Add random jitter (±25%)
+                const jitter = baseWait * (0.75 + Math.random() * 0.5);
+                const waitMs = Math.min(60000, jitter);
+                
+                crawlerLog.info(`Waiting ${Math.round(waitMs)}ms before retry ${retries + 1}/6`);
                 await sleep(waitMs);
             },
             async failedRequestHandler({ request, error }, { session }) {
-                log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
-                    error: error.message,
-                    statusCode: error.statusCode 
+                const message = error?.message || '';
+                const statusCode = error?.statusCode || error?.status;
+                
+                // Log the failure with full context
+                log.warning(`Request permanently failed after ${request.retryCount} retries (gracefully continuing)`, { 
+                    url: request.url,
+                    error: message,
+                    statusCode,
+                    label: request.userData?.label,
                 });
+                
+                // Retire session
                 if (session) session.retire();
+                
+                // Don't throw - let the scraper continue with other URLs
+                // This prevents the entire run from failing due to a few problematic URLs
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
+                // Add random reading time before processing
+                const readingDelay = 500 + Math.random() * 1500;
+                await sleep(readingDelay);
+                
                 if (saved >= RESULTS_WANTED) {
                     crawlerLog.info('Results limit reached, skipping further processing');
                     return;
@@ -490,18 +616,37 @@ async function main() {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
                 const statusCode = response?.statusCode ?? response?.status;
-                if (statusCode && [403, 429].includes(Number(statusCode))) {
+                
+                // Enhanced blocking detection
+                if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session but continuing`);
-                    if (session) session.retire();
-                    return; // Continue to next request instead of throwing
+                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session and skipping`);
+                    if (session) {
+                        session.retire();
+                    }
+                    // Add substantial delay before continuing
+                    await sleep(5000 + Math.random() * 5000);
+                    return;
                 }
+                
                 const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
-                if ($ && (pageTitle.includes('access denied') || pageTitle.includes('temporarily blocked'))) {
+                const bodyText = typeof $ === 'function' ? $('body').first().text().toLowerCase() : '';
+                
+                // More comprehensive blocking detection
+                if ($ && (
+                    pageTitle.includes('access denied') || 
+                    pageTitle.includes('temporarily blocked') ||
+                    pageTitle.includes('captcha') ||
+                    bodyText.includes('please verify you are human') ||
+                    bodyText.includes('unusual traffic')
+                )) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Detected access denial content on ${request.url}, skipping this page`);
-                    if (session) session.retire();
-                    return; // Skip this page instead of throwing
+                    crawlerLog.warning(`Detected access denial content on ${request.url}, skipping page`);
+                    if (session) {
+                        session.retire();
+                    }
+                    await sleep(5000 + Math.random() * 5000);
+                    return;
                 }
 
                 if (label === 'LIST') {
@@ -641,11 +786,16 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination
+                    // Handle pagination with enhanced rate limiting
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next) {
                             crawlerLog.info(`Enqueueing next page (${pageNo + 1}): ${next}`);
+                            
+                            // Add longer delay before pagination to avoid rate limiting
+                            const paginationDelay = 3000 + Math.random() * 3000;
+                            await sleep(paginationDelay);
+                            
                             await enqueueLinks({ 
                                 urls: [next], 
                                 userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
@@ -655,7 +805,9 @@ async function main() {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
-                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
+                    
+                    // Longer delay after processing list page
+                    await sleep(2000 + Math.random() * 2000);
                     return;
                 }
 
@@ -759,7 +911,9 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
+                    
+                    // Longer delay after detail page to reduce server load detection
+                    await sleep(1500 + Math.random() * 2000);
                 }
             }
         });
@@ -788,10 +942,49 @@ async function main() {
         stats.postedWithin = postedWithinLabel;
         stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
+        
+        // Calculate success rate
+        const totalRequests = stats.listPagesProcessed + stats.detailPagesProcessed;
+        const successfulRequests = totalRequests - stats.blockedResponses;
+        stats.successRate = totalRequests > 0 ? ((successfulRequests / totalRequests) * 100).toFixed(2) + '%' : 'N/A';
+        
         await Actor.setValue('RUN_STATS', stats);
         
+        // Enhanced result summary
+        log.info('=== Scraper Run Summary ===', {
+            totalSaved: saved,
+            targetResults: RESULTS_WANTED,
+            listPagesProcessed: stats.listPagesProcessed,
+            detailPagesProcessed: stats.detailPagesProcessed,
+            blockedResponses: stats.blockedResponses,
+            successRate: stats.successRate,
+            recencyFiltered: stats.recencyFiltered,
+            duplicateJobsSkipped: stats.duplicateJobsSkipped,
+        });
+        
         if (saved === 0) {
-            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
+            log.warning('No jobs were extracted. Possible causes:', {
+                possibleReasons: [
+                    'All requests were blocked (check blockedResponses count)',
+                    'Site selectors may have changed',
+                    'postedWithin filter too restrictive',
+                    'Proxy configuration issues',
+                ],
+                blockedCount: stats.blockedResponses,
+                successRate: stats.successRate,
+            });
+        }
+        
+        if (stats.blockedResponses > totalRequests * 0.3) {
+            log.warning('High rate of blocked requests detected. Consider:', {
+                blockedPercentage: ((stats.blockedResponses / totalRequests) * 100).toFixed(2) + '%',
+                suggestions: [
+                    'Use residential proxies instead of datacenter',
+                    'Reduce concurrency further',
+                    'Increase delays between requests',
+                    'Check if IP is rate-limited',
+                ],
+            });
         }
     } catch (error) {
         // Log enriched error details to help debugging on the platform
