@@ -199,7 +199,7 @@ async function main() {
             }
             fallbackHeaderHits += 1;
             return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -208,9 +208,11 @@ async function main() {
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-User': '?1',
-                'sec-ch-ua': '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+                'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform-version': '"15.0.0"',
+                'sec-ch-ua-model': '""',
                 'Cache-Control': 'max-age=0',
             };
         };
@@ -288,12 +290,17 @@ async function main() {
         };
 
         const buildStartUrl = (kw, loc, cat) => {
-            // Caterer.com uses /jobs/search for search results
-            const u = new URL('https://www.caterer.com/jobs/search');
-            if (kw) u.searchParams.set('keywords', String(kw).trim());
-            if (loc) u.searchParams.set('location', String(loc).trim());
-            if (cat) u.searchParams.set('category', String(cat).trim());
-            return u.href;
+            if (cat) {
+                let url = `https://www.caterer.com/jobs/${encodeURIComponent(cat.toLowerCase())}`;
+                if (loc) url += `?location=${encodeURIComponent(loc)}`;
+                return url;
+            } else {
+                // Caterer.com uses /jobs/search for search results
+                const u = new URL('https://www.caterer.com/jobs/search');
+                if (kw) u.searchParams.set('keywords', String(kw).trim());
+                if (loc) u.searchParams.set('location', String(loc).trim());
+                return u.href;
+            }
         };
 
         const initial = [];
@@ -423,16 +430,16 @@ async function main() {
             maxRequestRetries: 5,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 6,
+            maxConcurrency: 4,
             autoscaledPoolOptions: {
-                desiredConcurrency: 3,
+                desiredConcurrency: 2,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
             sessionPoolOptions: {
                 maxPoolSize: 50,
                 sessionOptions: {
-                    maxUsageCount: 15,
+                    maxUsageCount: 10,
                     maxAgeSecs: 600,
                 },
             },
@@ -649,7 +656,7 @@ async function main() {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
-                    await sleep((Math.random() * 0.6 + 0.4) * 1000);
+                    await sleep((Math.random() * 0.5 + 0.5) * 1000);
                     return;
                 }
 
@@ -753,7 +760,7 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    await sleep((Math.random() * 0.6 + 0.4) * 1000);
+                    await sleep((Math.random() * 0.5 + 0.5) * 1000);
                 }
             }
         });
