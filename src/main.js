@@ -172,7 +172,7 @@ async function main() {
         }
 
         const RESULTS_WANTED = Number.isFinite(+results_wanted) ? Math.max(1, +results_wanted) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : 999;
+        const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : Math.max(20, Math.ceil(RESULTS_WANTED / 5));
         postedWithinLabel = normalizePostedWithin(postedWithinInput);
         recencyWindowMs = RECENCY_WINDOWS[postedWithinLabel] || null;
         
@@ -199,16 +199,16 @@ async function main() {
             }
             fallbackHeaderHits += 1;
             return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-User': '?1',
-                'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
                 'sec-ch-ua-platform-version': '"15.0.0"',
@@ -430,9 +430,9 @@ async function main() {
             maxRequestRetries: 5,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 4,
+            maxConcurrency: 8,
             autoscaledPoolOptions: {
-                desiredConcurrency: 2,
+                desiredConcurrency: 4,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
@@ -453,13 +453,13 @@ async function main() {
                     request.headers = {
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept-Encoding': 'gzip, deflate, br, zstd',
                         'Referer': referer,
                         'Origin': 'https://www.caterer.com',
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=1, i',
                     };
-                    await sleep((Math.random() * 1.5 + 0.5) * 1000);
+                    await sleep((Math.random() * 0.8 + 0.2) * 1000);
                 },
             ],
 
@@ -516,7 +516,10 @@ async function main() {
                     const jobs = [];
                     
                     // Find all job links in h2 tags - more reliable selector
-                    const jobElements = $('h2 a[href*="/job/"]');
+                    const jobElements = $('a[href]').filter((_, el) => {
+                        const href = $(el).attr('href');
+                        return href && /\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href);
+                    });
                     crawlerLog.info(`Found ${jobElements.length} potential job links`);
                     
                     jobElements.each((idx, el) => {
@@ -531,7 +534,7 @@ async function main() {
                             
                             const jobUrl = normalizeJobUrl(href, request.url);
                             if (!jobUrl) return;
-                            const title = $link.text().trim();
+                            const title = $link.text().trim() || $jobContainer.find('h2, h3, .job-title, [class*="title"]').first().text().trim() || $link.attr('title') || 'Job Posting';
                             
                             // Try to find the parent container for this job to extract other details
                             const $jobContainer = $link.closest('article, section, .vacancy, [class*="job-item"], div[role="article"]').first();
@@ -576,7 +579,7 @@ async function main() {
                                 datePosted = normalizePostedDateValue(dateMatch[0]);
                             }
                             
-                            if (title && jobUrl && title.length > 2) {
+                            if (title && jobUrl) {
                                 if (!passesRecency(datePosted, jobUrl, crawlerLog)) {
                                     return;
                                 }
@@ -656,7 +659,7 @@ async function main() {
                             crawlerLog.info('No next page found - pagination complete');
                         }
                     }
-                    await sleep((Math.random() * 0.5 + 0.5) * 1000);
+                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
                     return;
                 }
 
@@ -760,13 +763,13 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    await sleep((Math.random() * 0.5 + 0.5) * 1000);
+                    await sleep((Math.random() * 0.3 + 0.2) * 1000);
                 }
             }
         });
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
+        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.google.com/' } })));
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
