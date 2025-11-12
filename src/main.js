@@ -430,17 +430,17 @@ async function main() {
             maxRequestRetries: 5,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 6, // Reduced from 8 to avoid overwhelming servers
+            maxConcurrency: 7,
             autoscaledPoolOptions: {
-                desiredConcurrency: 3, // Reduced from 4
+                desiredConcurrency: 4,
             },
-            requestHandlerTimeoutSecs: 180, // Increased from 120
-            navigationTimeoutSecs: 120, // Increased from 90
+            requestHandlerTimeoutSecs: 120,
+            navigationTimeoutSecs: 90,
             sessionPoolOptions: {
-                maxPoolSize: 30, // Reduced from 50
+                maxPoolSize: 50,
                 sessionOptions: {
-                    maxUsageCount: 5, // Reduced from 10
-                    maxAgeSecs: 300, // Reduced from 600
+                    maxUsageCount: 10,
+                    maxAgeSecs: 600,
                 },
             },
             
@@ -458,7 +458,6 @@ async function main() {
                         'Origin': 'https://www.caterer.com',
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=1, i',
-                        'Connection': 'close', // Force HTTP/1.1 connection close to avoid HTTP/2 stream issues
                     };
                     await sleep((Math.random() * 0.8 + 0.2) * 1000);
                 },
@@ -468,23 +467,14 @@ async function main() {
                 const retries = request.retryCount ?? 0;
                 if (session) session.retire();
                 const message = error?.message || '';
-                const isHttp2Reset = /nghttp2|NGHTTP2/i.test(message);
-                const isTimeout = /timeout|ETIMEDOUT/i.test(message);
-                const isConnectionError = /ECONNRESET|EPIPE|ENOTFOUND/i.test(message);
-                const baseWait = Math.min(30000, (2 ** Math.min(retries, 6)) * 500 + Math.random() * 1000);
-                const waitMs = isHttp2Reset ? Math.min(45000, baseWait * 2) : 
-                              isTimeout ? Math.min(60000, baseWait * 1.5) : 
-                              isConnectionError ? Math.min(40000, baseWait * 1.2) : baseWait;
-                crawlerLog.warning(
-                    isHttp2Reset ? 'HTTP/2 error detected, extended backoff' :
-                    isTimeout ? 'Timeout error, extended backoff' :
-                    isConnectionError ? 'Connection error, moderate backoff' :
-                    'Request error, applying exponential backoff', {
+                const isHttp2Reset = /nghttp2/i.test(message);
+                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400 + Math.random() * 600);
+                const waitMs = isHttp2Reset ? Math.min(30000, baseWait * 1.5) : baseWait;
+                crawlerLog.warning(isHttp2Reset ? 'HTTP/2 stream reset detected, backing off before retry' : 'Request error, applying exponential backoff before retry', {
                     url: request.url,
                     message,
                     waitMs,
                     retryCount: retries,
-                    errorType: isHttp2Reset ? 'HTTP2' : isTimeout ? 'TIMEOUT' : isConnectionError ? 'CONNECTION' : 'OTHER',
                 });
                 await sleep(waitMs);
             },
