@@ -1,43 +1,6 @@
 {
   "actorSpecification": 1,
-  "fields": {
-    "title": {
-      "type": "string",
-      "description": "Job title"
-    },
-    "company": {
-      "type": "string",
-      "description": "Company/employer name"
-    },
-    "location": {
-      "type": "string",
-      "description": "Job location"
-    },
-    "salary": {
-      "type": "string",
-      "description": "Salary or pay rate information"
-    },
-    "job_type": {
-      "type": "string",
-      "description": "Type of employment (Full-time, Part-time, Contract, etc.)"
-    },
-    "date_posted": {
-      "type": "string",
-      "description": "Date when the job was posted (ISO format)"
-    },
-    "url": {
-      "type": "string",
-      "description": "URL to the job posting"
-    },
-    "description_html": {
-      "type": "string",
-      "description": "Full job description in HTML format"
-    },
-    "description_text": {
-      "type": "string",
-      "description": "Job description as plain text"
-    }
-  },
+  "fields": {},
   "views": {
     "overview": {
       "title": "Overview",
