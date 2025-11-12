@@ -574,23 +574,45 @@ async function main() {
                 crawlerLog.info(`Waiting ${Math.round(waitMs)}ms before retry ${retries + 1}/6`);
                 await sleep(waitMs);
             },
-            async failedRequestHandler({ request, error }, { session }) {
+            async failedRequestHandler({ request, error }, { session, crawler }) {
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || error?.status;
-                
-                // Log the failure with full context
-                log.warning(`Request permanently failed after ${request.retryCount} retries (gracefully continuing)`, { 
+
+                // Enhanced failure handling - keep trying until we get results
+                log.warning(`Request permanently failed after ${request.retryCount} retries, but continuing with other URLs`, {
                     url: request.url,
                     error: message,
                     statusCode,
                     label: request.userData?.label,
                 });
-                
+
                 // Retire session
                 if (session) session.retire();
-                
-                // Don't throw - let the scraper continue with other URLs
-                // This prevents the entire run from failing due to a few problematic URLs
+
+                // For critical URLs (first page of results), try alternative approaches
+                const label = request.userData?.label;
+                if (label === 'LIST' && request.userData?.pageNo === 1 && saved < RESULTS_WANTED) {
+                    // Try the base search URL without pagination
+                    const baseUrl = request.url.split('?')[0].replace(/\/page\/\d+$/, '');
+                    const alternativeUrl = baseUrl.includes('?') ? baseUrl : `${baseUrl}?page=1`;
+
+                    if (alternativeUrl !== request.url) {
+                        log.info(`Trying alternative URL after failure: ${alternativeUrl}`);
+                        await sleep(5000 + Math.random() * 5000); // Longer cooldown for retries
+
+                        try {
+                            await crawler.addRequests([{
+                                url: alternativeUrl,
+                                userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/', retry: true }
+                            }]);
+                        } catch (enqueueError) {
+                            log.warning('Failed to enqueue alternative URL:', enqueueError.message);
+                        }
+                    }
+                }
+
+                // Don't throw - let the crawler continue with other URLs
+                // This is crucial for reaching the desired number of results
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
                 const label = request.userData?.label || 'LIST';
@@ -608,35 +630,76 @@ async function main() {
                 const pageNo = request.userData?.pageNo || 1;
                 const statusCode = response?.statusCode ?? response?.status;
                 
-                // Enhanced blocking detection
+                // Enhanced blocking detection - don't give up, keep trying
                 if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session and skipping`);
+                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session and will retry with new session`);
+
+                    // Force session retirement and mark for retry
                     if (session) {
                         session.retire();
                     }
-                    // Fast cooldown before continuing
-                    await sleep(1500 + Math.random() * 1500);
+
+                    // For pagination URLs, try to continue with other pages
+                    if (label === 'LIST' && pageNo < MAX_PAGES) {
+                        // Try next page immediately with a fresh session
+                        const nextPage = pageNo + 1;
+                        const currentUrl = new URL(request.url);
+                        currentUrl.searchParams.set('page', nextPage.toString());
+
+                        crawlerLog.info(`Retrying with next page due to block: ${currentUrl.href}`);
+                        await sleep(2000 + Math.random() * 2000); // Brief cooldown
+
+                        await enqueueLinks({
+                            urls: [currentUrl.href],
+                            userData: { label: 'LIST', pageNo: nextPage, referrer: request.url }
+                        });
+                        stats.listPagesEnqueued += 1;
+                    }
+
+                    // Don't return - let the crawler continue with other queued URLs
+                    // This ensures we keep processing until we reach RESULTS_WANTED
                     return;
                 }
                 
                 const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
                 const bodyText = typeof $ === 'function' ? $('body').first().text().toLowerCase() : '';
                 
-                // More comprehensive blocking detection
+                // More comprehensive blocking detection - keep trying
                 if ($ && (
-                    pageTitle.includes('access denied') || 
+                    pageTitle.includes('access denied') ||
                     pageTitle.includes('temporarily blocked') ||
                     pageTitle.includes('captcha') ||
                     bodyText.includes('please verify you are human') ||
                     bodyText.includes('unusual traffic')
                 )) {
                     stats.blockedResponses += 1;
-                    crawlerLog.warning(`Detected access denial content on ${request.url}, skipping page`);
+                    crawlerLog.warning(`Detected access denial content on ${request.url}, retiring session and continuing with other URLs`);
+
                     if (session) {
                         session.retire();
                     }
-                    await sleep(1500 + Math.random() * 1500);
+
+                    // For list pages, try alternative approaches
+                    if (label === 'LIST') {
+                        // Try a different search approach or skip to next page
+                        if (pageNo < MAX_PAGES) {
+                            const nextPage = pageNo + 1;
+                            const baseUrl = request.url.split('?')[0];
+                            const nextUrl = `${baseUrl}?page=${nextPage}`;
+
+                            crawlerLog.info(`Trying alternative page due to content block: ${nextUrl}`);
+                            await sleep(3000 + Math.random() * 2000);
+
+                            await enqueueLinks({
+                                urls: [nextUrl],
+                                userData: { label: 'LIST', pageNo: nextPage, referrer: request.url }
+                            });
+                            stats.listPagesEnqueued += 1;
+                        }
+                    }
+
+                    // Continue with other work instead of stopping
                     return;
                 }
 
@@ -911,6 +974,200 @@ async function main() {
             log.warning('Crawler encountered errors but continuing with post-processing:', crawlerError.message);
         }
 
+        // Resilience check: If we didn't get enough results due to blocking, try alternative approaches
+        if (saved < RESULTS_WANTED && stats.blockedResponses > 0) {
+            log.warning(`Only got ${saved}/${RESULTS_WANTED} results due to ${stats.blockedResponses} blocked responses. Trying alternative approaches...`);
+
+            // Try alternative search URLs with different parameters
+            const alternativeUrls = [];
+            const baseUrl = buildStartUrl(keyword, location, category);
+
+            // Try without location filter
+            if (location && saved < RESULTS_WANTED) {
+                const noLocationUrl = buildStartUrl(keyword, '', category);
+                if (noLocationUrl !== baseUrl) {
+                    alternativeUrls.push({
+                        url: noLocationUrl,
+                        userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
+                    });
+                }
+            }
+
+            // Try broader search terms
+            if (keyword && saved < RESULTS_WANTED) {
+                const broadKeywords = keyword.split(' ').slice(0, 1); // Just first word
+                if (broadKeywords.length < keyword.split(' ').length) {
+                    const broadUrl = buildStartUrl(broadKeywords.join(' '), location, category);
+                    if (broadUrl !== baseUrl) {
+                        alternativeUrls.push({
+                            url: broadUrl,
+                            userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
+                        });
+                    }
+                }
+            }
+
+            // Try category-specific searches
+            if (!category && saved < RESULTS_WANTED) {
+                const categories = ['chef', 'hospitality', 'restaurant', 'catering'];
+                for (const cat of categories.slice(0, 2)) { // Try first 2 categories
+                    if (saved >= RESULTS_WANTED) break;
+                    const catUrl = buildStartUrl(keyword, location, cat);
+                    alternativeUrls.push({
+                        url: catUrl,
+                        userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
+                    });
+                }
+            }
+
+            // Run alternative searches if we still need results
+            if (alternativeUrls.length > 0 && saved < RESULTS_WANTED) {
+                log.info(`Trying ${alternativeUrls.length} alternative search approaches to reach ${RESULTS_WANTED} results`);
+
+                try {
+                    // Create a new crawler instance for alternatives with more conservative settings
+                    const fallbackCrawler = new CheerioCrawler({
+                        proxyConfiguration: proxyConf,
+                        maxRequestRetries: 8, // More retries for alternatives
+                        useSessionPool: true,
+                        minConcurrency: 1,
+                        maxConcurrency: 3, // More conservative for alternatives
+                        autoscaledPoolOptions: {
+                            desiredConcurrency: 2,
+                            maxConcurrency: 3,
+                            minConcurrency: 1,
+                        },
+                        requestHandlerTimeoutSecs: 120,
+                        navigationTimeoutSecs: 90,
+                        sessionPoolOptions: {
+                            maxPoolSize: 30,
+                            sessionOptions: {
+                                maxUsageCount: 4, // Fresh sessions for alternatives
+                                maxAgeSecs: 200,
+                            },
+                        },
+                        persistCookiesPerSession: false,
+
+                        additionalMimeTypes: ['application/json', 'text/plain'],
+                        suggestResponseEncoding: 'utf-8',
+
+                        preNavigationHooks: [
+                            async ({ request, session }) => {
+                                // More conservative delays for alternative searches
+                                await sleep(2000 + Math.random() * 3000);
+
+                                const headers = getHeaders();
+                                const referer = request.userData?.referrer || 'https://www.caterer.com/';
+                                const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
+
+                                request.headers = {
+                                    ...headers,
+                                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                                    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                    'Accept-Encoding': 'gzip, deflate, br',
+                                    'Referer': referer,
+                                    'Sec-Fetch-Site': fetchSite,
+                                    'Sec-Fetch-Mode': 'navigate',
+                                    'Sec-Fetch-User': '?1',
+                                    'Sec-Fetch-Dest': 'document',
+                                    'Upgrade-Insecure-Requests': '1',
+                                    'Cache-Control': 'max-age=0',
+                                    'Connection': 'keep-alive',
+                                };
+
+                                delete request.headers['DNT'];
+                                delete request.headers['dnt'];
+
+                                if (request.options) {
+                                    request.options.http2 = false;
+                                }
+                            },
+                        ],
+
+                        async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
+                            if (saved >= RESULTS_WANTED) {
+                                crawlerLog.info('Results limit reached in fallback crawler, stopping');
+                                return;
+                            }
+
+                            const label = request.userData?.label || 'LIST';
+                            const pageNo = request.userData?.pageNo || 1;
+                            const statusCode = response?.statusCode ?? response?.status;
+
+                            if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
+                                crawlerLog.warning(`Fallback crawler also blocked on ${request.url}, skipping alternative`);
+                                return;
+                            }
+
+                            if (label === 'LIST') {
+                                crawlerLog.info(`Processing fallback LIST page ${pageNo}: ${request.url}`);
+
+                                const jobs = [];
+                                const jobElements = $('a[href]').filter((_, el) => {
+                                    const href = $(el).attr('href');
+                                    return href && /\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href);
+                                });
+
+                                jobElements.each((idx, el) => {
+                                    try {
+                                        const $link = $(el);
+                                        const href = $link.attr('href');
+                                        if (!href || !/\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href)) return;
+
+                                        const jobUrl = normalizeJobUrl(href, request.url);
+                                        if (!jobUrl) return;
+
+                                        const title = $link.text().trim() || $link.attr('title') || 'Job Posting';
+                                        if (title) {
+                                            jobs.push({
+                                                title,
+                                                company: null,
+                                                location: null,
+                                                salary: null,
+                                                job_type: null,
+                                                date_posted: null,
+                                                description_html: null,
+                                                description_text: null,
+                                                url: jobUrl,
+                                            });
+                                        }
+                                    } catch (err) {
+                                        crawlerLog.warning(`Error parsing fallback job: ${err.message}`);
+                                    }
+                                });
+
+                                if (jobs.length > 0) {
+                                    const remaining = Math.max(0, RESULTS_WANTED - saved);
+                                    for (const job of jobs.slice(0, remaining)) {
+                                        if (saved >= RESULTS_WANTED) break;
+                                        await pushJob(job, 'FALLBACK_LIST');
+                                    }
+                                }
+
+                                // Try next page if needed
+                                if (saved < RESULTS_WANTED && pageNo < Math.min(MAX_PAGES, 3)) {
+                                    const next = findNextPage($, request.url);
+                                    if (next) {
+                                        await enqueueLinks({
+                                            urls: [next],
+                                            userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url, alternative: true }
+                                        });
+                                    }
+                                }
+
+                                await sleep(1000 + Math.random() * 1000);
+                            }
+                        }
+                    });
+
+                    await fallbackCrawler.run(alternativeUrls.slice(0, 3)); // Limit to 3 alternative attempts
+
+                } catch (fallbackError) {
+                    log.warning('Fallback crawler failed:', fallbackError.message);
+                }
+            }
+        }
+
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
             for (const job of pendingListings.values()) {
@@ -928,36 +1185,60 @@ async function main() {
         stats.postedWithin = postedWithinLabel;
         stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
-        
+
         // Calculate success rate
         const totalRequests = stats.listPagesProcessed + stats.detailPagesProcessed;
         const successfulRequests = totalRequests - stats.blockedResponses;
         stats.successRate = totalRequests > 0 ? ((successfulRequests / totalRequests) * 100).toFixed(2) + '%' : 'N/A';
-        
+
+        // Add fallback attempt info
+        stats.fallbackAttempts = saved < RESULTS_WANTED && stats.blockedResponses > 0 ? 'Attempted' : 'Not needed';
+        stats.targetAchieved = saved >= RESULTS_WANTED;
+
         await Actor.setValue('RUN_STATS', stats);
-        
-        // Enhanced result summary
+
+        // Enhanced result summary with resilience info
         log.info('=== Scraper Run Summary ===', {
             totalSaved: saved,
             targetResults: RESULTS_WANTED,
+            targetAchieved: stats.targetAchieved,
             listPagesProcessed: stats.listPagesProcessed,
             detailPagesProcessed: stats.detailPagesProcessed,
             blockedResponses: stats.blockedResponses,
             successRate: stats.successRate,
+            fallbackAttempts: stats.fallbackAttempts,
             recencyFiltered: stats.recencyFiltered,
             duplicateJobsSkipped: stats.duplicateJobsSkipped,
         });
-        
-        if (saved === 0) {
-            log.warning('No jobs were extracted. Possible causes:', {
+
+        if (saved < RESULTS_WANTED) {
+            const shortfall = RESULTS_WANTED - saved;
+            log.warning(`Failed to reach target: got ${saved}/${RESULTS_WANTED} results (${shortfall} short)`, {
                 possibleReasons: [
-                    'All requests were blocked (check blockedResponses count)',
-                    'Site selectors may have changed',
-                    'postedWithin filter too restrictive',
-                    'Proxy configuration issues',
+                    `${stats.blockedResponses} requests were blocked`,
+                    'Site may have strong anti-bot measures',
+                    'Search criteria may be too restrictive',
+                    'Consider using residential proxies',
+                    'Fallback attempts were made but may need more aggressive approaches'
                 ],
                 blockedCount: stats.blockedResponses,
                 successRate: stats.successRate,
+                fallbackUsed: stats.fallbackAttempts,
+            });
+        } else {
+            log.info(`🎉 Target achieved! Successfully collected ${saved}/${RESULTS_WANTED} job listings`);
+        }
+
+        if (stats.blockedResponses > totalRequests * 0.3) {
+            log.warning('High rate of blocked requests detected. Recommendations:', {
+                blockedPercentage: ((stats.blockedResponses / totalRequests) * 100).toFixed(2) + '%',
+                suggestions: [
+                    'Use residential proxies instead of datacenter',
+                    'Reduce concurrency further',
+                    'Increase delays between requests',
+                    'Consider rotating user agents more frequently',
+                    'The actor attempted fallback strategies automatically'
+                ],
             });
         }
         
