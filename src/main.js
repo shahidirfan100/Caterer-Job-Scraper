@@ -1,4 +1,4 @@
-// Caterer.com jobs scraper - Production-ready implementation
+// Caterer Job Scraper - Production-ready implementation
 // Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
@@ -155,10 +155,11 @@ async function main() {
 
         const keyword = safeStr(input.keyword, '');
         const location = safeStr(input.location, '');
-        const category = safeStr(input.category, '');
         const results_wanted = safeInt(input.results_wanted, 100);
         const max_pages = safeInt(input.max_pages, 20);
         const collectDetails = safeBool(input.collectDetails, true);
+        const startUrl = safeStr(input.startUrl, '');
+        const url = safeStr(input.url, '');
         const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
         const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
         const postedWithinInput = safeStr(input.postedWithin, 'any');
@@ -170,14 +171,13 @@ async function main() {
         }
 
         const RESULTS_WANTED = Number.isFinite(+results_wanted) ? Math.max(1, +results_wanted) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : Math.max(20, Math.ceil(RESULTS_WANTED / 5));
+        const MAX_PAGES = Number.isFinite(+max_pages) ? Math.max(1, +max_pages) : 999;
         postedWithinLabel = normalizePostedWithin(postedWithinInput);
         recencyWindowMs = RECENCY_WINDOWS[postedWithinLabel] || null;
         
-        log.info('Starting Caterer.com Job Scraper', { 
+        log.info('Starting Caterer Job Scraper', { 
             keyword, 
             location, 
-            category, 
             results_wanted: RESULTS_WANTED, 
             max_pages: MAX_PAGES,
             collect_details: collectDetails,
@@ -186,53 +186,35 @@ async function main() {
 
         initHeaderGenerator();
         let fallbackHeaderHits = 0;
-        
-        // Multiple realistic user agent strings for rotation
-        const userAgents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
-        ];
-        
-        // Dynamic header generation for anti-bot evasion with consistent fingerprints
+        // Dynamic header generation for anti-bot evasion
         const getHeaders = () => {
             if (headerGeneratorInstance) {
                 try {
-                    const headers = headerGeneratorInstance.getHeaders();
-                    // Ensure no bot-identifying headers
-                    delete headers['DNT'];
-                    delete headers['dnt'];
-                    return headers;
+                    return headerGeneratorInstance.getHeaders();
                 } catch (error) {
                     log.warning('HeaderGenerator getHeaders failed, using fallback headers:', error.message);
                 }
             }
             fallbackHeaderHits += 1;
-            
-            // Rotate user agent on fallback
-            const ua = userAgents[fallbackHeaderHits % userAgents.length];
-            const isChrome = ua.includes('Chrome') && !ua.includes('Firefox');
-            
-            const baseHeaders = {
-                'User-Agent': ua,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
+            return {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-User': '?1',
+                'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform-version': '"15.0.0"',
+                'sec-ch-ua-arch': '"x86"',
+                'sec-ch-ua-bitness': '"64"',
+                'sec-ch-ua-model': '""',
                 'Cache-Control': 'max-age=0',
             };
-            
-            // Add Chrome-specific client hints only for Chrome UA
-            if (isChrome) {
-                baseHeaders['sec-ch-ua'] = '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"';
-                baseHeaders['sec-ch-ua-mobile'] = '?0';
-                baseHeaders['sec-ch-ua-platform'] = ua.includes('Mac') ? '"macOS"' : '"Windows"';
-            }
-            
-            return baseHeaders;
         };
 
         const toAbs = (href, base = 'https://www.caterer.com') => {
@@ -264,7 +246,22 @@ async function main() {
         const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
         const extractJobTypeFromPage = ($) => {
             if (!$) return null;
-            const keywords = ['job type', 'employment type', 'contract type'];
+            
+            // First try schema.org structured data
+            const schemaNode = $('[itemprop="employmentType"], meta[itemprop="employmentType"]').first();
+            if (schemaNode.length) {
+                const value = schemaNode.attr('content') || schemaNode.text();
+                if (value) return normalizeText(value);
+            }
+            
+            // Try data-testid attributes
+            const dataTestId = $('[data-testid*="employment-type"], [data-testid*="job-type"]').first().text();
+            if (dataTestId) return normalizeText(dataTestId);
+            
+            // Keywords to look for
+            const keywords = ['job type', 'employment type', 'contract type', 'type of employment'];
+            
+            // Expanded selectors for better coverage
             const candidateSelectors = [
                 'li',
                 '.job-summary__item',
@@ -273,7 +270,13 @@ async function main() {
                 '.job-card__meta li',
                 '.job-meta li',
                 '[class*="summary"] li',
+                '.job-specification li',
+                '[class*="job-detail"] li',
+                'dl dt',
+                '.info-item',
+                '[class*="attribute"]'
             ];
+            
             for (const selector of candidateSelectors) {
                 const items = $(selector);
                 if (!items.length) continue;
@@ -283,7 +286,19 @@ async function main() {
                     const rawText = normalizeText($el.text());
                     if (!rawText) continue;
                     const lower = rawText.toLowerCase();
+                    
+                    // Check if this element contains a job type keyword
                     if (!keywords.some((keyword) => lower.includes(keyword))) continue;
+                    
+                    // Try to extract value from sibling dd element (for dl/dt/dd structure)
+                    if ($el.is('dt')) {
+                        const ddValue = $el.next('dd').text().trim();
+                        if (ddValue && ddValue.length > 2 && ddValue.length < 50) {
+                            return normalizeText(ddValue);
+                        }
+                    }
+                    
+                    // Try to find spans and extract the last one (usually the value)
                     const spans = $el.find('span');
                     if (spans.length > 1) {
                         const candidate = normalizeText($(spans[spans.length - 1]).text());
@@ -291,39 +306,51 @@ async function main() {
                             return candidate;
                         }
                     }
-                    const cleaned = keywords.reduce((acc, keyword) => acc.replace(new RegExp(keyword, 'ig'), ''), rawText)
-                        .replace(/[:\-]/g, '')
+                    
+                    // Extract by removing the keyword label
+                    const cleaned = keywords.reduce((acc, keyword) => 
+                        acc.replace(new RegExp(keyword + '\\s*:?\\s*', 'ig'), ''), rawText)
+                        .replace(/^[:\-\s]+|[:\-\s]+$/g, '')
                         .trim();
-                    if (cleaned) return cleaned;
+                    if (cleaned && cleaned.length > 2 && cleaned.length < 50) {
+                        // Validate it looks like a job type
+                        const validTypes = ['full', 'part', 'contract', 'permanent', 'temporary', 'freelance', 'casual', 'seasonal'];
+                        if (validTypes.some(type => cleaned.toLowerCase().includes(type))) {
+                            return cleaned;
+                        }
+                    }
                 }
             }
-            const schemaNode = $('[itemprop="employmentType"], meta[itemprop="employmentType"]').first();
-            if (schemaNode.length) {
-                const value = schemaNode.attr('content') || schemaNode.text();
-                if (value) return normalizeText(value);
+            
+            // Fallback: search for common job type terms in the page text
+            const pageText = $('body').text();
+            const typePatterns = [
+                /(?:job type|employment type|contract type)\s*:?\s*(full[- ]?time|part[- ]?time|contract|permanent|temporary|freelance)/i,
+                /(full[- ]?time|part[- ]?time)\s+(?:position|role|employment)/i
+            ];
+            for (const pattern of typePatterns) {
+                const match = pageText.match(pattern);
+                if (match && match[1]) {
+                    return normalizeText(match[1]);
+                }
             }
-            const dataTestId = $('[data-testid*="employment-type"], [data-testid*="job-type"]').first().text();
-            if (dataTestId) return normalizeText(dataTestId);
+            
             return null;
         };
 
-        const buildStartUrl = (kw, loc, cat) => {
-            if (cat) {
-                let url = `https://www.caterer.com/jobs/${encodeURIComponent(cat.toLowerCase())}`;
-                if (loc) url += `?location=${encodeURIComponent(loc)}`;
-                return url;
-            } else {
-                // Caterer.com uses /jobs/search for search results
-                const u = new URL('https://www.caterer.com/jobs/search');
-                if (kw) u.searchParams.set('keywords', String(kw).trim());
-                if (loc) u.searchParams.set('location', String(loc).trim());
-                return u.href;
-            }
+        const buildStartUrl = (kw, loc) => {
+            // Caterer.com uses /jobs/search for search results
+            const u = new URL('https://www.caterer.com/jobs/search');
+            if (kw) u.searchParams.set('keywords', String(kw).trim());
+            if (loc) u.searchParams.set('location', String(loc).trim());
+            return u.href;
         };
 
         const initial = [];
         if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-        if (!initial.length) initial.push(buildStartUrl(keyword, location, category));
+        if (startUrl) initial.push(startUrl);
+        if (url) initial.push(url);
+        if (!initial.length) initial.push(buildStartUrl(keyword, location));
 
         // Defensive proxyConfiguration handling
         let proxyConf = undefined;
@@ -352,6 +379,9 @@ async function main() {
             listPagesEnqueued: initial.length,
             pendingListingFlushes: 0,
             recencyFiltered: 0,
+            sessionsRetired: 0,
+            requestErrors: 0,
+            jobsWithJobType: 0,
         };
         const passesRecency = (dateValue, url, logger = log) => {
             if (shouldKeepByRecency(dateValue)) return true;
@@ -368,10 +398,17 @@ async function main() {
                 return false;
             }
             if (!passesRecency(job.date_posted, job.url)) return false;
+            
+            // Track extraction success rates
+            if (job.job_type) stats.jobsWithJobType += 1;
+            
             await Dataset.pushData(job);
             pushedUrls.add(job.url);
             saved += 1;
-            log.info(`✓ Saved (${sourceLabel}) Total: ${saved}/${RESULTS_WANTED}`, { url: job.url });
+            log.info(`✓ Saved (${sourceLabel}) Total: ${saved}/${RESULTS_WANTED}`, { 
+                url: job.url,
+                hasJobType: !!job.job_type
+            });
             return true;
         };
 
@@ -445,76 +482,44 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 6,
             useSessionPool: true,
-            minConcurrency: 3,
+            minConcurrency: 2,
             maxConcurrency: 8,
             autoscaledPoolOptions: {
-                desiredConcurrency: 5,
+                desiredConcurrency: 4,
                 maxConcurrency: 8,
-                minConcurrency: 3,
+                minConcurrency: 2,
             },
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
             sessionPoolOptions: {
-                maxPoolSize: 60,
+                maxPoolSize: 100,
                 sessionOptions: {
                     maxUsageCount: 8,
-                    maxAgeSecs: 500,
+                    maxAgeSecs: 300,
                 },
             },
-            persistCookiesPerSession: false,
-
-            // Force HTTP/1.1 to avoid HTTP/2 stream errors
-            additionalMimeTypes: ['application/json', 'text/plain'],
-            suggestResponseEncoding: 'utf-8',
-
+            
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
-                async ({ request, session, log: crawlerLog }) => {
-                    // Highly optimized delays: minimal but realistic
-                    const label = request.userData?.label || 'LIST';
-                    const isListPage = label === 'LIST';
-
-                    // List pages: 0.3-0.8s, Detail pages: 0.15-0.4s
-                    const baseDelay = isListPage
-                        ? 300 + Math.random() * 500  // 0.3-0.8s for list pages
-                        : 150 + Math.random() * 250;  // 0.15-0.4s for detail pages
-
-                    await sleep(baseDelay);
-                    
+                async ({ request, session }) => {
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
-                    
-                    // Enhanced headers with better fingerprinting consistency
                     request.headers = {
                         ...headers,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br, zstd',
                         'Referer': referer,
                         'Sec-Fetch-Site': fetchSite,
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-User': '?1',
-                        'Sec-Fetch-Dest': 'document',
-                        'Upgrade-Insecure-Requests': '1',
-                        'Cache-Control': 'max-age=0',
-                        'Connection': 'keep-alive',
+                        'Priority': 'u=0, i',
                     };
-                    
-                    // Remove DNT and bot-identifying headers
+                    // Remove bot-identifying headers
                     delete request.headers['DNT'];
                     delete request.headers['dnt'];
                     
-                    // Force HTTP/1.1 to avoid HTTP/2 stream errors
-                    if (request.options) {
-                        request.options.http2 = false;
-                    }
-                    
-                    // Retire sessions less aggressively for better speed
-                    if (session && session.usageCount >= 6) {
-                        session.retire();
-                        crawlerLog.debug('Retiring session proactively after 6 uses');
-                    }
+                    // Human-like delay with jitter (300-900ms)
+                    const delay = Math.random() * 600 + 300;
+                    await sleep(delay);
                 },
             ],
 
@@ -523,185 +528,91 @@ async function main() {
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || error?.status;
                 
-                // Retire session on any error
-                if (session) {
+                stats.requestErrors += 1;
+                
+                // Retire session on blocking or serious errors
+                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha/i.test(message))) {
+                    crawlerLog.warning('Session retired due to blocking signal', { url: request.url, statusCode });
                     session.retire();
+                    stats.sessionsRetired += 1;
                 }
                 
-                // Identify error types
-                const isHttp2Error = /nghttp2|http2|stream closed/i.test(message);
-                const isBlockedError = [403, 429].includes(Number(statusCode)) || /blocked|denied/i.test(message);
-                const isNetworkError = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(message);
+                const isHttp2Reset = /nghttp2/i.test(message);
+                const isBlocked = statusCode === 403 || statusCode === 429;
                 
-                // Fast exponential backoff - optimized for speed
-                let baseWait = Math.min(25000, (2 ** Math.min(retries, 5)) * 300);
+                // Exponential backoff with jitter
+                const baseWait = Math.min(25000, (2 ** Math.min(retries, 7)) * 500);
+                const jitter = Math.random() * 1000;
+                const multiplier = isBlocked ? 2.0 : (isHttp2Reset ? 1.5 : 1.0);
+                const waitMs = Math.min(40000, baseWait * multiplier + jitter);
                 
-                // Apply multipliers based on error type
-                if (isBlockedError) {
-                    baseWait *= 1.5;
-                    crawlerLog.warning('Detected blocking (403/429), applying moderate backoff', {
+                crawlerLog.warning(
+                    isBlocked ? 'Blocked response detected, extended backoff' : 
+                    isHttp2Reset ? 'HTTP/2 stream reset, backing off' : 
+                    'Request error, exponential backoff with jitter', 
+                    {
                         url: request.url,
+                        message,
                         statusCode,
-                        waitMs: baseWait,
+                        waitMs: Math.round(waitMs),
                         retryCount: retries,
-                    });
-                } else if (isHttp2Error) {
-                    baseWait *= 1.2;
-                    crawlerLog.warning('HTTP/2 error detected, applying light backoff and forcing HTTP/1.1', {
-                        url: request.url,
-                        message,
-                        waitMs: baseWait,
-                        retryCount: retries,
-                    });
-                    // Force HTTP/1.1 for retry
-                    if (request.options) {
-                        request.options.http2 = false;
                     }
-                } else if (isNetworkError) {
-                    baseWait *= 1.1;
-                    crawlerLog.warning('Network error, applying minimal backoff', {
-                        url: request.url,
-                        message,
-                        waitMs: baseWait,
-                        retryCount: retries,
-                    });
-                }
-                
-                // Add random jitter (±15%)
-                const jitter = baseWait * (0.85 + Math.random() * 0.3);
-                const waitMs = Math.min(30000, jitter);
-                
-                crawlerLog.info(`Waiting ${Math.round(waitMs)}ms before retry ${retries + 1}/6`);
+                );
                 await sleep(waitMs);
             },
-            async failedRequestHandler({ request, error }, { session, crawler }) {
-                const message = error?.message || '';
-                const statusCode = error?.statusCode || error?.status;
-
-                // Enhanced failure handling - keep trying until we get results
-                log.warning(`Request permanently failed after ${request.retryCount} retries, but continuing with other URLs`, {
-                    url: request.url,
-                    error: message,
-                    statusCode,
-                    label: request.userData?.label,
+            async failedRequestHandler({ request, error }, { session }) {
+                log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
+                    error: error.message,
+                    statusCode: error.statusCode 
                 });
-
-                // Retire session
                 if (session) session.retire();
-
-                // For critical URLs (first page of results), try alternative approaches
-                const label = request.userData?.label;
-                if (label === 'LIST' && request.userData?.pageNo === 1 && saved < RESULTS_WANTED) {
-                    // Try the base search URL without pagination
-                    const baseUrl = request.url.split('?')[0].replace(/\/page\/\d+$/, '');
-                    const alternativeUrl = baseUrl.includes('?') ? baseUrl : `${baseUrl}?page=1`;
-
-                    if (alternativeUrl !== request.url) {
-                        log.info(`Trying alternative URL after failure: ${alternativeUrl}`);
-                        await sleep(5000 + Math.random() * 5000); // Longer cooldown for retries
-
-                        try {
-                            await crawler.addRequests([{
-                                url: alternativeUrl,
-                                userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/', retry: true }
-                            }]);
-                        } catch (enqueueError) {
-                            log.warning('Failed to enqueue alternative URL:', enqueueError.message);
-                        }
-                    }
-                }
-
-                // Don't throw - let the crawler continue with other URLs
-                // This is crucial for reaching the desired number of results
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
-                const label = request.userData?.label || 'LIST';
-                
-                // Ultra-fast reading delay based on page type
-                const readingDelay = label === 'DETAIL' 
-                    ? 100 + Math.random() * 200  // 0.1-0.3s for detail pages
-                    : 200 + Math.random() * 300; // 0.2-0.5s for list pages
-                await sleep(readingDelay);
-                
-                if (saved >= RESULTS_WANTED) {
-                    crawlerLog.info('Results limit reached, skipping further processing');
-                    return;
-                }
-                const pageNo = request.userData?.pageNo || 1;
-                const statusCode = response?.statusCode ?? response?.status;
-                
-                // Enhanced blocking detection - don't give up, keep trying
-                if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
-                    stats.blockedResponses += 1;
-                    crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}, retiring session and will retry with new session`);
-
-                    // Force session retirement and mark for retry
-                    if (session) {
-                        session.retire();
+                try {
+                    if (saved >= RESULTS_WANTED) {
+                        crawlerLog.info('Results limit reached, skipping further processing');
+                        return;
                     }
 
-                    // For pagination URLs, try to continue with other pages
-                    if (label === 'LIST' && pageNo < MAX_PAGES) {
-                        // Try next page immediately with a fresh session
-                        const nextPage = pageNo + 1;
-                        const currentUrl = new URL(request.url);
-                        currentUrl.searchParams.set('page', nextPage.toString());
-
-                        crawlerLog.info(`Retrying with next page due to block: ${currentUrl.href}`);
-                        await sleep(2000 + Math.random() * 2000); // Brief cooldown
-
-                        await enqueueLinks({
-                            urls: [currentUrl.href],
-                            userData: { label: 'LIST', pageNo: nextPage, referrer: request.url }
-                        });
-                        stats.listPagesEnqueued += 1;
-                    }
-
-                    // Don't return - let the crawler continue with other queued URLs
-                    // This ensures we keep processing until we reach RESULTS_WANTED
-                    return;
-                }
-                
-                const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
-                const bodyText = typeof $ === 'function' ? $('body').first().text().toLowerCase() : '';
-                
-                // More comprehensive blocking detection - keep trying
-                if ($ && (
-                    pageTitle.includes('access denied') ||
-                    pageTitle.includes('temporarily blocked') ||
-                    pageTitle.includes('captcha') ||
-                    bodyText.includes('please verify you are human') ||
-                    bodyText.includes('unusual traffic')
-                )) {
-                    stats.blockedResponses += 1;
-                    crawlerLog.warning(`Detected access denial content on ${request.url}, retiring session and continuing with other URLs`);
-
-                    if (session) {
-                        session.retire();
-                    }
-
-                    // For list pages, try alternative approaches
-                    if (label === 'LIST') {
-                        // Try a different search approach or skip to next page
-                        if (pageNo < MAX_PAGES) {
-                            const nextPage = pageNo + 1;
-                            const baseUrl = request.url.split('?')[0];
-                            const nextUrl = `${baseUrl}?page=${nextPage}`;
-
-                            crawlerLog.info(`Trying alternative page due to content block: ${nextUrl}`);
-                            await sleep(3000 + Math.random() * 2000);
-
-                            await enqueueLinks({
-                                urls: [nextUrl],
-                                userData: { label: 'LIST', pageNo: nextPage, referrer: request.url }
-                            });
-                            stats.listPagesEnqueued += 1;
+                    const label = request.userData?.label || 'LIST';
+                    const pageNo = request.userData?.pageNo || 1;
+                    const statusCode = response?.statusCode ?? response?.status;
+                    
+                    // Enhanced blocking detection
+                    if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
+                        stats.blockedResponses += 1;
+                        crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}`);
+                        if (session) {
+                            session.retire();
+                            stats.sessionsRetired += 1;
+                            crawlerLog.info('Session retired and will rotate', { sessionId: session.id?.slice(0, 8) });
                         }
+                        throw new Error(`Blocked with status ${statusCode}`);
                     }
-
-                    // Continue with other work instead of stopping
-                    return;
-                }
+                    
+                    // Check for captcha or access denial in page content
+                    const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
+                    const bodyText = typeof $ === 'function' ? $('body').text().toLowerCase() : '';
+                    const blockSignals = ['access denied', 'temporarily blocked', 'captcha', 'cloudflare', 'please verify'];
+                    const isBlocked = blockSignals.some(sig => pageTitle.includes(sig) || bodyText.includes(sig));
+                    
+                    if ($ && isBlocked) {
+                        stats.blockedResponses += 1;
+                        crawlerLog.warning(`Detected blocking content on ${request.url}`);
+                        if (session) {
+                            session.retire();
+                            stats.sessionsRetired += 1;
+                            crawlerLog.info('Session retired due to blocking detection', { sessionId: session.id?.slice(0, 8) });
+                        }
+                        throw new Error('Access denied or captcha detected');
+                    }
+                    
+                    crawlerLog.info(`Processing ${label} page`, { 
+                        url: request.url, 
+                        pageNo, 
+                        statusCode,
+                        sessionId: session?.id?.slice(0, 8)
+                    });
 
                 if (label === 'LIST') {
                     stats.listPagesProcessed += 1;
@@ -711,10 +622,7 @@ async function main() {
                     const jobs = [];
                     
                     // Find all job links in h2 tags - more reliable selector
-                    const jobElements = $('a[href]').filter((_, el) => {
-                        const href = $(el).attr('href');
-                        return href && /\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href);
-                    });
+                    const jobElements = $('h2 a[href*="/job/"]');
                     crawlerLog.info(`Found ${jobElements.length} potential job links`);
                     
                     jobElements.each((idx, el) => {
@@ -729,7 +637,7 @@ async function main() {
                             
                             const jobUrl = normalizeJobUrl(href, request.url);
                             if (!jobUrl) return;
-                            const title = $link.text().trim() || $jobContainer.find('h2, h3, .job-title, [class*="title"]').first().text().trim() || $link.attr('title') || 'Job Posting';
+                            const title = $link.text().trim();
                             
                             // Try to find the parent container for this job to extract other details
                             const $jobContainer = $link.closest('article, section, .vacancy, [class*="job-item"], div[role="article"]').first();
@@ -774,28 +682,89 @@ async function main() {
                                 datePosted = normalizePostedDateValue(dateMatch[0]);
                             }
                             
-                            if (title && jobUrl) {
+                            // Extract job type from listing
+                            let jobType = null;
+                            const jobTypeKeywords = ['full time', 'part time', 'contract', 'permanent', 'temporary', 'freelance', 'full-time', 'part-time'];
+                            const containerTextLower = locationText.toLowerCase();
+                            for (const keyword of jobTypeKeywords) {
+                                if (containerTextLower.includes(keyword)) {
+                                    // Extract the actual text with proper casing
+                                    const regex = new RegExp(keyword.replace('-', '[\\s-]?'), 'i');
+                                    const match = locationText.match(regex);
+                                    if (match) {
+                                        jobType = match[0].trim();
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Also check for job type in specific elements
+                            if (!jobType) {
+                                const typeSelectors = [
+                                    '.job-type',
+                                    '[class*="employment"]',
+                                    '[class*="contract"]',
+                                    'span:contains("Full")',
+                                    'span:contains("Part")'
+                                ];
+                                for (const sel of typeSelectors) {
+                                    const typeEl = $jobContainer.find(sel).first();
+                                    if (typeEl.length) {
+                                        const typeText = typeEl.text().trim();
+                                        if (typeText && typeText.length > 3 && typeText.length < 30) {
+                                            jobType = typeText;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (title && jobUrl && title.length > 2) {
                                 if (!passesRecency(datePosted, jobUrl, crawlerLog)) {
                                     return;
                                 }
-                                jobs.push({
+                                const job = {
                                     title,
                                     company,
                                     location,
                                     salary,
-                                    job_type: null,
+                                    job_type: jobType,
                                     date_posted: datePosted,
                                     description_html: null,
                                     description_text: null,
                                     url: jobUrl,
-                                });
+                                };
+                                jobs.push(job);
+                                
+                                // Log extraction details for debugging
+                                if (idx < 3) { // Log first 3 jobs for debugging
+                                    crawlerLog.debug('Job extracted from listing:', {
+                                        title,
+                                        job_type: jobType || 'NOT_FOUND',
+                                        hasCompany: !!company,
+                                        hasLocation: !!location
+                                    });
+                                }
                             }
                         } catch (err) {
                             crawlerLog.warning(`Error parsing job element: ${err.message}`);
                         }
                     });
                     
-                    crawlerLog.info(`Extracted ${jobs.length} valid jobs from ${request.url}`);
+                    crawlerLog.info(`Extracted ${jobs.length} valid jobs from page ${pageNo}`, { 
+                        url: request.url,
+                        jobsExtracted: jobs.length,
+                        totalSaved: saved,
+                        remaining: RESULTS_WANTED - saved
+                    });
+                    
+                    if (jobs.length === 0) {
+                        crawlerLog.warning('No jobs found on page - possible selector issue or empty page', {
+                            pageNo,
+                            url: request.url,
+                            titleMatches: $('title').text().trim().slice(0, 100)
+                        });
+                    }
                     
                     if (jobs.length > 0) {
                         const remaining = Math.max(0, RESULTS_WANTED - saved);
@@ -840,23 +809,32 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination with optimized rate limiting
+                    // Handle pagination
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next) {
-                            crawlerLog.info(`Enqueueing next page (${pageNo + 1}): ${next}`);
+                            crawlerLog.info(`Pagination: Moving to page ${pageNo + 1}`, {
+                                nextUrl: next,
+                                currentPage: pageNo,
+                                totalSaved: saved,
+                                maxPages: MAX_PAGES
+                            });
                             await enqueueLinks({ 
                                 urls: [next], 
                                 userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
-                            crawlerLog.info('No next page found - pagination complete');
+                            crawlerLog.info('Pagination complete - no next page found', {
+                                currentPage: pageNo,
+                                totalSaved: saved
+                            });
                         }
+                    } else if (pageNo >= MAX_PAGES) {
+                        crawlerLog.info('Max pages limit reached', { maxPages: MAX_PAGES, currentPage: pageNo });
                     }
-                    
-                    // Minimal delay after list page
-                    await sleep(300 + Math.random() * 400);
+                    // Human-like reading time (400-800ms)
+                    await sleep((Math.random() * 400 + 400));
                     return;
                 }
 
@@ -926,13 +904,36 @@ async function main() {
                         }
                         
                         const salary = $('[class*="salary"], .wage').first().text().trim() || null;
+                        
+                        // Extract job type from detail page
                         const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
-                        const jobType =
-                            jobTypeFromJson ||
-                            extractJobTypeFromPage($) ||
-                            listingStub?.job_type ||
-                            $('[class*="job-type"], .employment-type').first().text().trim() ||
-                            null;
+                        let jobType = jobTypeFromJson || listingStub?.job_type || null;
+                        
+                        if (!jobType) {
+                            jobType = extractJobTypeFromPage($);
+                        }
+                        
+                        if (!jobType) {
+                            // Additional selectors for job type on detail pages
+                            const typeSelectors = [
+                                '[class*="job-type"]',
+                                '[class*="employment"]',
+                                '[class*="contract-type"]',
+                                '.job-details [class*="type"]',
+                                'dt:contains("Job Type") + dd',
+                                'dt:contains("Employment Type") + dd'
+                            ];
+                            for (const sel of typeSelectors) {
+                                const typeEl = $(sel).first();
+                                if (typeEl.length) {
+                                    const typeText = typeEl.text().trim();
+                                    if (typeText && typeText.length > 3 && typeText.length < 50) {
+                                        jobType = typeText;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
 
                         const merged = {
                             ...(listingStub || {}),
@@ -953,6 +954,11 @@ async function main() {
                         }
 
                         if (merged.title) {
+                            crawlerLog.debug('Job extracted from detail page:', {
+                                title: merged.title,
+                                job_type: merged.job_type || 'NOT_FOUND',
+                                hasDescription: !!merged.description_text
+                            });
                             await pushJob(merged, 'DETAIL');
                         } else {
                             crawlerLog.warning(`Detail page missing title, skipping push: ${request.url}`);
@@ -960,213 +966,27 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    
-                    // Minimal delay after detail page
-                    await sleep(200 + Math.random() * 300);
+                    // Human-like reading time for detail pages (500-1000ms)
+                    await sleep((Math.random() * 500 + 500));
+                }
+                } catch (handlerError) {
+                    stats.requestErrors += 1;
+                    crawlerLog.error('Request handler error:', {
+                        url: request.url,
+                        error: handlerError.message,
+                        stack: handlerError.stack
+                    });
+                    if (session) {
+                        session.retire();
+                        stats.sessionsRetired += 1;
+                    }
+                    throw handlerError;
                 }
             }
         });
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        try {
-            await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.google.com/' } })));
-        } catch (crawlerError) {
-            log.warning('Crawler encountered errors but continuing with post-processing:', crawlerError.message);
-        }
-
-        // Resilience check: If we didn't get enough results due to blocking, try alternative approaches
-        if (saved < RESULTS_WANTED && stats.blockedResponses > 0) {
-            log.warning(`Only got ${saved}/${RESULTS_WANTED} results due to ${stats.blockedResponses} blocked responses. Trying alternative approaches...`);
-
-            // Try alternative search URLs with different parameters
-            const alternativeUrls = [];
-            const baseUrl = buildStartUrl(keyword, location, category);
-
-            // Try without location filter
-            if (location && saved < RESULTS_WANTED) {
-                const noLocationUrl = buildStartUrl(keyword, '', category);
-                if (noLocationUrl !== baseUrl) {
-                    alternativeUrls.push({
-                        url: noLocationUrl,
-                        userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
-                    });
-                }
-            }
-
-            // Try broader search terms
-            if (keyword && saved < RESULTS_WANTED) {
-                const broadKeywords = keyword.split(' ').slice(0, 1); // Just first word
-                if (broadKeywords.length < keyword.split(' ').length) {
-                    const broadUrl = buildStartUrl(broadKeywords.join(' '), location, category);
-                    if (broadUrl !== baseUrl) {
-                        alternativeUrls.push({
-                            url: broadUrl,
-                            userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
-                        });
-                    }
-                }
-            }
-
-            // Try category-specific searches
-            if (!category && saved < RESULTS_WANTED) {
-                const categories = ['chef', 'hospitality', 'restaurant', 'catering'];
-                for (const cat of categories.slice(0, 2)) { // Try first 2 categories
-                    if (saved >= RESULTS_WANTED) break;
-                    const catUrl = buildStartUrl(keyword, location, cat);
-                    alternativeUrls.push({
-                        url: catUrl,
-                        userData: { label: 'LIST', pageNo: 1, referrer: baseUrl, alternative: true }
-                    });
-                }
-            }
-
-            // Run alternative searches if we still need results
-            if (alternativeUrls.length > 0 && saved < RESULTS_WANTED) {
-                log.info(`Trying ${alternativeUrls.length} alternative search approaches to reach ${RESULTS_WANTED} results`);
-
-                try {
-                    // Create a new crawler instance for alternatives with more conservative settings
-                    const fallbackCrawler = new CheerioCrawler({
-                        proxyConfiguration: proxyConf,
-                        maxRequestRetries: 8, // More retries for alternatives
-                        useSessionPool: true,
-                        minConcurrency: 1,
-                        maxConcurrency: 3, // More conservative for alternatives
-                        autoscaledPoolOptions: {
-                            desiredConcurrency: 2,
-                            maxConcurrency: 3,
-                            minConcurrency: 1,
-                        },
-                        requestHandlerTimeoutSecs: 120,
-                        navigationTimeoutSecs: 90,
-                        sessionPoolOptions: {
-                            maxPoolSize: 30,
-                            sessionOptions: {
-                                maxUsageCount: 4, // Fresh sessions for alternatives
-                                maxAgeSecs: 200,
-                            },
-                        },
-                        persistCookiesPerSession: false,
-
-                        additionalMimeTypes: ['application/json', 'text/plain'],
-                        suggestResponseEncoding: 'utf-8',
-
-                        preNavigationHooks: [
-                            async ({ request, session }) => {
-                                // More conservative delays for alternative searches
-                                await sleep(2000 + Math.random() * 3000);
-
-                                const headers = getHeaders();
-                                const referer = request.userData?.referrer || 'https://www.caterer.com/';
-                                const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
-
-                                request.headers = {
-                                    ...headers,
-                                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                                    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                                    'Accept-Encoding': 'gzip, deflate, br',
-                                    'Referer': referer,
-                                    'Sec-Fetch-Site': fetchSite,
-                                    'Sec-Fetch-Mode': 'navigate',
-                                    'Sec-Fetch-User': '?1',
-                                    'Sec-Fetch-Dest': 'document',
-                                    'Upgrade-Insecure-Requests': '1',
-                                    'Cache-Control': 'max-age=0',
-                                    'Connection': 'keep-alive',
-                                };
-
-                                delete request.headers['DNT'];
-                                delete request.headers['dnt'];
-
-                                if (request.options) {
-                                    request.options.http2 = false;
-                                }
-                            },
-                        ],
-
-                        async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
-                            if (saved >= RESULTS_WANTED) {
-                                crawlerLog.info('Results limit reached in fallback crawler, stopping');
-                                return;
-                            }
-
-                            const label = request.userData?.label || 'LIST';
-                            const pageNo = request.userData?.pageNo || 1;
-                            const statusCode = response?.statusCode ?? response?.status;
-
-                            if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
-                                crawlerLog.warning(`Fallback crawler also blocked on ${request.url}, skipping alternative`);
-                                return;
-                            }
-
-                            if (label === 'LIST') {
-                                crawlerLog.info(`Processing fallback LIST page ${pageNo}: ${request.url}`);
-
-                                const jobs = [];
-                                const jobElements = $('a[href]').filter((_, el) => {
-                                    const href = $(el).attr('href');
-                                    return href && /\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href);
-                                });
-
-                                jobElements.each((idx, el) => {
-                                    try {
-                                        const $link = $(el);
-                                        const href = $link.attr('href');
-                                        if (!href || !/\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href)) return;
-
-                                        const jobUrl = normalizeJobUrl(href, request.url);
-                                        if (!jobUrl) return;
-
-                                        const title = $link.text().trim() || $link.attr('title') || 'Job Posting';
-                                        if (title) {
-                                            jobs.push({
-                                                title,
-                                                company: null,
-                                                location: null,
-                                                salary: null,
-                                                job_type: null,
-                                                date_posted: null,
-                                                description_html: null,
-                                                description_text: null,
-                                                url: jobUrl,
-                                            });
-                                        }
-                                    } catch (err) {
-                                        crawlerLog.warning(`Error parsing fallback job: ${err.message}`);
-                                    }
-                                });
-
-                                if (jobs.length > 0) {
-                                    const remaining = Math.max(0, RESULTS_WANTED - saved);
-                                    for (const job of jobs.slice(0, remaining)) {
-                                        if (saved >= RESULTS_WANTED) break;
-                                        await pushJob(job, 'FALLBACK_LIST');
-                                    }
-                                }
-
-                                // Try next page if needed
-                                if (saved < RESULTS_WANTED && pageNo < Math.min(MAX_PAGES, 3)) {
-                                    const next = findNextPage($, request.url);
-                                    if (next) {
-                                        await enqueueLinks({
-                                            urls: [next],
-                                            userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url, alternative: true }
-                                        });
-                                    }
-                                }
-
-                                await sleep(1000 + Math.random() * 1000);
-                            }
-                        }
-                    });
-
-                    await fallbackCrawler.run(alternativeUrls.slice(0, 3)); // Limit to 3 alternative attempts
-
-                } catch (fallbackError) {
-                    log.warning('Fallback crawler failed:', fallbackError.message);
-                }
-            }
-        }
+        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
@@ -1185,73 +1005,27 @@ async function main() {
         stats.postedWithin = postedWithinLabel;
         stats.recencyWindowHours = recencyWindowMs ? Math.round(recencyWindowMs / (60 * 60 * 1000)) : null;
         stats.timestamp = new Date().toISOString();
-
-        // Calculate success rate
-        const totalRequests = stats.listPagesProcessed + stats.detailPagesProcessed;
-        const successfulRequests = totalRequests - stats.blockedResponses;
-        stats.successRate = totalRequests > 0 ? ((successfulRequests / totalRequests) * 100).toFixed(2) + '%' : 'N/A';
-
-        // Add fallback attempt info
-        stats.fallbackAttempts = saved < RESULTS_WANTED && stats.blockedResponses > 0 ? 'Attempted' : 'Not needed';
-        stats.targetAchieved = saved >= RESULTS_WANTED;
-
-        await Actor.setValue('RUN_STATS', stats);
-
-        // Enhanced result summary with resilience info
-        log.info('=== Scraper Run Summary ===', {
-            totalSaved: saved,
-            targetResults: RESULTS_WANTED,
-            targetAchieved: stats.targetAchieved,
+        stats.successRate = stats.listPagesProcessed > 0 
+            ? ((stats.listPagesProcessed / (stats.listPagesProcessed + stats.blockedResponses)) * 100).toFixed(2) + '%'
+            : 'N/A';
+        
+        log.info('Run statistics:', {
+            totalSaved: stats.totalSaved,
             listPagesProcessed: stats.listPagesProcessed,
             detailPagesProcessed: stats.detailPagesProcessed,
             blockedResponses: stats.blockedResponses,
+            sessionsRetired: stats.sessionsRetired,
+            requestErrors: stats.requestErrors,
             successRate: stats.successRate,
-            fallbackAttempts: stats.fallbackAttempts,
             recencyFiltered: stats.recencyFiltered,
-            duplicateJobsSkipped: stats.duplicateJobsSkipped,
+            jobsWithJobType: stats.jobsWithJobType,
+            jobTypeExtractionRate: saved > 0 ? `${((stats.jobsWithJobType / saved) * 100).toFixed(1)}%` : 'N/A'
         });
-
-        if (saved < RESULTS_WANTED) {
-            const shortfall = RESULTS_WANTED - saved;
-            log.warning(`Failed to reach target: got ${saved}/${RESULTS_WANTED} results (${shortfall} short)`, {
-                possibleReasons: [
-                    `${stats.blockedResponses} requests were blocked`,
-                    'Site may have strong anti-bot measures',
-                    'Search criteria may be too restrictive',
-                    'Consider using residential proxies',
-                    'Fallback attempts were made but may need more aggressive approaches'
-                ],
-                blockedCount: stats.blockedResponses,
-                successRate: stats.successRate,
-                fallbackUsed: stats.fallbackAttempts,
-            });
-        } else {
-            log.info(`🎉 Target achieved! Successfully collected ${saved}/${RESULTS_WANTED} job listings`);
-        }
-
-        if (stats.blockedResponses > totalRequests * 0.3) {
-            log.warning('High rate of blocked requests detected. Recommendations:', {
-                blockedPercentage: ((stats.blockedResponses / totalRequests) * 100).toFixed(2) + '%',
-                suggestions: [
-                    'Use residential proxies instead of datacenter',
-                    'Reduce concurrency further',
-                    'Increase delays between requests',
-                    'Consider rotating user agents more frequently',
-                    'The actor attempted fallback strategies automatically'
-                ],
-            });
-        }
         
-        if (stats.blockedResponses > totalRequests * 0.3) {
-            log.warning('High rate of blocked requests detected. Consider:', {
-                blockedPercentage: ((stats.blockedResponses / totalRequests) * 100).toFixed(2) + '%',
-                suggestions: [
-                    'Use residential proxies instead of datacenter',
-                    'Reduce concurrency further',
-                    'Increase delays between requests',
-                    'Check if IP is rate-limited',
-                ],
-            });
+        await Actor.setValue('RUN_STATS', stats);
+        
+        if (saved === 0) {
+            log.warning('No jobs were extracted. This might indicate selectors need updating or the site structure has changed.');
         }
     } catch (error) {
         // Log enriched error details to help debugging on the platform
