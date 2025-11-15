@@ -2,6 +2,7 @@
 // Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
+import gotScraping from 'got-scraping';
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
 
@@ -480,19 +481,20 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 6,
+            maxRequestRetries: 8,
             useSessionPool: true,
-            minConcurrency: 2,
-            maxConcurrency: 8,
+            minConcurrency: 1,
+            maxConcurrency: 5,
             autoscaledPoolOptions: {
-                desiredConcurrency: 4,
-                maxConcurrency: 8,
-                minConcurrency: 2,
+                desiredConcurrency: 2,
+                maxConcurrency: 5,
+                minConcurrency: 1,
             },
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 60,
+            requestHandlerTimeoutSecs: 120,
+            navigationTimeoutSecs: 90,
+            persistCookiesPerSession: true,
             sessionPoolOptions: {
-                maxPoolSize: 100,
+                maxPoolSize: 50,
                 sessionOptions: {
                     maxUsageCount: 8,
                     maxAgeSecs: 300,
@@ -502,13 +504,15 @@ async function main() {
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
                 async ({ request, session }) => {
+                    // Disable HTTP/2 for all requests -- many sites will reset streams
+                    try { request.useHttp2 = false; } catch (e) { /* noop */ }
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
                     request.headers = {
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br, zstd',
+                        'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': referer,
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=0, i',
@@ -559,6 +563,119 @@ async function main() {
                     }
                 );
                 await sleep(waitMs);
+
+                // If we detected an HTTP/2 reset, attempt a fallback fetch using got-scraping with http2 disabled
+                if (isHttp2Reset && !request.userData?._http2FallbackTried) {
+                    request.userData = request.userData || {};
+                    request.userData._http2FallbackTried = true;
+                    try {
+                        crawlerLog.info('Attempting fallback fetch with got-scraping (http2 disabled)', { url: request.url });
+                        const res = await gotScraping(request.url, {
+                            headers: request.headers,
+                            http2: false,
+                            timeout: { request: 90000 },
+                            retry: { limit: 1 },
+                        });
+                        if (res && res.body) {
+                            const html = String(res.body);
+                            const $ = cheerioLoad(html);
+                            // call the same handler flow depending on the label
+                            if ((request.userData && request.userData.label) === 'DETAIL') {
+                                // re-use detail parsing
+                                await (async () => {
+                                    const listingStub = pendingListings.get(request.url);
+                                    if (listingStub) pendingListings.delete(request.url);
+                                    const json = extractFromJsonLd($);
+                                    const data = json || {};
+                                    if (!data.title) data.title = $('h1, [class*="job-title"], .job-heading').first().text().trim() || null;
+                                    if (!data.company) data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
+                                    if (!data.description_html) {
+                                        const descSelectors = ['.job-description', '[class*="description"]', '.job-details', 'article', '.content'];
+                                        for (const sel of descSelectors) {
+                                            const desc = $(sel).first();
+                                            if (desc.length && desc.text().length > 50) {
+                                                data.description_html = desc.html();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (data.description_html) data.description_text = cleanText(data.description_html);
+                                    if (!data.location) data.location = $('[class*="location"]').first().text().trim() || null;
+                                    if (data.date_posted) data.date_posted = normalizePostedDateValue(data.date_posted);
+                                    if (!data.date_posted) {
+                                        const timeNode = $('time[datetime]').first();
+                                        if (timeNode.length) data.date_posted = normalizePostedDateValue(timeNode.attr('datetime') || timeNode.text());
+                                    }
+                                    const salary = $('[class*="salary"], .wage').first().text().trim() || null;
+                                    const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
+                                    let jobType = jobTypeFromJson || listingStub?.job_type || null;
+                                    if (!jobType) jobType = extractJobTypeFromPage($);
+                                    const merged = {
+                                        ...(listingStub || {}),
+                                        title: data.title || listingStub?.title || null,
+                                        company: data.company || listingStub?.company || null,
+                                        location: data.location || listingStub?.location || null,
+                                        salary: salary || listingStub?.salary || null,
+                                        job_type: jobType || listingStub?.job_type || null,
+                                        date_posted: data.date_posted || listingStub?.date_posted || null,
+                                        description_html: data.description_html || listingStub?.description_html || null,
+                                        description_text: data.description_text || listingStub?.description_text || null,
+                                        url: request.url,
+                                    };
+                                    merged.date_posted = normalizePostedDateValue(merged.date_posted);
+                                    if (merged.title) await pushJob(merged, 'DETAIL');
+                                })();
+                            } else {
+                                // LIST fallback handler
+                                await (async () => {
+                                    const jobs = [];
+                                    const jobElements = $('h2 a[href*="/job/"]');
+                                    jobElements.each((idx, el) => {
+                                        try {
+                                            const $link = $(el);
+                                            const href = $link.attr('href');
+                                            if (!href || !/\/job\//i.test(href)) return;
+                                            const jobUrl = normalizeJobUrl(href, request.url);
+                                            if (!jobUrl) return;
+                                            const title = $link.text().trim();
+                                            const $jobContainer = $link.closest('article, section, .vacancy, [class*="job-item"], div[role="article"]').first();
+                                            let company = null;
+                                            const companyLink = $jobContainer.find('a[href*="/jobs/"]').not($link).first();
+                                            if (companyLink.length) company = companyLink.text().trim();
+                                            const locationText = $jobContainer.text();
+                                            let location = null;
+                                            const locationMatch = locationText.match(/([A-Z]{1,2}\d{1,2}\s?[A-Z]{2}|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:,\s*[A-Z]{2,})?)/);
+                                            if (locationMatch) location = locationMatch[0].trim();
+                                            let salary = null;
+                                            const salaryMatch = locationText.match(/(?:£[\d,]+(?:\.\d{2})?(?:\s*-\s*£[\d,]+(?:\.\d{2})?)?|Up to £[\d,]+(?:\.\d{2})?)\s*per\s*(?:hour|annum|day|year|week)/i);
+                                            if (salaryMatch) salary = salaryMatch[0].trim();
+                                            let datePosted = null;
+                                            const dateMatch = locationText.match(/(?:posted\s)?(?:(\d+)\s*(?:hours?|days?|weeks?|months?)\s*ago|NEW|FEATURED|\d+\s*ago)/i);
+                                            if (dateMatch) datePosted = normalizePostedDateValue(dateMatch[0]);
+                                            let jobType = null;
+                                            const jobTypeKeywords = ['full time', 'part time', 'contract', 'permanent', 'temporary', 'freelance', 'full-time', 'part-time'];
+                                            const containerTextLower = locationText.toLowerCase();
+                                            for (const keyword of jobTypeKeywords) { if (containerTextLower.includes(keyword)) { const match = locationText.match(new RegExp(keyword.replace('-', '[\\s-]?'), 'i')); if (match) jobType = match[0].trim(); break; } }
+                                            if (title && jobUrl && title.length > 2) {
+                                                if (!passesRecency(datePosted, jobUrl, crawlerLog)) return;
+                                                const job = { title, company, location, salary, job_type: jobType, date_posted: datePosted, description_html: null, description_text: null, url: jobUrl };
+                                                jobs.push(job);
+                                            }
+                                        } catch (err) { crawlerLog.warning('Error parsing LIST element (fallback): ' + err.message); }
+                                    });
+                                    for (const job of jobs) {
+                                        if (!job || !job.url) continue;
+                                        if (collectDetails) {
+                                            if (!pendingListings.has(job.url)) pendingListings.set(job.url, job);
+                                        } else if (saved < RESULTS_WANTED) { await pushJob(job, 'LIST'); if (saved >= RESULTS_WANTED) break; }
+                                    }
+                                })();
+                            }
+                        }
+                    } catch (err) {
+                        crawlerLog.warning('Fallback with http2:false failed', { url: request.url, error: err.message });
+                    }
+                }
             },
             async failedRequestHandler({ request, error }, { session }) {
                 log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
