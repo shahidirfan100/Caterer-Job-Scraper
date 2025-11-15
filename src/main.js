@@ -243,9 +243,10 @@ async function main() {
         // Production defaults for stealth and reliability (internal - not in schema)
         const useResidentialProxy = true; // prefer residential proxies for stealth
         const http2Fallback = true; // attempt fallback over HTTP/1.1 when HTTP/2 stream reset
-        const minDelayMs = 300; // human-like min jitter
-        const maxDelayMs = 1200; // human-like max jitter
-        const userMaxConcurrency = 5; // conservative default
+        // Stealth-y defaults — but can be overridden by environment variables
+        const minDelayMs = Number(process.env.APIFY_MIN_DELAY_MS || 150); // human-like min jitter
+        const maxDelayMs = Number(process.env.APIFY_MAX_DELAY_MS || 600); // human-like max jitter
+        const userMaxConcurrency = Math.max(1, Number(process.env.APIFY_MAX_CONCURRENCY || 8)); // faster default — adjust with env
         const userMaxRequestRetries = 8; // retry strategy for transient errors
         const persistCookiesPerSessionInput = true; // keep cookies per session for stealth
         const postedWithinInput = safeStr(input.postedWithin, 'any');
@@ -567,7 +568,8 @@ async function main() {
         }
 
         // Create a got-scraping instance that explicitly disables HTTP/2 for fallbacks
-        const fallbackGot = gotScraping.extend({ http2: false, retry: { limit: 1 }, timeout: { request: 90000 }, followRedirect: true });
+        // Use a shorter fallback timeout to avoid long wait times when fallback fails
+        const fallbackGot = gotScraping.extend({ http2: false, retry: { limit: 1 }, timeout: { request: 30000 }, followRedirect: true });
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
