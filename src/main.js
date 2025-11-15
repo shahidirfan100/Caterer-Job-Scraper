@@ -583,7 +583,6 @@ async function main() {
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
             persistCookiesPerSession: persistCookiesPerSessionInput,
-            persistCookiesPerSession: true,
             sessionPoolOptions: {
                 maxPoolSize: 50,
                 sessionOptions: {
@@ -595,8 +594,12 @@ async function main() {
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
                 async ({ request, session }) => {
-                    // Disable HTTP/2 for all requests -- many sites will reset streams
-                    try { request.useHttp2 = false; } catch (e) { /* noop */ }
+                    // NOTE: We must not mutate the `request` object with non-schema fields
+                    // (e.g., `useHttp2`) because that causes Apify storage schema validation errors.
+                    // To keep HTTP/2 related changes internal, rely on the fallbackGot HTTP/1.1
+                    // fallback in the `errorHandler` rather than setting request.useHttp2 here.
+                    // Clean up old invalid fields that may exist on requests stored in the queue
+                    try { delete request.useHttp2; } catch (err) { /* noop */ }
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
@@ -619,6 +622,8 @@ async function main() {
             ],
 
             async errorHandler({ request, error, session, log: crawlerLog }) {
+                // Remove stale, non-schema fields from the request that may cause update errors
+                try { delete request.useHttp2; } catch (err) { /* noop */ }
                 const retries = request.retryCount ?? 0;
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || error?.status;
