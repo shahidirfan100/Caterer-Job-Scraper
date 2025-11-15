@@ -2,7 +2,7 @@
 // Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
-import gotScraping from 'got-scraping';
+import { gotScraping } from 'got-scraping';
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
 
