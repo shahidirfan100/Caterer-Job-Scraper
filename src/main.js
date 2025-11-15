@@ -407,51 +407,26 @@ const parseSalaryFromText = (text) => {
     };
 };
 
-// *** UPDATED: more robust Caterer pagination ***
 function findNextPage($, base) {
-    if (!$) return null;
-
-    // 1) Primary: look for explicit "Next" anchor with page=
-    const nextLink = $('a[href*="page="]').filter((_, el) => {
-        const text = $(el).text().trim().toLowerCase();
-        return text === 'next' || text.includes('next');
-    }).first().attr('href');
-
-    if (nextLink) return toAbs(nextLink, base);
-
-    // 2) Secondary: infer from current page number and numeric anchors
-    const currentUrl = new URL(base);
-    const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
-    const nextPageNum = currentPage + 1;
-
-    const numericHref = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
-    if (numericHref) return toAbs(numericHref, base);
-
-    // 3) Fallback: parse "Page X of Y" block and synthesize URL
-    let paginationText = '';
-    $('[class*="page"], [class*="pagination"], :contains("Page ")').each((_, el) => {
-        const text = $(el).text();
-        if (/Page\s+\d+\s+of\s+\d+/i.test(text)) {
-            paginationText = text;
-            return false; // break .each
+            // Caterer.com uses ?page=N pagination (seen in fetched HTML: ?page=2, ?page=3, etc.)
+            const nextLink = $('a[href*="page="]').filter((_, el) => {
+                const text = $(el).text().trim().toLowerCase();
+                return text === 'next' || text.includes('next');
+            }).first().attr('href');
+            
+            if (nextLink) return toAbs(nextLink, base);
+            
+            // Fallback: try to find current page and calculate next
+            const currentUrl = new URL(base);
+            const currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
+            
+            // Check if a link to next page number exists
+            const nextPageNum = currentPage + 1;
+            const nextPageLink = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
+            if (nextPageLink) return toAbs(nextPageLink, base);
+            
+            return null;
         }
-    });
-
-    if (paginationText) {
-        const match = paginationText.match(/Page\s+(\d+)\s+of\s+(\d+)/i);
-        if (match) {
-            const curr = parseInt(match[1], 10);
-            const total = parseInt(match[2], 10);
-            if (Number.isFinite(curr) && Number.isFinite(total) && curr < total) {
-                const u = new URL(base);
-                u.searchParams.set('page', String(curr + 1));
-                return u.href;
-            }
-        }
-    }
-
-    return null;
-}
 
 // Single-entrypoint main
 // Install useful global handlers to capture unexpected errors during runtime
@@ -713,25 +688,67 @@ async function main() {
             }
         };
 
+        const proxyConf =
+            proxyConfiguration && Object.keys(proxyConfiguration).length
+                ? await Actor.createProxyConfiguration(proxyConfiguration)
+                : await Actor.createProxyConfiguration(
+                      useResidentialProxy
+                          ? {
+                                groups: ['RESIDENTIAL'],
+                            }
+                          : {},
+                  );
+
         const persistCookiesPerSession = persistCookiesPerSessionInput;
 
         const crawler = new CheerioCrawler({
-            proxyConfiguration:
-                proxyConfiguration && Object.keys(proxyConfiguration).length
-                    ? await Actor.createProxyConfiguration(proxyConfiguration)
-                    : await Actor.createProxyConfiguration(
-                          useResidentialProxy
-                              ? {
-                                    groups: ['RESIDENTIAL'],
-                                }
-                              : {},
-                      ),
-            useSessionPool: true,
-            persistCookiesPerSession,
-            maxConcurrency: userMaxConcurrency,
-            maxRequestsPerCrawl: 5000,
-            requestHandlerTimeoutSecs: 120,
+            proxyConfiguration: proxyConf,
             maxRequestRetries: userMaxRequestRetries,
+            useSessionPool: true,
+            minConcurrency: 1,
+            maxConcurrency: userMaxConcurrency,
+            autoscaledPoolOptions: {
+                desiredConcurrency: Math.max(1, Math.floor(userMaxConcurrency / 2)),
+                maxConcurrency: userMaxConcurrency,
+                minConcurrency: 1,
+            },
+            requestHandlerTimeoutSecs: 30,
+            navigationTimeoutSecs: 20,
+            persistCookiesPerSession: persistCookiesPerSessionInput,
+            sessionPoolOptions: {
+                maxPoolSize: 50,
+                sessionOptions: {
+                    maxUsageCount: 8,
+                    maxAgeSecs: 300,
+                },
+            },
+            
+            // Stealth headers and throttling handled in hooks
+            preNavigationHooks: [
+                async ({ request, session }) => {
+                    // Clean up any invalid fields that may exist on requests
+                    try { delete request.useHttp2; } catch (err) { /* noop */ }
+                    const headers = headerGenerator.getHeaders(headerGeneratorOptions);
+                    request.headers = {
+                        ...(request.headers || {}),
+                        ...headers,
+                        referer: request.headers?.referer || 'https://www.caterer.com/',
+                        origin: 'https://www.caterer.com',
+                    };
+
+                    const minDelay = minDelayMs || 150;
+                    const maxDelay = maxDelayMs || 600;
+                    const delay = minDelay + Math.random() * (maxDelay - minDelay);
+                    await sleep(delay);
+
+                    log.debug('Pre-navigation hook applied headers and delay', {
+                        url: request.url,
+                        delayMs: delay,
+                        hasSession: !!session,
+                    });
+                },
+            ],
+
             errorHandler: async ({ error, request, session, log: crawlerLog, retryCount }) => {
                 stats.retriedRequests += 1;
 
@@ -764,32 +781,7 @@ async function main() {
                     });
                 }
             },
-            preNavigationHooks: [
-                async ({ request, session, log: crawlerLog }) => {
-                    const delay = minDelayMs + Math.random() * (maxDelayMs - minDelayMs);
-                    await sleep(delay);
 
-                    if (!request.headers) request.headers = {};
-
-                    const generated = headerGenerator.getHeaders(headerGeneratorOptions);
-                    Object.assign(request.headers, generated);
-
-                    request.headers['referer'] = request.headers['referer'] || 'https://www.caterer.com/';
-                    request.headers['origin'] = 'https://www.caterer.com';
-
-                    if (session) {
-                        request.headers['cookie'] = session.getPuppeteerCookiesString
-                            ? session.getPuppeteerCookiesString('https://www.caterer.com')
-                            : request.headers['cookie'];
-                    }
-
-                    crawlerLog.debug('Pre-navigation hook applied headers and delay', {
-                        url: request.url,
-                        delayMs: delay,
-                        hasSession: !!session,
-                    });
-                },
-            ],
             requestHandler: async ({ request, $, session, log: crawlerLog, enqueueLinks }) => {
                 if (!$) {
                     crawlerLog.error('Cheerio instance is missing, cannot process page', {
@@ -955,7 +947,7 @@ async function main() {
                         stats.detailPagesEnqueued += toEnqueue.length;
                     }
 
-                    // *** UPDATED: pagination uses only actually saved jobs, not pendingListings.size ***
+                    // Handle pagination - only use actually saved jobs (not pending detail stubs)
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next && next !== request.url) {
@@ -963,11 +955,11 @@ async function main() {
                                 nextUrl: next,
                                 currentPage: pageNo,
                                 totalSaved: saved,
-                                maxPages: MAX_PAGES,
+                                maxPages: MAX_PAGES
                             });
-                            await enqueueLinks({
-                                urls: [next],
-                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url },
+                            await enqueueLinks({ 
+                                urls: [next], 
+                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
@@ -979,10 +971,7 @@ async function main() {
                             });
                         }
                     } else if (pageNo >= MAX_PAGES) {
-                        crawlerLog.info('Max pages limit reached', {
-                            maxPages: MAX_PAGES,
-                            currentPage: pageNo,
-                        });
+                        crawlerLog.info('Max pages limit reached', { maxPages: MAX_PAGES, currentPage: pageNo });
                     }
                     // Pagination logic completed, continue to next request
                 }
