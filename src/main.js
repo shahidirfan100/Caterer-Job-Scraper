@@ -407,50 +407,51 @@ const parseSalaryFromText = (text) => {
     };
 };
 
+// *** UPDATED: more robust Caterer pagination ***
 function findNextPage($, base) {
-            if (!$) return null;
+    if (!$) return null;
 
-            // 1) Primary: look for explicit "Next" anchor with page=
-            const nextLink = $('a[href*="page="]').filter((_, el) => {
-                const text = $(el).text().trim().toLowerCase();
-                return text === 'next' || text.includes('next');
-            }).first().attr('href');
+    // 1) Primary: look for explicit "Next" anchor with page=
+    const nextLink = $('a[href*="page="]').filter((_, el) => {
+        const text = $(el).text().trim().toLowerCase();
+        return text === 'next' || text.includes('next');
+    }).first().attr('href');
 
-            if (nextLink) return toAbs(nextLink, base);
+    if (nextLink) return toAbs(nextLink, base);
 
-            // 2) Secondary: infer from current page number and numeric anchors
-            const currentUrl = new URL(base);
-            const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
-            const nextPageNum = currentPage + 1;
+    // 2) Secondary: infer from current page number and numeric anchors
+    const currentUrl = new URL(base);
+    const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
+    const nextPageNum = currentPage + 1;
 
-            const numericHref = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
-            if (numericHref) return toAbs(numericHref, base);
+    const numericHref = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
+    if (numericHref) return toAbs(numericHref, base);
 
-            // 3) Fallback: parse "Page X of Y" block and synthesize URL
-            let paginationText = '';
-            $('[class*="page"], [class*="pagination"], :contains("Page ")').each((_, el) => {
-                const text = $(el).text();
-                if (/Page\s+\d+\s+of\s+\d+/i.test(text)) {
-                    paginationText = text;
-                    return false; // break .each
-                }
-            });
-
-            if (paginationText) {
-                const match = paginationText.match(/Page\s+(\d+)\s+of\s+(\d+)/i);
-                if (match) {
-                    const curr = parseInt(match[1], 10);
-                    const total = parseInt(match[2], 10);
-                    if (Number.isFinite(curr) && Number.isFinite(total) && curr < total) {
-                        const u = new URL(base);
-                        u.searchParams.set('page', String(curr + 1));
-                        return u.href;
-                    }
-                }
-            }
-
-            return null;
+    // 3) Fallback: parse "Page X of Y" block and synthesize URL
+    let paginationText = '';
+    $('[class*="page"], [class*="pagination"], :contains("Page ")').each((_, el) => {
+        const text = $(el).text();
+        if (/Page\s+\d+\s+of\s+\d+/i.test(text)) {
+            paginationText = text;
+            return false; // break .each
         }
+    });
+
+    if (paginationText) {
+        const match = paginationText.match(/Page\s+(\d+)\s+of\s+(\d+)/i);
+        if (match) {
+            const curr = parseInt(match[1], 10);
+            const total = parseInt(match[2], 10);
+            if (Number.isFinite(curr) && Number.isFinite(total) && curr < total) {
+                const u = new URL(base);
+                u.searchParams.set('page', String(curr + 1));
+                return u.href;
+            }
+        }
+    }
+
+    return null;
+}
 
 // Single-entrypoint main
 // Install useful global handlers to capture unexpected errors during runtime
@@ -470,18 +471,65 @@ async function main() {
             await Actor.init();
             log.info('Actor.init() succeeded');
         } catch (initErr) {
-            log.error('Actor.init() failed:', { name: initErr.name, message: initErr.message, stack: initErr.stack, validationErrors: initErr.validationErrors });
+            // Provide more actionable diagnostics when Actor.init() fails with ArgumentError
+            log.error('Actor.init() failed:', {
+                name: initErr.name,
+                message: initErr.message,
+                stack: initErr.stack,
+                validationErrors: initErr.validationErrors,
+            });
+            // If this appears to be an input validation problem, log the raw environment input if available
             try {
                 if (process.env.APIFY_INPUT) {
                     log.warning('APIFY_INPUT env var present; logging its type and truncated content');
                     const raw = String(process.env.APIFY_INPUT);
                     log.warning('APIFY_INPUT (truncated 1k):', raw.slice(0, 1024));
                 }
-            } catch (envErr) { /* ignore env logging errors */ }
+            } catch (envErr) {
+                // Ignore secondary logging failures
+            }
             throw initErr;
         }
 
-        const input = await Actor.getInput() || {};
+        let input;
+        try {
+            input = await Actor.getInput();
+            log.info('Actor.getInput() succeeded');
+        } catch (error) {
+            log.error('Error in Actor.getInput():', error);
+            log.error('Error details:', {
+                name: error.name,
+                message: error.message,
+                validationErrors: error.validationErrors,
+            });
+            if (error && error.name === 'ArgumentError') {
+                // Try to fall back to a local INPUT.json if present (useful for local runs or malformed platform input)
+                try {
+                    const raw = await fs.readFile(new URL('../INPUT.json', import.meta.url));
+                    input = JSON.parse(String(raw));
+                    log.warning('Loaded fallback INPUT.json from repository root');
+                } catch (fsErr) {
+                    log.warning('Could not read fallback INPUT.json:', fsErr?.message || fsErr);
+                    throw error;
+                }
+            } else {
+                throw error;
+            }
+        }
+
+        if (!input || typeof input !== 'object') {
+            log.warning('No or invalid input received from Actor.getInput(). Using empty object.');
+            input = {};
+        }
+
+        log.info('Parsed input (truncated safely)', {
+            hasKeyword: !!input.keyword,
+            hasLocation: !!input.location,
+            hasStartUrl: !!input.startUrl,
+            hasUrl: !!input.url,
+            hasStartUrls: Array.isArray(input.startUrls) && input.startUrls.length > 0,
+        });
+
         let postedWithinLabel = 'any';
         let recencyWindowMs = null;
 
@@ -684,7 +732,6 @@ async function main() {
             maxRequestsPerCrawl: 5000,
             requestHandlerTimeoutSecs: 120,
             maxRequestRetries: userMaxRequestRetries,
-            requestHandlerTimeoutMillis: 90_000,
             errorHandler: async ({ error, request, session, log: crawlerLog, retryCount }) => {
                 stats.retriedRequests += 1;
 
@@ -908,24 +955,9 @@ async function main() {
                         stats.detailPagesEnqueued += toEnqueue.length;
                     }
 
-                    // Handle pagination - use only actually saved jobs to decide if we need more pages
-                    crawlerLog.debug('Pagination state', {
-                        url: request.url,
-                        pageNo,
-                        saved,
-                        pendingListings: pendingListings.size,
-                        RESULTS_WANTED,
-                        MAX_PAGES,
-                    });
-
+                    // *** UPDATED: pagination uses only actually saved jobs, not pendingListings.size ***
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
-
-                        crawlerLog.debug('findNextPage result', {
-                            currentUrl: request.url,
-                            nextUrl: next,
-                        });
-
                         if (next && next !== request.url) {
                             crawlerLog.info(`Pagination: Moving to page ${pageNo + 1}`, {
                                 nextUrl: next,
@@ -939,14 +971,12 @@ async function main() {
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
-                            crawlerLog.info(
-                                'Pagination complete - no next page found or next equals current',
-                                {
-                                    currentPage: pageNo,
-                                    totalSaved: saved,
-                                    nextUrl: next,
-                                },
-                            );
+                            crawlerLog.info('Pagination complete - no next page found or next equals current', {
+                                currentPage: pageNo,
+                                totalSaved: saved,
+                                maxPages: MAX_PAGES,
+                                nextUrl: next,
+                            });
                         }
                     } else if (pageNo >= MAX_PAGES) {
                         crawlerLog.info('Max pages limit reached', {
@@ -1261,22 +1291,34 @@ async function main() {
         });
 
         await Actor.exit();
-    } catch (err) {
-        log.error('Actor failed with error', { err });
+    } catch (error) {
+        // Log enriched error details to help debugging on the platform
         try {
-            await Actor.setValue('ERROR', {
-                message: err.message,
-                stack: err.stack,
-                name: err.name,
-                time: new Date().toISOString(),
-            });
-        } catch (storeErr) {
-            log.error('Failed to store ERROR dataset item', { storeErr });
+            const details = {
+                name: error?.name,
+                message: error?.message,
+                stack: error?.stack,
+                validationErrors: error?.validationErrors || null,
+            };
+            log.error('Fatal error in main():', details);
+            console.error('Fatal error in main():', JSON.stringify(details, null, 2));
+        } catch (logErr) {
+            // Fallback log
+            log.error('Fatal error in main(), and failed to log details', logErr);
+            console.error('Fatal error in main():', error);
         }
-        await Actor.exit(err.code || 1);
+        // Re-throw so the caller/process sees non-zero exit. This ensures platform marks the run as failed.
+        throw error;
+    } finally {
+        try {
+            await Actor.exit();
+        } catch (exitErr) {
+            log.warning('Actor.exit() failed:', exitErr && exitErr.message ? exitErr.message : exitErr);
+        }
     }
 }
 
 main().catch((err) => {
-    log.error('main() threw an unhandled error', { err });
+    console.error(err);
+    process.exit(1);
 });
