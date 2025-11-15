@@ -87,6 +87,82 @@ const initHeaderGenerator = () => {
             operatingSystems: ['windows', 'macos', 'linux'],
             devices: ['desktop'],
         });
+
+        // Parse LIST page during HTTP/1.1 fallback (errorHandler cannot use enqueueLinks)
+        async function parseListFallback($, request, crawlerLog) {
+            try {
+                const jobElements = $('h2 a[href*="/job/"]');
+                const jobs = [];
+                jobElements.each((idx, el) => {
+                    try {
+                        const $link = $(el);
+                        const href = $link.attr('href');
+                        if (!href || !/\/job\//i.test(href)) return;
+                        const jobUrl = normalizeJobUrl(href, request.url);
+                        if (!jobUrl) return;
+                        const title = $link.text().trim();
+                        const $jobContainer = $link.closest('article, section, .vacancy, [class*="job-item"], div[role="article"]').first();
+                        let company = null;
+                        const companyLink = $jobContainer.find('a[href*="/jobs/"]').not($link).first();
+                        if (companyLink.length) company = companyLink.text().trim();
+                        const locationText = $jobContainer.text();
+                        let location = null;
+                        const locationMatch = locationText.match(/([A-Z]{1,2}\d{1,2}\s?[A-Z]{2}|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:,\s*[A-Z]{2,})?)/);
+                        if (locationMatch) location = locationMatch[0].trim();
+                        let salary = null; const salaryMatch = locationText.match(/(?:£[\d,]+(?:\.\d{2})?(?:\s*-\s*£[\d,]+(?:\.\d{2})?)?|Up to £[\d,]+(?:\.\d{2})?)\s*per\s*(?:hour|annum|day|year|week)/i);
+                        if (salaryMatch) salary = salaryMatch[0].trim();
+                        let datePosted = null; const dateMatch = locationText.match(/(?:posted\s)?(?:(\d+)\s*(?:hours?|days?|weeks?|months?)\s*ago|NEW|FEATURED|\d+\s*ago)/i);
+                        if (dateMatch) datePosted = normalizePostedDateValue(dateMatch[0]);
+                        let jobType = null; const jobTypeKeywords = ['full time', 'part time', 'contract', 'permanent', 'temporary', 'freelance', 'full-time', 'part-time'];
+                        const containerTextLower = locationText.toLowerCase();
+                        for (const keyword of jobTypeKeywords) { if (containerTextLower.includes(keyword)) { jobType = (locationText.match(new RegExp(keyword.replace('-', '[\\s-]?'), 'i')) || [])[0]; break; } }
+                        if (title && jobUrl && title.length > 2) jobs.push({ title, company, location, salary, job_type: jobType, date_posted: datePosted, description_html: null, description_text: null, url: jobUrl });
+                    } catch (err) { crawlerLog.warning('parseListFallback inner error: ' + err.message); }
+                });
+
+                for (const job of jobs) {
+                    if (!job || !job.url) continue;
+                    if (saved >= RESULTS_WANTED) break;
+                    if (collectDetails) {
+                        if (!pendingListings.has(job.url)) pendingListings.set(job.url, job);
+                    } else {
+                        await pushJob(job, 'LIST_FALLBACK');
+                    }
+                }
+            } catch (err) {
+                crawlerLog.warning('parseListFallback failed: ' + err.message);
+            }
+        }
+
+        // Parse DETAIL page during HTTP/1.1 fallback
+        async function parseDetailFallback($, request, crawlerLog, session) {
+            try {
+                const listingStub = pendingListings.get(request.url);
+                if (listingStub) pendingListings.delete(request.url);
+                const json = extractFromJsonLd($); const data = json || {};
+                if (!data.title) data.title = $('h1, [class*="job-title"], .job-heading').first().text().trim() || null;
+                if (!data.company) data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
+                if (!data.description_html) {
+                    const descSelectors = ['.job-description', '[class*="description"]', '.job-details', 'article', '.content'];
+                    for (const sel of descSelectors) { const desc = $(sel).first(); if (desc.length && desc.text().length > 50) { data.description_html = desc.html(); break; } }
+                }
+                if (data.description_html) data.description_text = cleanText(data.description_html);
+                if (!data.location) data.location = $('[class*="location"]').first().text().trim() || null;
+                if (data.date_posted) data.date_posted = normalizePostedDateValue(data.date_posted);
+                if (!data.date_posted) {
+                    const timeNode = $('time[datetime]').first(); if (timeNode.length) data.date_posted = normalizePostedDateValue(timeNode.attr('datetime') || timeNode.text());
+                }
+                const salary = $('[class*="salary"], .wage').first().text().trim() || null;
+                let jobType = data.employmentType || data.jobType || data.job_type || listingStub?.job_type || null;
+                if (!jobType) jobType = extractJobTypeFromPage($);
+                const merged = { ...(listingStub || {}), title: data.title || listingStub?.title || null, company: data.company || listingStub?.company || null, location: data.location || listingStub?.location || null, salary: salary || listingStub?.salary || null, job_type: jobType || listingStub?.job_type || null, date_posted: data.date_posted || listingStub?.date_posted || null, description_html: data.description_html || listingStub?.description_html || null, description_text: data.description_text || listingStub?.description_text || null, url: request.url };
+                merged.date_posted = normalizePostedDateValue(merged.date_posted);
+                if (!merged.description_text && merged.description_html) merged.description_text = cleanText(merged.description_html);
+                if (merged.title) await pushJob(merged, 'DETAIL_FALLBACK'); else crawlerLog.warning('parseDetailFallback no title', { url: request.url });
+            } catch (err) {
+                crawlerLog.warning('parseDetailFallback failed: ' + err.message);
+            }
+        }
         log.info('HeaderGenerator initialized');
     } catch (error) {
         log.warning('HeaderGenerator initialization failed, will use fallback headers:', error.message);
@@ -163,6 +239,15 @@ async function main() {
         const url = safeStr(input.url, '');
         const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
         const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
+
+        // Production defaults for stealth and reliability (internal - not in schema)
+        const useResidentialProxy = true; // prefer residential proxies for stealth
+        const http2Fallback = true; // attempt fallback over HTTP/1.1 when HTTP/2 stream reset
+        const minDelayMs = 300; // human-like min jitter
+        const maxDelayMs = 1200; // human-like max jitter
+        const userMaxConcurrency = 5; // conservative default
+        const userMaxRequestRetries = 8; // retry strategy for transient errors
+        const persistCookiesPerSessionInput = true; // keep cookies per session for stealth
         const postedWithinInput = safeStr(input.postedWithin, 'any');
 
         // Defensive input validation and logging
@@ -358,7 +443,7 @@ async function main() {
         try {
             const useDefaultProxy = !proxyConfiguration || Object.keys(proxyConfiguration).length === 0;
             const proxyOptions = useDefaultProxy
-                ? { useApifyProxy: true, apifyProxyGroups: ['DATACENTER'] }
+                ? { useApifyProxy: true, apifyProxyGroups: useResidentialProxy ? ['RESIDENTIAL', 'DATACENTER'] : ['DATACENTER'] }
                 : proxyConfiguration;
             proxyConf = await Actor.createProxyConfiguration(proxyOptions);
             log.info('Proxy configuration ready', { defaultProxy: useDefaultProxy });
@@ -368,6 +453,7 @@ async function main() {
         }
 
         let saved = 0;
+        let requestQueue = null; // Opened later so we can requeue failed fallbacks
         const pushedUrls = new Set();
         const pendingListings = new Map();
         const queuedDetailUrls = new Set();
@@ -382,6 +468,7 @@ async function main() {
             recencyFiltered: 0,
             sessionsRetired: 0,
             requestErrors: 0,
+            requeued: 0,
             jobsWithJobType: 0,
         };
         const passesRecency = (dateValue, url, logger = log) => {
@@ -479,19 +566,23 @@ async function main() {
             return null;
         }
 
+        // Create a got-scraping instance that explicitly disables HTTP/2 for fallbacks
+        const fallbackGot = gotScraping.extend({ http2: false, retry: { limit: 1 }, timeout: { request: 90000 }, followRedirect: true });
+
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 8,
+            maxRequestRetries: userMaxRequestRetries,
             useSessionPool: true,
             minConcurrency: 1,
-            maxConcurrency: 5,
+            maxConcurrency: userMaxConcurrency,
             autoscaledPoolOptions: {
-                desiredConcurrency: 2,
-                maxConcurrency: 5,
+                desiredConcurrency: Math.max(1, Math.floor(userMaxConcurrency / 2)),
+                maxConcurrency: userMaxConcurrency,
                 minConcurrency: 1,
             },
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 90,
+            persistCookiesPerSession: persistCookiesPerSessionInput,
             persistCookiesPerSession: true,
             sessionPoolOptions: {
                 maxPoolSize: 50,
@@ -521,8 +612,8 @@ async function main() {
                     delete request.headers['DNT'];
                     delete request.headers['dnt'];
                     
-                    // Human-like delay with jitter (300-900ms)
-                    const delay = Math.random() * 600 + 300;
+                    // Human-like delay with jitter (minDelayMs - maxDelayMs)
+                    const delay = Math.random() * (maxDelayMs - minDelayMs) + minDelayMs;
                     await sleep(delay);
                 },
             ],
@@ -542,6 +633,9 @@ async function main() {
                 }
                 
                 const isHttp2Reset = /nghttp2/i.test(message);
+                if (isHttp2Reset) {
+                    stats.http2Errors = (stats.http2Errors || 0) + 1;
+                }
                 const isBlocked = statusCode === 403 || statusCode === 429;
                 
                 // Exponential backoff with jitter
@@ -564,118 +658,47 @@ async function main() {
                 );
                 await sleep(waitMs);
 
-                // If we detected an HTTP/2 reset, attempt a fallback fetch using got-scraping with http2 disabled
-                if (isHttp2Reset && !request.userData?._http2FallbackTried) {
+                // Fallback: HTTP/2 stream reset can be recovered by fetching over HTTP/1.1
+                if (http2Fallback && isHttp2Reset && !(request.userData && request.userData._http2FallbackTried)) {
                     request.userData = request.userData || {};
                     request.userData._http2FallbackTried = true;
+                    crawlerLog.info('Detected HTTP/2 reset - trying HTTP/1.1 fallback', { url: request.url });
                     try {
-                        crawlerLog.info('Attempting fallback fetch with got-scraping (http2 disabled)', { url: request.url });
-                        const res = await gotScraping(request.url, {
-                            headers: request.headers,
-                            http2: false,
-                            timeout: { request: 90000 },
-                            retry: { limit: 1 },
-                        });
-                        if (res && res.body) {
-                            const html = String(res.body);
-                            const $ = cheerioLoad(html);
-                            // call the same handler flow depending on the label
-                            if ((request.userData && request.userData.label) === 'DETAIL') {
-                                // re-use detail parsing
-                                await (async () => {
-                                    const listingStub = pendingListings.get(request.url);
-                                    if (listingStub) pendingListings.delete(request.url);
-                                    const json = extractFromJsonLd($);
-                                    const data = json || {};
-                                    if (!data.title) data.title = $('h1, [class*="job-title"], .job-heading').first().text().trim() || null;
-                                    if (!data.company) data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
-                                    if (!data.description_html) {
-                                        const descSelectors = ['.job-description', '[class*="description"]', '.job-details', 'article', '.content'];
-                                        for (const sel of descSelectors) {
-                                            const desc = $(sel).first();
-                                            if (desc.length && desc.text().length > 50) {
-                                                data.description_html = desc.html();
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (data.description_html) data.description_text = cleanText(data.description_html);
-                                    if (!data.location) data.location = $('[class*="location"]').first().text().trim() || null;
-                                    if (data.date_posted) data.date_posted = normalizePostedDateValue(data.date_posted);
-                                    if (!data.date_posted) {
-                                        const timeNode = $('time[datetime]').first();
-                                        if (timeNode.length) data.date_posted = normalizePostedDateValue(timeNode.attr('datetime') || timeNode.text());
-                                    }
-                                    const salary = $('[class*="salary"], .wage').first().text().trim() || null;
-                                    const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
-                                    let jobType = jobTypeFromJson || listingStub?.job_type || null;
-                                    if (!jobType) jobType = extractJobTypeFromPage($);
-                                    const merged = {
-                                        ...(listingStub || {}),
-                                        title: data.title || listingStub?.title || null,
-                                        company: data.company || listingStub?.company || null,
-                                        location: data.location || listingStub?.location || null,
-                                        salary: salary || listingStub?.salary || null,
-                                        job_type: jobType || listingStub?.job_type || null,
-                                        date_posted: data.date_posted || listingStub?.date_posted || null,
-                                        description_html: data.description_html || listingStub?.description_html || null,
-                                        description_text: data.description_text || listingStub?.description_text || null,
-                                        url: request.url,
-                                    };
-                                    merged.date_posted = normalizePostedDateValue(merged.date_posted);
-                                    if (merged.title) await pushJob(merged, 'DETAIL');
-                                })();
+                        const res = await fallbackGot(request.url, { headers: request.headers, throwHttpErrors: false });
+                        if (res && res.statusCode >= 200 && res.statusCode < 300 && res.body) {
+                            const $ = cheerioLoad(String(res.body));
+                            stats.fallbackUsed = (stats.fallbackUsed || 0) + 1;
+                            const label = (request.userData && request.userData.label) || (/\/job\//i.test(request.url) ? 'DETAIL' : 'LIST');
+                            if (label === 'DETAIL') {
+                                await parseDetailFallback($, request, crawlerLog, session);
                             } else {
-                                // LIST fallback handler
-                                await (async () => {
-                                    const jobs = [];
-                                    const jobElements = $('h2 a[href*="/job/"]');
-                                    jobElements.each((idx, el) => {
-                                        try {
-                                            const $link = $(el);
-                                            const href = $link.attr('href');
-                                            if (!href || !/\/job\//i.test(href)) return;
-                                            const jobUrl = normalizeJobUrl(href, request.url);
-                                            if (!jobUrl) return;
-                                            const title = $link.text().trim();
-                                            const $jobContainer = $link.closest('article, section, .vacancy, [class*="job-item"], div[role="article"]').first();
-                                            let company = null;
-                                            const companyLink = $jobContainer.find('a[href*="/jobs/"]').not($link).first();
-                                            if (companyLink.length) company = companyLink.text().trim();
-                                            const locationText = $jobContainer.text();
-                                            let location = null;
-                                            const locationMatch = locationText.match(/([A-Z]{1,2}\d{1,2}\s?[A-Z]{2}|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:,\s*[A-Z]{2,})?)/);
-                                            if (locationMatch) location = locationMatch[0].trim();
-                                            let salary = null;
-                                            const salaryMatch = locationText.match(/(?:£[\d,]+(?:\.\d{2})?(?:\s*-\s*£[\d,]+(?:\.\d{2})?)?|Up to £[\d,]+(?:\.\d{2})?)\s*per\s*(?:hour|annum|day|year|week)/i);
-                                            if (salaryMatch) salary = salaryMatch[0].trim();
-                                            let datePosted = null;
-                                            const dateMatch = locationText.match(/(?:posted\s)?(?:(\d+)\s*(?:hours?|days?|weeks?|months?)\s*ago|NEW|FEATURED|\d+\s*ago)/i);
-                                            if (dateMatch) datePosted = normalizePostedDateValue(dateMatch[0]);
-                                            let jobType = null;
-                                            const jobTypeKeywords = ['full time', 'part time', 'contract', 'permanent', 'temporary', 'freelance', 'full-time', 'part-time'];
-                                            const containerTextLower = locationText.toLowerCase();
-                                            for (const keyword of jobTypeKeywords) { if (containerTextLower.includes(keyword)) { const match = locationText.match(new RegExp(keyword.replace('-', '[\\s-]?'), 'i')); if (match) jobType = match[0].trim(); break; } }
-                                            if (title && jobUrl && title.length > 2) {
-                                                if (!passesRecency(datePosted, jobUrl, crawlerLog)) return;
-                                                const job = { title, company, location, salary, job_type: jobType, date_posted: datePosted, description_html: null, description_text: null, url: jobUrl };
-                                                jobs.push(job);
-                                            }
-                                        } catch (err) { crawlerLog.warning('Error parsing LIST element (fallback): ' + err.message); }
-                                    });
-                                    for (const job of jobs) {
-                                        if (!job || !job.url) continue;
-                                        if (collectDetails) {
-                                            if (!pendingListings.has(job.url)) pendingListings.set(job.url, job);
-                                        } else if (saved < RESULTS_WANTED) { await pushJob(job, 'LIST'); if (saved >= RESULTS_WANTED) break; }
-                                    }
-                                })();
+                                await parseListFallback($, request, crawlerLog);
                             }
+                            return;
                         }
+                        crawlerLog.warning('HTTP/1.1 fallback returned non-success status', { url: request.url, status: res && res.statusCode });
                     } catch (err) {
-                        crawlerLog.warning('Fallback with http2:false failed', { url: request.url, error: err.message });
+                        crawlerLog.warning('HTTP/1.1 fallback failed', { url: request.url, message: err.message });
+                        stats.fallbackFailed = (stats.fallbackFailed || 0) + 1;
+
+                        // Attempt a one-time requeue for detail pages after fallback failed - useful for transient blocking
+                        try {
+                            const label = request.userData?.label || (/\/job\//i.test(request.url) ? 'DETAIL' : 'LIST');
+                            if (label === 'DETAIL' && requestQueue && !(request.userData && request.userData._requeueAttempted)) {
+                                request.userData = request.userData || {};
+                                request.userData._requeueAttempted = true;
+                                const uniqueKey = `${request.url}:requeue1`;
+                                await requestQueue.addRequest({ url: request.url, uniqueKey, userData: { ...request.userData, requeueSource: 'http2fallback' } });
+                                stats.requeued = (stats.requeued || 0) + 1;
+                                crawlerLog.info('Requeued DETAIL request after fallback failure', { url: request.url, uniqueKey });
+                            }
+                        } catch (rerr) {
+                            crawlerLog.warning('Failed to requeue request after fallback failure', { url: request.url, message: rerr.message });
+                        }
                     }
                 }
+
+                // (duplicate fallback block removed - fallback logic centralized above)
             },
             async failedRequestHandler({ request, error }, { session }) {
                 log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
@@ -950,8 +973,8 @@ async function main() {
                     } else if (pageNo >= MAX_PAGES) {
                         crawlerLog.info('Max pages limit reached', { maxPages: MAX_PAGES, currentPage: pageNo });
                     }
-                    // Human-like reading time (400-800ms)
-                    await sleep((Math.random() * 400 + 400));
+                    // Human-like reading time (minDelayMs/2 - maxDelayMs/2)
+                    await sleep((Math.random() * ((maxDelayMs/2) - (minDelayMs/2)) + (minDelayMs/2)));
                     return;
                 }
 
@@ -1083,8 +1106,8 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    // Human-like reading time for detail pages (500-1000ms)
-                    await sleep((Math.random() * 500 + 500));
+                    // Human-like reading time for detail pages (minDelayMs/2 - maxDelayMs/2)
+                    await sleep((Math.random() * ((maxDelayMs/2) - (minDelayMs/2)) + (minDelayMs/2)));
                 }
                 } catch (handlerError) {
                     stats.requestErrors += 1;
@@ -1101,6 +1124,15 @@ async function main() {
                 }
             }
         });
+
+        // Allow re-adding failing requests to the queue for one more try (preventing infinite requeues)
+        try {
+            requestQueue = await Actor.openRequestQueue();
+            log.info('Opened Apify request queue to support requeueing on fallback failures');
+        } catch (err) {
+            log.warning('Failed to open Apify request queue - requeue on failure disabled:', err.message);
+            requestQueue = null;
+        }
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
@@ -1133,6 +1165,7 @@ async function main() {
             blockedResponses: stats.blockedResponses,
             sessionsRetired: stats.sessionsRetired,
             requestErrors: stats.requestErrors,
+            requeued: stats.requeued,
             successRate: stats.successRate,
             recencyFiltered: stats.recencyFiltered,
             jobsWithJobType: stats.jobsWithJobType,
