@@ -460,7 +460,10 @@ async function main() {
                 // Match actual job posting URLs, not location/category links
                 // Job URLs: /job/{slug}/{company}-job{number}
                 // Exclude: /jobs/search/in-{location}, /jobs/{category}, /jobs?{params}
-                    if (/^\/job\//i.test(href) && !/^\/jobs(\/|\?)/i.test(href)) {
+                    // Accept relative /job/... as well as absolute https://www.caterer.com/job/...
+                    const isJobPath = /(^\/job\/)|(:\/\/[^\/]+\/job\/)/i.test(href);
+                    const isJobsCategory = /(^\/jobs(?:\/|\?)|:\/\/[^\/]+\/jobs(?:\/|\?))/i.test(href);
+                    if (isJobPath && !isJobsCategory) {
                         // require either a '-job' suffix with digits or 'search-job' pattern
                         if (/(?:-job\d+)|(search-job\d+)/i.test(href)) {
                     const abs = normalizeJobUrl(href, base);
