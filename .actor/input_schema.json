@@ -71,8 +71,26 @@
       "type": "object",
       "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
       "editor": "proxy"
+    },
+    "startUrl": {
+      "title": "Start URL (single)",
+      "type": "string",
+      "description": "Single Caterer.com URL to start scraping from (alternative to startUrls array).",
+      "editor": "textfield"
+    },
+    "url": {
+      "title": "Direct Job URL",
+      "type": "string",
+      "description": "Direct URL to a specific job listing.",
+      "editor": "textfield"
+    },
+    "category": {
+      "title": "Category",
+      "type": "string",
+      "description": "Optional job category filter (kept for backward compatibility).",
+      "editor": "textfield"
     }
   },
   "required": [],
-  "additionalProperties": true
+  "additionalProperties": false
 }

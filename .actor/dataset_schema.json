@@ -1,6 +1,52 @@
 {
   "actorSpecification": 1,
-  "fields": {},
+  "fields": {
+    "title": {
+      "type": "string",
+      "nullable": true,
+      "description": "Job title"
+    },
+    "company": {
+      "type": "string",
+      "nullable": true,
+      "description": "Company name"
+    },
+    "location": {
+      "type": "string",
+      "nullable": true,
+      "description": "Job location"
+    },
+    "salary": {
+      "type": "string",
+      "nullable": true,
+      "description": "Salary information"
+    },
+    "job_type": {
+      "type": "string",
+      "nullable": true,
+      "description": "Employment type (e.g., Full-time, Part-time)"
+    },
+    "date_posted": {
+      "type": "string",
+      "nullable": true,
+      "description": "Date when job was posted (ISO 8601 format)"
+    },
+    "description_html": {
+      "type": "string",
+      "nullable": true,
+      "description": "Job description in HTML format"
+    },
+    "description_text": {
+      "type": "string",
+      "nullable": true,
+      "description": "Job description in plain text"
+    },
+    "url": {
+      "type": "string",
+      "nullable": false,
+      "description": "URL to the job listing"
+    }
+  },
   "views": {
     "overview": {
       "title": "Overview",

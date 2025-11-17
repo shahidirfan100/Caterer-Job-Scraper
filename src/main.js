@@ -1,7 +1,7 @@
 // Caterer Job Scraper - Production-ready implementation
 // Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset, RequestQueue } from 'crawlee';
+import { CheerioCrawler, Dataset } from 'crawlee';
 // gotScraping removed - not needed after simplifying error handling
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
@@ -68,8 +68,6 @@ const shouldKeepByRecency = (dateValue) => {
     if (!parsed) return true;
     return (Date.now() - parsed.getTime()) <= recencyWindowMs;
 };
-const HEARTBEAT_INTERVAL_MS = Math.max(15_000, Number(process.env.APIFY_HEARTBEAT_MS || 30_000));
-const PENDING_FLUSH_THRESHOLD = Math.max(5, Number(process.env.APIFY_PENDING_FLUSH_THRESHOLD || 25));
 
 // Try to import header-generator, fallback if not available
 let HeaderGenerator;
@@ -116,12 +114,12 @@ async function main() {
         } catch (initErr) {
             // Provide more actionable diagnostics when Actor.init() fails with ArgumentError
             log.error('Actor.init() failed:', { name: initErr.name, message: initErr.message, stack: initErr.stack, validationErrors: initErr.validationErrors });
-            // If this appears to be an input validation problem, log the raw environment input if available
+            // If this appears to be an input validation problem, note that APIFY_INPUT is present
+            // Note: Do NOT log raw APIFY_INPUT content - it may contain secrets and will fail QA review
             try {
                 if (process.env.APIFY_INPUT) {
-                    log.warning('APIFY_INPUT env var present; logging its type and truncated content');
                     const raw = String(process.env.APIFY_INPUT);
-                    log.warning('APIFY_INPUT (truncated 1k):', raw.slice(0, 1024));
+                    log.warning('APIFY_INPUT env var present (length: ' + raw.length + ' chars) - validation may have failed');
                 }
             } catch (envErr) { /* ignore env logging errors */ }
             // Re-throw so outer catch still handles termination, but with richer logs
@@ -250,158 +248,13 @@ async function main() {
             }
         };
 
-const cleanText = (html) => {
-    if (!html) return '';
-    const $ = cheerioLoad(html);
-    $('script, style, noscript, iframe').remove();
-    return $.root().text().replace(/\s+/g, ' ').trim();
-};
-const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
-const looksLikeCss = (value) => {
-    if (!value || typeof value !== 'string') return false;
-    if (value.includes('#no-js-image')) return true;
-    return /(?:^|\s)[.#][\w-]+\s*\{/.test(value) || value.includes('@media');
-};
-const sanitizePlainText = (value) => {
-    if (!value) return null;
-    const normalized = normalizeText(value);
-    if (!normalized) return null;
-    if (looksLikeCss(normalized)) return null;
-    return normalized;
-};
-const getElementCleanText = ($element) => {
-    if (!$element || !$element.length) return null;
-    const clone = $element.clone();
-    clone.find('script, style, noscript').remove();
-    const text = clone.text();
-    return sanitizePlainText(text);
-};
-const extractDetailDescription = ($) => {
-    if (!$) return null;
-    const selectors = [
-        '[data-testid*="description"]',
-        '#jobDescription',
-        '[itemprop="description"]',
-        '.job-description',
-        '.job-details__description',
-        '.job-details [class*="description"]',
-        'article',
-        'main section',
-    ];
-    for (const selector of selectors) {
-        const target = typeof selector === 'function' ? selector($) : $(selector).first();
-        if (!target || !target.length) continue;
-        const clone = target.clone();
-        clone.find('script, style, noscript, iframe').remove();
-        const html = clone.html();
-        if (!html) continue;
-        const text = cleanText(html);
-        if (text && text.length >= 80) {
-            return { html, text };
-        }
-    }
-    const fallback = $('main, article, section').filter((_, el) => {
-        const clone = $(el).clone();
-        clone.find('script, style, noscript, iframe').remove();
-        const html = clone.html();
-        if (!html) return false;
-        const text = cleanText(html);
-        return text && text.length >= 150;
-    }).first();
-    if (fallback && fallback.length) {
-        const clone = fallback.clone();
-        clone.find('script, style, noscript, iframe').remove();
-        const html = clone.html();
-        const text = cleanText(html);
-        if (text) return { html, text };
-    }
-    return null;
-};
-const extractFromEmbeddedJson = ($) => {
-    if (!$) return null;
-    const scripts = $('script[id="__NEXT_DATA__"], script[type="application/json"]').slice(0, 10);
-    const MAX_NODES = 5000;
-    const combineLocation = (node) => {
-        if (!node) return null;
-        if (typeof node === 'string') return sanitizePlainText(node);
-        if (Array.isArray(node)) {
-            const parts = node.map((n) => combineLocation(n)).filter(Boolean);
-            return parts.join(', ') || null;
-        }
-        if (typeof node !== 'object') return null;
-        const parts = [
-            node.displayName,
-            node.name,
-            node.city,
-            node.region,
-            node.county,
-            node.state,
-            node.country,
-            node.postcode,
-        ].map((part) => sanitizePlainText(part));
-        const combined = parts.filter(Boolean).join(', ');
-        return combined || null;
-    };
-    const mapNodeToJob = (node) => {
-        if (!node || typeof node !== 'object') return null;
-        const raw = {
-            title: node.jobTitle || node.title || node.positionTitle,
-            company: node.companyName || node.recruiterName || node.employerName || node.hiringOrgName || node.hiringOrganization?.name,
-            location: combineLocation(node.jobLocation || node.location || node.job_location || node.jobLocations),
-            description_html: node.jobDescription || node.description_html || node.description,
-            description_text: node.description_text || node.descriptionText,
-            salary: node.salaryDescription || node.salaryText || node.salary,
-            job_type: node.jobType || node.employmentType || node.contractType,
-            date_posted: node.datePosted || node.postedDate || node.date,
+        const cleanText = (html) => {
+            if (!html) return '';
+            const $ = cheerioLoad(html);
+            $('script, style, noscript, iframe').remove();
+            return $.root().text().replace(/\s+/g, ' ').trim();
         };
-        const hasData = Object.values(raw).some((val) => typeof val === 'string' && val.trim().length > 0);
-        if (!hasData) return null;
-        return {
-            title: sanitizePlainText(raw.title),
-            company: sanitizePlainText(raw.company),
-            location: sanitizePlainText(raw.location),
-            description_html: raw.description_html || null,
-            description_text: sanitizePlainText(raw.description_text),
-            salary: sanitizePlainText(raw.salary),
-            job_type: sanitizePlainText(raw.job_type),
-            date_posted: raw.date_posted || null,
-        };
-    };
-    for (let i = 0; i < scripts.length; i++) {
-        const raw = $(scripts[i]).html();
-        if (!raw || raw.length > 2_000_000) continue;
-        let data;
-        try {
-            data = JSON.parse(raw);
-        } catch {
-            continue;
-        }
-        const queue = [data];
-        let processed = 0;
-        while (queue.length && processed < MAX_NODES) {
-            const node = queue.shift();
-            processed += 1;
-            if (!node) continue;
-            if (typeof node === 'string') continue;
-            if (Array.isArray(node)) {
-                queue.push(...node.slice(0, 50));
-                continue;
-            }
-            if (typeof node === 'object') {
-                const job = mapNodeToJob(node);
-                if (job && (job.description_html || job.title || job.company || job.location)) {
-                    return job;
-                }
-                const values = Object.values(node);
-                for (const val of values.slice(0, 50)) {
-                    if (processed >= MAX_NODES) break;
-                    queue.push(val);
-                }
-            }
-        }
-    }
-    return null;
-};
+        const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
         const extractJobTypeFromPage = ($) => {
             if (!$) return null;
             
@@ -525,7 +378,7 @@ const extractFromEmbeddedJson = ($) => {
         }
 
         let saved = 0;
-        const requestQueue = await RequestQueue.open();
+        let requestQueue = null; // Opened later so we can requeue failed fallbacks
         const pushedUrls = new Set();
         const pendingListings = new Map();
         const queuedDetailUrls = new Set();
@@ -542,74 +395,12 @@ const extractFromEmbeddedJson = ($) => {
             requestErrors: 0,
             requeued: 0,
             jobsWithJobType: 0,
-            heartbeatCount: 0,
-            totalRequestDurationMs: 0,
-            completedRequests: 0,
-            avgRequestMs: 0,
-        };
-        let heartbeatTimer = null;
-        const emitHeartbeat = async () => {
-            stats.heartbeatCount += 1;
-            let queueInfo = null;
-            try {
-                queueInfo = await requestQueue?.getInfo();
-            } catch (infoErr) {
-                log.warning('Heartbeat queue info fetch failed', infoErr?.message || infoErr);
-            }
-            const payload = {
-                saved,
-                pendingListings: pendingListings.size,
-                queuedDetailUrls: queuedDetailUrls.size,
-                listPagesProcessed: stats.listPagesProcessed,
-                detailPagesProcessed: stats.detailPagesProcessed,
-                blockedResponses: stats.blockedResponses,
-                avgRequestMs: stats.avgRequestMs,
-                queueInfo,
-            };
-            log.info('[HEARTBEAT]', payload);
-        };
-        const startHeartbeat = () => {
-            if (heartbeatTimer) return;
-            heartbeatTimer = setInterval(() => {
-                emitHeartbeat().catch((err) => log.warning('Heartbeat emit failed', err?.message || err));
-            }, HEARTBEAT_INTERVAL_MS);
-            heartbeatTimer.unref?.();
-        };
-        const stopHeartbeat = () => {
-            if (heartbeatTimer) {
-                clearInterval(heartbeatTimer);
-                heartbeatTimer = null;
-            }
         };
         const passesRecency = (dateValue, url, logger = log) => {
             if (shouldKeepByRecency(dateValue)) return true;
             stats.recencyFiltered += 1;
             logger.info('Skipping job due to postedWithin filter', { url, date: dateValue, postedWithin: postedWithinLabel });
             return false;
-        };
-        const flushPendingListings = async (reason = 'LIST_FALLBACK') => {
-            if (!pendingListings.size) return;
-            const pending = [...pendingListings.entries()];
-            for (const [url, job] of pending) {
-                pendingListings.delete(url);
-                stats.pendingListingFlushes += 1;
-                await pushJob(job, reason);
-                if (saved >= RESULTS_WANTED) break;
-            }
-        };
-        let stopRequested = false;
-        const stopIfLimitReached = async () => {
-            if (stopRequested || saved < RESULTS_WANTED) return;
-            stopRequested = true;
-            log.info('Results target reached. Requesting crawler shutdown.');
-            try {
-                await requestQueue?.drop?.();
-            } catch (dropErr) {
-                log.warning('RequestQueue.drop() failed', dropErr?.message || dropErr);
-            }
-            if (crawler?.autoscaledPool?.isRunning()) {
-                await crawler.autoscaledPool.abort();
-            }
         };
 
         const pushJob = async (job, sourceLabel) => {
@@ -631,7 +422,6 @@ const extractFromEmbeddedJson = ($) => {
                 url: job.url,
                 hasJobType: !!job.job_type
             });
-            await stopIfLimitReached();
             return true;
         };
 
@@ -735,8 +525,7 @@ const extractFromEmbeddedJson = ($) => {
         // Create a got-scraping instance that explicitly disables HTTP/2 for fallbacks
         // Fallback logic removed for speed and simplicity
 
-        let crawler;
-        crawler = new CheerioCrawler({
+        const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
             maxRequestRetries: userMaxRequestRetries,
             useSessionPool: true,
@@ -757,7 +546,6 @@ const extractFromEmbeddedJson = ($) => {
                     maxAgeSecs: 300,
                 },
             },
-            requestQueue,
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -838,11 +626,9 @@ const extractFromEmbeddedJson = ($) => {
                 if (session) session.retire();
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
-                const handlerStart = Date.now();
                 try {
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping further processing');
-                        await stopIfLimitReached();
                         return;
                     }
 
@@ -1052,13 +838,6 @@ const extractFromEmbeddedJson = ($) => {
                             }
                         }
                         crawlerLog.info(`Buffered ${collectDetails ? 'listing stubs' : 'jobs pushed'} from LIST page`, { buffered: jobs.length, pendingListings: pendingListings.size });
-                        if (collectDetails && pendingListings.size >= PENDING_FLUSH_THRESHOLD) {
-                            crawlerLog.info('Pending listing buffer threshold reached, flushing early', {
-                                pendingListings: pendingListings.size,
-                                threshold: PENDING_FLUSH_THRESHOLD,
-                            });
-                            await flushPendingListings('LIST_BUFFER');
-                        }
                     }
 
                     // Optionally enqueue detail pages if requested
@@ -1082,8 +861,7 @@ const extractFromEmbeddedJson = ($) => {
                             crawlerLog.info(`Enqueueing ${toEnqueue.length} detail pages`);
                             await enqueueLinks({ 
                                 urls: toEnqueue, 
-                                userData: { label: 'DETAIL', referrer: request.url },
-                                requestQueue,
+                                userData: { label: 'DETAIL', referrer: request.url }
                             });
                             stats.detailPagesEnqueued += toEnqueue.length;
                         }
@@ -1102,8 +880,7 @@ const extractFromEmbeddedJson = ($) => {
                             });
                             await enqueueLinks({ 
                                 urls: [next], 
-                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url },
-                                requestQueue,
+                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
@@ -1122,8 +899,6 @@ const extractFromEmbeddedJson = ($) => {
                     stats.detailPagesProcessed += 1;
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping detail page');
-                        queuedDetailUrls.delete(request.url);
-                        await stopIfLimitReached();
                         return;
                     }
                     
@@ -1133,27 +908,9 @@ const extractFromEmbeddedJson = ($) => {
                         const listingStub = pendingListings.get(request.url);
                         if (listingStub) pendingListings.delete(request.url);
                         
-                        // Try JSON-LD first, then embedded JSON blobs
+                        // Try JSON-LD first
                         const json = extractFromJsonLd($);
                         const data = json || {};
-                        const embedded = extractFromEmbeddedJson($);
-                        if (embedded) {
-                            for (const [key, value] of Object.entries(embedded)) {
-                                if (value && (data[key] === undefined || data[key] === null)) {
-                                    data[key] = value;
-                                }
-                            }
-                        }
-                        ['company', 'location', 'salary', 'job_type'].forEach((key) => {
-                            if (data[key]) {
-                                const sanitized = sanitizePlainText(data[key]);
-                                data[key] = sanitized || null;
-                            }
-                        });
-                        if (data.description_text) {
-                            const sanitized = sanitizePlainText(data.description_text);
-                            if (sanitized) data.description_text = sanitized;
-                        }
                         
                         // Enhanced selectors for detail pages
                         if (!data.title) {
@@ -1161,53 +918,26 @@ const extractFromEmbeddedJson = ($) => {
                         }
                         
                         if (!data.company) {
-                            const companySelectors = [
-                                '[data-testid*="recruiter"]',
-                                '[class*="recruiter"]',
-                                '[class*="employer"]',
-                                '.company',
-                                '.job-company',
-                                '[itemprop="hiringOrganization"] [itemprop="name"]',
-                                'dt:contains("Recruiter") + dd',
-                            ];
-                            for (const sel of companySelectors) {
-                                const el = $(sel).first();
-                                const text = getElementCleanText(el);
-                                if (text) {
-                                    data.company = text;
-                                    break;
-                                }
-                            }
+                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
                         }
                         
                         if (!data.description_html) {
-                            const desc = extractDetailDescription($);
-                            if (desc) {
-                                data.description_html = desc.html;
-                                data.description_text = sanitizePlainText(desc.text) || desc.text;
-                            }
-                        }
-                        
-                        if (data.description_html && !data.description_text) {
-                            const cleaned = cleanText(data.description_html);
-                            data.description_text = sanitizePlainText(cleaned) || cleaned;
-                        }
-                        
-                        if (!data.location) {
-                            const locSelectors = [
-                                '[data-testid*="location"]',
-                                '[class*="location"]',
-                                '.job-location',
-                                'dt:contains("Location") + dd',
-                                '[itemprop="jobLocation"] [itemprop="addressLocality"]',
-                            ];
-                            for (const sel of locSelectors) {
-                                const text = getElementCleanText($(sel).first());
-                                if (text) {
-                                    data.location = text;
+                            const descSelectors = ['.job-description', '[class*="description"]', '.job-details', 'article', '.content'];
+                            for (const sel of descSelectors) {
+                                const desc = $(sel).first();
+                                if (desc.length && desc.text().length > 50) {
+                                    data.description_html = desc.html();
                                     break;
                                 }
                             }
+                        }
+                        
+                        if (data.description_html) {
+                            data.description_text = cleanText(data.description_html);
+                        }
+                        
+                        if (!data.location) {
+                            data.location = $('[class*="location"]').first().text().trim() || null;
                         }
                         
                         if (data.date_posted) {
@@ -1229,7 +959,7 @@ const extractFromEmbeddedJson = ($) => {
                             }
                         }
                         
-                        const salary = getElementCleanText($('[class*="salary"], .wage, dt:contains("Salary") + dd').first()) || null;
+                        const salary = $('[class*="salary"], .wage').first().text().trim() || null;
                         
                         // Extract job type from detail page
                         const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
@@ -1252,7 +982,7 @@ const extractFromEmbeddedJson = ($) => {
                             for (const sel of typeSelectors) {
                                 const typeEl = $(sel).first();
                                 if (typeEl.length) {
-                                    const typeText = getElementCleanText(typeEl);
+                                    const typeText = typeEl.text().trim();
                                     if (typeText && typeText.length > 3 && typeText.length < 50) {
                                         jobType = typeText;
                                         break;
@@ -1274,18 +1004,9 @@ const extractFromEmbeddedJson = ($) => {
                             url: request.url,
                         };
                         merged.date_posted = normalizePostedDateValue(merged.date_posted);
-                        ['company', 'location', 'salary', 'job_type'].forEach((key) => {
-                            if (merged[key]) {
-                                const sanitized = sanitizePlainText(merged[key]);
-                                merged[key] = sanitized || merged[key];
-                            }
-                        });
+
                         if (!merged.description_text && merged.description_html) {
-                            const cleaned = cleanText(merged.description_html);
-                            merged.description_text = sanitizePlainText(cleaned) || cleaned;
-                        } else if (merged.description_text) {
-                            const sanitizedDescription = sanitizePlainText(merged.description_text);
-                            merged.description_text = sanitizedDescription || merged.description_text;
+                            merged.description_text = cleanText(merged.description_html);
                         }
 
                         if (merged.title) {
@@ -1300,8 +1021,6 @@ const extractFromEmbeddedJson = ($) => {
                         }
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
-                    } finally {
-                        queuedDetailUrls.delete(request.url);
                     }
                     // Detail processing complete
                 }
@@ -1317,27 +1036,15 @@ const extractFromEmbeddedJson = ($) => {
                         stats.sessionsRetired += 1;
                     }
                     throw handlerError;
-                } finally {
-                    const duration = Date.now() - handlerStart;
-                    stats.completedRequests += 1;
-                    stats.totalRequestDurationMs += duration;
-                    stats.avgRequestMs = Math.round(stats.totalRequestDurationMs / stats.completedRequests);
                 }
             }
         });
 
-        const initialRequests = initial.map((u) => ({ 
-            url: u, 
-            userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } 
-        }));
-        await requestQueue.addRequests(initialRequests);
+        // Note: Crawler manages its own queue internally; requestQueue variable kept for potential future enhancements
+        requestQueue = null;
+
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        startHeartbeat();
-        try {
-            await crawler.run();
-        } finally {
-            stopHeartbeat();
-        }
+        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
