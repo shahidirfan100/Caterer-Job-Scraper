@@ -257,13 +257,24 @@ const cleanText = (html) => {
     return $.root().text().replace(/\s+/g, ' ').trim();
 };
 const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
+const looksLikeCss = (value) => {
+    if (!value || typeof value !== 'string') return false;
+    if (value.includes('#no-js-image')) return true;
+    return /(?:^|\s)[.#][\w-]+\s*\{/.test(value) || value.includes('@media');
+};
+const sanitizePlainText = (value) => {
+    if (!value) return null;
+    const normalized = normalizeText(value);
+    if (!normalized) return null;
+    if (looksLikeCss(normalized)) return null;
+    return normalized;
+};
 const getElementCleanText = ($element) => {
     if (!$element || !$element.length) return null;
     const clone = $element.clone();
     clone.find('script, style, noscript').remove();
     const text = clone.text();
-    const normalized = normalizeText(text);
-    return normalized || null;
+    return sanitizePlainText(text);
 };
 const extractDetailDescription = ($) => {
     if (!$) return null;
@@ -303,6 +314,91 @@ const extractDetailDescription = ($) => {
         const html = clone.html();
         const text = cleanText(html);
         if (text) return { html, text };
+    }
+    return null;
+};
+const extractFromEmbeddedJson = ($) => {
+    if (!$) return null;
+    const scripts = $('script[id="__NEXT_DATA__"], script[type="application/json"]').slice(0, 10);
+    const MAX_NODES = 5000;
+    const combineLocation = (node) => {
+        if (!node) return null;
+        if (typeof node === 'string') return sanitizePlainText(node);
+        if (Array.isArray(node)) {
+            const parts = node.map((n) => combineLocation(n)).filter(Boolean);
+            return parts.join(', ') || null;
+        }
+        if (typeof node !== 'object') return null;
+        const parts = [
+            node.displayName,
+            node.name,
+            node.city,
+            node.region,
+            node.county,
+            node.state,
+            node.country,
+            node.postcode,
+        ].map((part) => sanitizePlainText(part));
+        const combined = parts.filter(Boolean).join(', ');
+        return combined || null;
+    };
+    const mapNodeToJob = (node) => {
+        if (!node || typeof node !== 'object') return null;
+        const raw = {
+            title: node.jobTitle || node.title || node.positionTitle,
+            company: node.companyName || node.recruiterName || node.employerName || node.hiringOrgName || node.hiringOrganization?.name,
+            location: combineLocation(node.jobLocation || node.location || node.job_location || node.jobLocations),
+            description_html: node.jobDescription || node.description_html || node.description,
+            description_text: node.description_text || node.descriptionText,
+            salary: node.salaryDescription || node.salaryText || node.salary,
+            job_type: node.jobType || node.employmentType || node.contractType,
+            date_posted: node.datePosted || node.postedDate || node.date,
+        };
+        const hasData = Object.values(raw).some((val) => typeof val === 'string' && val.trim().length > 0);
+        if (!hasData) return null;
+        return {
+            title: sanitizePlainText(raw.title),
+            company: sanitizePlainText(raw.company),
+            location: sanitizePlainText(raw.location),
+            description_html: raw.description_html || null,
+            description_text: sanitizePlainText(raw.description_text),
+            salary: sanitizePlainText(raw.salary),
+            job_type: sanitizePlainText(raw.job_type),
+            date_posted: raw.date_posted || null,
+        };
+    };
+    for (let i = 0; i < scripts.length; i++) {
+        const raw = $(scripts[i]).html();
+        if (!raw || raw.length > 2_000_000) continue;
+        let data;
+        try {
+            data = JSON.parse(raw);
+        } catch {
+            continue;
+        }
+        const queue = [data];
+        let processed = 0;
+        while (queue.length && processed < MAX_NODES) {
+            const node = queue.shift();
+            processed += 1;
+            if (!node) continue;
+            if (typeof node === 'string') continue;
+            if (Array.isArray(node)) {
+                queue.push(...node.slice(0, 50));
+                continue;
+            }
+            if (typeof node === 'object') {
+                const job = mapNodeToJob(node);
+                if (job && (job.description_html || job.title || job.company || job.location)) {
+                    return job;
+                }
+                const values = Object.values(node);
+                for (const val of values.slice(0, 50)) {
+                    if (processed >= MAX_NODES) break;
+                    queue.push(val);
+                }
+            }
+        }
     }
     return null;
 };
@@ -1037,9 +1133,27 @@ const extractDetailDescription = ($) => {
                         const listingStub = pendingListings.get(request.url);
                         if (listingStub) pendingListings.delete(request.url);
                         
-                        // Try JSON-LD first
+                        // Try JSON-LD first, then embedded JSON blobs
                         const json = extractFromJsonLd($);
                         const data = json || {};
+                        const embedded = extractFromEmbeddedJson($);
+                        if (embedded) {
+                            for (const [key, value] of Object.entries(embedded)) {
+                                if (value && (data[key] === undefined || data[key] === null)) {
+                                    data[key] = value;
+                                }
+                            }
+                        }
+                        ['company', 'location', 'salary', 'job_type'].forEach((key) => {
+                            if (data[key]) {
+                                const sanitized = sanitizePlainText(data[key]);
+                                data[key] = sanitized || null;
+                            }
+                        });
+                        if (data.description_text) {
+                            const sanitized = sanitizePlainText(data.description_text);
+                            if (sanitized) data.description_text = sanitized;
+                        }
                         
                         // Enhanced selectors for detail pages
                         if (!data.title) {
@@ -1070,12 +1184,13 @@ const extractDetailDescription = ($) => {
                             const desc = extractDetailDescription($);
                             if (desc) {
                                 data.description_html = desc.html;
-                                data.description_text = desc.text;
+                                data.description_text = sanitizePlainText(desc.text) || desc.text;
                             }
                         }
                         
                         if (data.description_html && !data.description_text) {
-                            data.description_text = cleanText(data.description_html);
+                            const cleaned = cleanText(data.description_html);
+                            data.description_text = sanitizePlainText(cleaned) || cleaned;
                         }
                         
                         if (!data.location) {
@@ -1159,9 +1274,18 @@ const extractDetailDescription = ($) => {
                             url: request.url,
                         };
                         merged.date_posted = normalizePostedDateValue(merged.date_posted);
-
+                        ['company', 'location', 'salary', 'job_type'].forEach((key) => {
+                            if (merged[key]) {
+                                const sanitized = sanitizePlainText(merged[key]);
+                                merged[key] = sanitized || merged[key];
+                            }
+                        });
                         if (!merged.description_text && merged.description_html) {
-                            merged.description_text = cleanText(merged.description_html);
+                            const cleaned = cleanText(merged.description_html);
+                            merged.description_text = sanitizePlainText(cleaned) || cleaned;
+                        } else if (merged.description_text) {
+                            const sanitizedDescription = sanitizePlainText(merged.description_text);
+                            merged.description_text = sanitizedDescription || merged.description_text;
                         }
 
                         if (merged.title) {
