@@ -250,13 +250,62 @@ async function main() {
             }
         };
 
-        const cleanText = (html) => {
-            if (!html) return '';
-            const $ = cheerioLoad(html);
-            $('script, style, noscript, iframe').remove();
-            return $.root().text().replace(/\s+/g, ' ').trim();
-        };
-        const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
+const cleanText = (html) => {
+    if (!html) return '';
+    const $ = cheerioLoad(html);
+    $('script, style, noscript, iframe').remove();
+    return $.root().text().replace(/\s+/g, ' ').trim();
+};
+const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim();
+const getElementCleanText = ($element) => {
+    if (!$element || !$element.length) return null;
+    const clone = $element.clone();
+    clone.find('script, style, noscript').remove();
+    const text = clone.text();
+    const normalized = normalizeText(text);
+    return normalized || null;
+};
+const extractDetailDescription = ($) => {
+    if (!$) return null;
+    const selectors = [
+        '[data-testid*="description"]',
+        '#jobDescription',
+        '[itemprop="description"]',
+        '.job-description',
+        '.job-details__description',
+        '.job-details [class*="description"]',
+        'article',
+        'main section',
+    ];
+    for (const selector of selectors) {
+        const target = typeof selector === 'function' ? selector($) : $(selector).first();
+        if (!target || !target.length) continue;
+        const clone = target.clone();
+        clone.find('script, style, noscript, iframe').remove();
+        const html = clone.html();
+        if (!html) continue;
+        const text = cleanText(html);
+        if (text && text.length >= 80) {
+            return { html, text };
+        }
+    }
+    const fallback = $('main, article, section').filter((_, el) => {
+        const clone = $(el).clone();
+        clone.find('script, style, noscript, iframe').remove();
+        const html = clone.html();
+        if (!html) return false;
+        const text = cleanText(html);
+        return text && text.length >= 150;
+    }).first();
+    if (fallback && fallback.length) {
+        const clone = fallback.clone();
+        clone.find('script, style, noscript, iframe').remove();
+        const html = clone.html();
+        const text = cleanText(html);
+        if (text) return { html, text };
+    }
+    return null;
+};
         const extractJobTypeFromPage = ($) => {
             if (!$) return null;
             
@@ -998,26 +1047,52 @@ async function main() {
                         }
                         
                         if (!data.company) {
-                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
-                        }
-                        
-                        if (!data.description_html) {
-                            const descSelectors = ['.job-description', '[class*="description"]', '.job-details', 'article', '.content'];
-                            for (const sel of descSelectors) {
-                                const desc = $(sel).first();
-                                if (desc.length && desc.text().length > 50) {
-                                    data.description_html = desc.html();
+                            const companySelectors = [
+                                '[data-testid*="recruiter"]',
+                                '[class*="recruiter"]',
+                                '[class*="employer"]',
+                                '.company',
+                                '.job-company',
+                                '[itemprop="hiringOrganization"] [itemprop="name"]',
+                                'dt:contains("Recruiter") + dd',
+                            ];
+                            for (const sel of companySelectors) {
+                                const el = $(sel).first();
+                                const text = getElementCleanText(el);
+                                if (text) {
+                                    data.company = text;
                                     break;
                                 }
                             }
                         }
                         
-                        if (data.description_html) {
+                        if (!data.description_html) {
+                            const desc = extractDetailDescription($);
+                            if (desc) {
+                                data.description_html = desc.html;
+                                data.description_text = desc.text;
+                            }
+                        }
+                        
+                        if (data.description_html && !data.description_text) {
                             data.description_text = cleanText(data.description_html);
                         }
                         
                         if (!data.location) {
-                            data.location = $('[class*="location"]').first().text().trim() || null;
+                            const locSelectors = [
+                                '[data-testid*="location"]',
+                                '[class*="location"]',
+                                '.job-location',
+                                'dt:contains("Location") + dd',
+                                '[itemprop="jobLocation"] [itemprop="addressLocality"]',
+                            ];
+                            for (const sel of locSelectors) {
+                                const text = getElementCleanText($(sel).first());
+                                if (text) {
+                                    data.location = text;
+                                    break;
+                                }
+                            }
                         }
                         
                         if (data.date_posted) {
@@ -1039,7 +1114,7 @@ async function main() {
                             }
                         }
                         
-                        const salary = $('[class*="salary"], .wage').first().text().trim() || null;
+                        const salary = getElementCleanText($('[class*="salary"], .wage, dt:contains("Salary") + dd').first()) || null;
                         
                         // Extract job type from detail page
                         const jobTypeFromJson = data.employmentType || data.jobType || data.job_type || null;
@@ -1062,7 +1137,7 @@ async function main() {
                             for (const sel of typeSelectors) {
                                 const typeEl = $(sel).first();
                                 if (typeEl.length) {
-                                    const typeText = typeEl.text().trim();
+                                    const typeText = getElementCleanText(typeEl);
                                     if (typeText && typeText.length > 3 && typeText.length < 50) {
                                         jobType = typeText;
                                         break;
