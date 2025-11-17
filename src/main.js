@@ -1,7 +1,7 @@
 // Caterer Job Scraper - Production-ready implementation
 // Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
+import { CheerioCrawler, Dataset, RequestQueue } from 'crawlee';
 // gotScraping removed - not needed after simplifying error handling
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
@@ -68,6 +68,8 @@ const shouldKeepByRecency = (dateValue) => {
     if (!parsed) return true;
     return (Date.now() - parsed.getTime()) <= recencyWindowMs;
 };
+const HEARTBEAT_INTERVAL_MS = Math.max(15_000, Number(process.env.APIFY_HEARTBEAT_MS || 30_000));
+const PENDING_FLUSH_THRESHOLD = Math.max(5, Number(process.env.APIFY_PENDING_FLUSH_THRESHOLD || 25));
 
 // Try to import header-generator, fallback if not available
 let HeaderGenerator;
@@ -378,7 +380,7 @@ async function main() {
         }
 
         let saved = 0;
-        let requestQueue = null; // Opened later so we can requeue failed fallbacks
+        const requestQueue = await RequestQueue.open();
         const pushedUrls = new Set();
         const pendingListings = new Map();
         const queuedDetailUrls = new Set();
@@ -395,12 +397,74 @@ async function main() {
             requestErrors: 0,
             requeued: 0,
             jobsWithJobType: 0,
+            heartbeatCount: 0,
+            totalRequestDurationMs: 0,
+            completedRequests: 0,
+            avgRequestMs: 0,
+        };
+        let heartbeatTimer = null;
+        const emitHeartbeat = async () => {
+            stats.heartbeatCount += 1;
+            let queueInfo = null;
+            try {
+                queueInfo = await requestQueue?.getInfo();
+            } catch (infoErr) {
+                log.warning('Heartbeat queue info fetch failed', infoErr?.message || infoErr);
+            }
+            const payload = {
+                saved,
+                pendingListings: pendingListings.size,
+                queuedDetailUrls: queuedDetailUrls.size,
+                listPagesProcessed: stats.listPagesProcessed,
+                detailPagesProcessed: stats.detailPagesProcessed,
+                blockedResponses: stats.blockedResponses,
+                avgRequestMs: stats.avgRequestMs,
+                queueInfo,
+            };
+            log.info('[HEARTBEAT]', payload);
+        };
+        const startHeartbeat = () => {
+            if (heartbeatTimer) return;
+            heartbeatTimer = setInterval(() => {
+                emitHeartbeat().catch((err) => log.warning('Heartbeat emit failed', err?.message || err));
+            }, HEARTBEAT_INTERVAL_MS);
+            heartbeatTimer.unref?.();
+        };
+        const stopHeartbeat = () => {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
         };
         const passesRecency = (dateValue, url, logger = log) => {
             if (shouldKeepByRecency(dateValue)) return true;
             stats.recencyFiltered += 1;
             logger.info('Skipping job due to postedWithin filter', { url, date: dateValue, postedWithin: postedWithinLabel });
             return false;
+        };
+        const flushPendingListings = async (reason = 'LIST_FALLBACK') => {
+            if (!pendingListings.size) return;
+            const pending = [...pendingListings.entries()];
+            for (const [url, job] of pending) {
+                pendingListings.delete(url);
+                stats.pendingListingFlushes += 1;
+                await pushJob(job, reason);
+                if (saved >= RESULTS_WANTED) break;
+            }
+        };
+        let stopRequested = false;
+        const stopIfLimitReached = async () => {
+            if (stopRequested || saved < RESULTS_WANTED) return;
+            stopRequested = true;
+            log.info('Results target reached. Requesting crawler shutdown.');
+            try {
+                await requestQueue?.drop?.();
+            } catch (dropErr) {
+                log.warning('RequestQueue.drop() failed', dropErr?.message || dropErr);
+            }
+            if (crawler?.autoscaledPool?.isRunning()) {
+                await crawler.autoscaledPool.abort();
+            }
         };
 
         const pushJob = async (job, sourceLabel) => {
@@ -422,6 +486,7 @@ async function main() {
                 url: job.url,
                 hasJobType: !!job.job_type
             });
+            await stopIfLimitReached();
             return true;
         };
 
@@ -525,7 +590,8 @@ async function main() {
         // Create a got-scraping instance that explicitly disables HTTP/2 for fallbacks
         // Fallback logic removed for speed and simplicity
 
-        const crawler = new CheerioCrawler({
+        let crawler;
+        crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
             maxRequestRetries: userMaxRequestRetries,
             useSessionPool: true,
@@ -546,6 +612,7 @@ async function main() {
                     maxAgeSecs: 300,
                 },
             },
+            requestQueue,
             
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -626,9 +693,11 @@ async function main() {
                 if (session) session.retire();
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
+                const handlerStart = Date.now();
                 try {
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping further processing');
+                        await stopIfLimitReached();
                         return;
                     }
 
@@ -838,6 +907,13 @@ async function main() {
                             }
                         }
                         crawlerLog.info(`Buffered ${collectDetails ? 'listing stubs' : 'jobs pushed'} from LIST page`, { buffered: jobs.length, pendingListings: pendingListings.size });
+                        if (collectDetails && pendingListings.size >= PENDING_FLUSH_THRESHOLD) {
+                            crawlerLog.info('Pending listing buffer threshold reached, flushing early', {
+                                pendingListings: pendingListings.size,
+                                threshold: PENDING_FLUSH_THRESHOLD,
+                            });
+                            await flushPendingListings('LIST_BUFFER');
+                        }
                     }
 
                     // Optionally enqueue detail pages if requested
@@ -861,7 +937,8 @@ async function main() {
                             crawlerLog.info(`Enqueueing ${toEnqueue.length} detail pages`);
                             await enqueueLinks({ 
                                 urls: toEnqueue, 
-                                userData: { label: 'DETAIL', referrer: request.url }
+                                userData: { label: 'DETAIL', referrer: request.url },
+                                requestQueue,
                             });
                             stats.detailPagesEnqueued += toEnqueue.length;
                         }
@@ -880,7 +957,8 @@ async function main() {
                             });
                             await enqueueLinks({ 
                                 urls: [next], 
-                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
+                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url },
+                                requestQueue,
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
@@ -899,6 +977,8 @@ async function main() {
                     stats.detailPagesProcessed += 1;
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping detail page');
+                        queuedDetailUrls.delete(request.url);
+                        await stopIfLimitReached();
                         return;
                     }
                     
@@ -1021,6 +1101,8 @@ async function main() {
                         }
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
+                    } finally {
+                        queuedDetailUrls.delete(request.url);
                     }
                     // Detail processing complete
                 }
@@ -1036,15 +1118,27 @@ async function main() {
                         stats.sessionsRetired += 1;
                     }
                     throw handlerError;
+                } finally {
+                    const duration = Date.now() - handlerStart;
+                    stats.completedRequests += 1;
+                    stats.totalRequestDurationMs += duration;
+                    stats.avgRequestMs = Math.round(stats.totalRequestDurationMs / stats.completedRequests);
                 }
             }
         });
 
-        // Note: Crawler manages its own queue internally; requestQueue variable kept for potential future enhancements
-        requestQueue = null;
-
+        const initialRequests = initial.map((u) => ({ 
+            url: u, 
+            userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } 
+        }));
+        await requestQueue.addRequests(initialRequests);
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
+        startHeartbeat();
+        try {
+            await crawler.run();
+        } finally {
+            stopHeartbeat();
+        }
 
         if (collectDetails && pendingListings.size && saved < RESULTS_WANTED) {
             log.info('Flushing pending listings without detail pages', { pending: pendingListings.size });
