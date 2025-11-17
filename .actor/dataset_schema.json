@@ -1,6 +1,7 @@
 {
   "actorSpecification": 1,
-  "fields": {
+  "type": "object",
+  "properties": {
     "title": {
       "type": "string",
       "nullable": true,
