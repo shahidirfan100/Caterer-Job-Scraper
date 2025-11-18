@@ -1,6 +1,6 @@
 {
     "actorOutputSchemaVersion": 1,
-    "title": "Output schema of the TikTok Video Downloader",
+    "title": "Output schema",
     "properties": {
         "overview": {
             "type": "string",
