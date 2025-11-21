@@ -147,7 +147,11 @@ async function main() {
             }
         }
         input = input || {};
-        log.info('Raw input received:', input);
+        // Avoid logging the whole input to stay compliant with Apify QA (inputs may contain secrets)
+        log.info('Raw input metadata:', {
+            keys: Object.keys(input || {}),
+            length: JSON.stringify(input || {}).length,
+        });
         // Defensive defaults and type-casting for all fields
         const safeInt = (v, def) => (Number.isFinite(+v) && +v > 0 ? +v : def);
         const safeBool = (v, def) => (typeof v === 'boolean' ? v : def);
