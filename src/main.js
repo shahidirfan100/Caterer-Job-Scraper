@@ -511,30 +511,55 @@ async function main() {
                 },
             },
             
-            // Stealth headers and throttling handled in hooks
+            // Enhanced stealth headers with pagination-specific handling
             preNavigationHooks: [
                 async ({ request, session }) => {
                     const headers = getHeaders();
+                    const isPagination = request.userData?.pageNo > 1;
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
-                    const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
-                    request.headers = {
+
+                    // Enhanced headers for pagination requests
+                    const baseHeaders = {
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br, zstd',
                         'Referer': referer,
-                        'Sec-Fetch-Site': fetchSite,
+                        'Sec-Fetch-Site': referer.includes('caterer.com') ? 'same-origin' : 'same-site',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-User': '?1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Cache-Control': 'max-age=0',
+                        'Upgrade-Insecure-Requests': '1',
                         'Priority': 'u=0, i',
                     };
+
+                    // Add pagination-specific headers to make it look more natural
+                    if (isPagination) {
+                        baseHeaders['Sec-Fetch-Site'] = 'same-origin'; // Always same-origin for pagination
+                        baseHeaders['Sec-Purpose'] = 'prefetch'; // Add prefetch purpose for pagination
+                    }
+
+                    request.headers = baseHeaders;
+
                     // Remove bot-identifying headers
                     delete request.headers['DNT'];
                     delete request.headers['dnt'];
-                    
-                    // Intelligent delay based on session usage and time patterns
+
+                    // Enhanced delay strategy for pagination
                     const sessionUsage = session?.usageCount || 0;
-                    const baseDelay = sessionUsage < 3 ? 800 : sessionUsage < 6 ? 1200 : 1800;
-                    const jitter = Math.random() * 400 - 200; // -200 to +200ms jitter
-                    const timeOfDayFactor = Math.sin((new Date().getHours() / 24) * Math.PI * 2) * 0.3 + 0.7; // Peak during business hours
-                    const delay = Math.max(500, baseDelay * timeOfDayFactor + jitter);
+                    const isPaginationRequest = request.userData?.pageNo > 1;
+
+                    let baseDelay;
+                    if (isPaginationRequest) {
+                        // Longer delays for pagination to avoid rate limiting
+                        baseDelay = sessionUsage < 2 ? 2000 : sessionUsage < 4 ? 3000 : 4000;
+                    } else {
+                        baseDelay = sessionUsage < 3 ? 800 : sessionUsage < 6 ? 1200 : 1800;
+                    }
+
+                    const jitter = Math.random() * 600 - 300; // ±300ms jitter
+                    const timeOfDayFactor = Math.sin((new Date().getHours() / 24) * Math.PI * 2) * 0.3 + 0.7;
+                    const delay = Math.max(800, baseDelay * timeOfDayFactor + jitter);
 
                     await sleep(delay);
                 },
@@ -864,19 +889,24 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination
+                    // Handle pagination with enhanced stealth
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next) {
-                            crawlerLog.info(`Pagination: Moving to page ${pageNo + 1}`, {
+                            crawlerLog.info(`Pagination: Moving to page ${pageNo + 1} with enhanced stealth`, {
                                 nextUrl: next,
                                 currentPage: pageNo,
                                 totalSaved: saved,
                                 maxPages: MAX_PAGES
                             });
-                            await enqueueLinks({ 
-                                urls: [next], 
-                                userData: { label: 'LIST', pageNo: pageNo + 1, referrer: request.url }
+                            await enqueueLinks({
+                                urls: [next],
+                                userData: {
+                                    label: 'LIST',
+                                    pageNo: pageNo + 1,
+                                    referrer: request.url,
+                                    isPagination: true // Flag for special handling
+                                }
                             });
                             stats.listPagesEnqueued += 1;
                         } else {
