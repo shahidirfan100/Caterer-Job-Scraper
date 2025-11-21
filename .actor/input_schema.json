@@ -1,26 +1,23 @@
 {
-  "title": "Caterer.com Jobs Scraper",
-  "description": "Scrape hospitality and catering jobs from Caterer.com. Provide either keyword/location OR Caterer.com search URLs. Actor paginates and optionally scrapes detail pages.",
+  "title": "Caterer Job Scraper",
+  "description": "Scrape hospitality and catering jobs from Caterer.com. Provide either keyword/location OR a Caterer.com search URL (startUrl, url, or startUrls). Actor paginates and optionally scrapes detail pages.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "startUrls": {
-      "title": "Start URLs",
-      "type": "array",
-      "description": "Array of Caterer.com URLs to start scraping from. If provided, keyword/location filters are ignored.",
-      "items": {
-        "type": "string"
-      },
-      "editor": "stringList"
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific Caterer.com search URL. If provided, this will be used instead of Keyword/Location.",
+      "editor": "textfield"
     },
     "keyword": {
-      "title": "Keyword",
+      "title": "Keyword (if not using Start URL)",
       "type": "string",
       "description": "Job search keyword(s), e.g., 'Head Chef', 'Restaurant Manager', 'Sous Chef', 'Bartender'.",
       "editor": "textfield"
     },
     "location": {
-      "title": "Location",
+      "title": "Location (if not using Start URL)",
       "type": "string",
       "description": "Location to search for jobs (e.g., 'London', 'Manchester', 'Birmingham'). Leave empty for all locations.",
       "editor": "textfield"
@@ -71,8 +68,8 @@
       "type": "object",
       "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
       "editor": "proxy"
-  }
-},
+    }
+  },
   "required": [],
   "additionalProperties": true
 }

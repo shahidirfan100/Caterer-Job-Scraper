@@ -1,7 +1,7 @@
 // Caterer Job Scraper - Production-ready implementation
-// Stack: Apify + Crawlee + PlaywrightCrawler + Cheerio + header-generator
+// Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
 
@@ -72,7 +72,7 @@ const shouldKeepByRecency = (dateValue) => {
 let HeaderGenerator;
 try {
     const hg = await import('header-generator');
-    HeaderGenerator = hg.HeaderGenerator || hg.default;
+    HeaderGenerator = hg.default;
 } catch (error) {
     log.warning('header-generator not available, using fallback headers:', error.message);
     HeaderGenerator = null;
@@ -82,10 +82,9 @@ const initHeaderGenerator = () => {
     if (!HeaderGenerator || headerGeneratorInstance) return;
     try {
         headerGeneratorInstance = new HeaderGenerator({
-            browsers: [{ name: 'chrome', minVersion: 120 }, { name: 'firefox', minVersion: 120 }],
+            browsers: ['chrome', 'firefox'],
             operatingSystems: ['windows', 'macos', 'linux'],
             devices: ['desktop'],
-            locales: ['en-US', 'en-GB'],
         });
         log.info('HeaderGenerator initialized');
     } catch (error) {
@@ -114,12 +113,12 @@ async function main() {
         } catch (initErr) {
             // Provide more actionable diagnostics when Actor.init() fails with ArgumentError
             log.error('Actor.init() failed:', { name: initErr.name, message: initErr.message, stack: initErr.stack, validationErrors: initErr.validationErrors });
-            // If this appears to be an input validation problem, note that APIFY_INPUT is present
-            // Note: Do NOT log raw APIFY_INPUT content - it may contain secrets and will fail QA review
+            // If this appears to be an input validation problem, log the raw environment input if available
             try {
                 if (process.env.APIFY_INPUT) {
+                    log.warning('APIFY_INPUT env var present; logging its type and truncated content');
                     const raw = String(process.env.APIFY_INPUT);
-                    log.warning('APIFY_INPUT env var present (length: ' + raw.length + ' chars) - validation may have failed');
+                    log.warning('APIFY_INPUT (truncated 1k):', raw.slice(0, 1024));
                 }
             } catch (envErr) { /* ignore env logging errors */ }
             // Re-throw so outer catch still handles termination, but with richer logs
@@ -147,11 +146,7 @@ async function main() {
             }
         }
         input = input || {};
-        // Avoid logging the whole input to stay compliant with Apify QA (inputs may contain secrets)
-        log.info('Raw input metadata:', {
-            keys: Object.keys(input || {}),
-            length: JSON.stringify(input || {}).length,
-        });
+        log.info('Raw input received:', input);
         // Defensive defaults and type-casting for all fields
         const safeInt = (v, def) => (Number.isFinite(+v) && +v > 0 ? +v : def);
         const safeBool = (v, def) => (typeof v === 'boolean' ? v : def);
@@ -167,15 +162,6 @@ async function main() {
         const url = safeStr(input.url, '');
         const startUrls = Array.isArray(input.startUrls) ? input.startUrls : undefined;
         const proxyConfiguration = safeObj(input.proxyConfiguration, undefined);
-
-        // Production defaults for stealth and reliability (internal - not in schema)
-        const useResidentialProxy = true; // prefer residential proxies for stealth
-        // Stealth-y defaults — can be overridden by environment variables
-        const minDelayMs = Number(process.env.APIFY_MIN_DELAY_MS || 200); // human-like min jitter
-        const maxDelayMs = Number(process.env.APIFY_MAX_DELAY_MS || 800); // human-like max jitter
-        const userMaxConcurrency = Math.max(1, Number(process.env.APIFY_MAX_CONCURRENCY || 5)); // conservative default for residential proxies
-        const userMaxRequestRetries = 6; // retry strategy for transient errors
-        const persistCookiesPerSessionInput = true; // keep cookies per session for stealth
         const postedWithinInput = safeStr(input.postedWithin, 'any');
 
         // Defensive input validation and logging
@@ -371,20 +357,16 @@ async function main() {
         try {
             const useDefaultProxy = !proxyConfiguration || Object.keys(proxyConfiguration).length === 0;
             const proxyOptions = useDefaultProxy
-                ? { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] }
+                ? { useApifyProxy: true, apifyProxyGroups: ['DATACENTER'] }
                 : proxyConfiguration;
             proxyConf = await Actor.createProxyConfiguration(proxyOptions);
-            log.info('Proxy configuration ready', { 
-                defaultProxy: useDefaultProxy, 
-                groups: useDefaultProxy ? 'RESIDENTIAL' : 'custom' 
-            });
+            log.info('Proxy configuration ready', { defaultProxy: useDefaultProxy });
         } catch (e) {
             log.warning('Failed to create proxy configuration, continuing without proxy (may reduce success rate):', e.message);
             proxyConf = undefined;
         }
 
         let saved = 0;
-        let requestQueue = null; // Opened later so we can requeue failed fallbacks
         const pushedUrls = new Set();
         const pendingListings = new Map();
         const queuedDetailUrls = new Set();
@@ -399,7 +381,6 @@ async function main() {
             recencyFiltered: 0,
             sessionsRetired: 0,
             requestErrors: 0,
-            requeued: 0,
             jobsWithJobType: 0,
         };
         const passesRecency = (dateValue, url, logger = log) => {
@@ -466,16 +447,10 @@ async function main() {
                 // Match actual job posting URLs, not location/category links
                 // Job URLs: /job/{slug}/{company}-job{number}
                 // Exclude: /jobs/search/in-{location}, /jobs/{category}, /jobs?{params}
-                    // Accept relative /job/... as well as absolute https://www.caterer.com/job/...
-                    const isJobPath = /(^\/job\/)|(:\/\/[^\/]+\/job\/)/i.test(href);
-                    const isJobsCategory = /(^\/jobs(?:\/|\?)|:\/\/[^\/]+\/jobs(?:\/|\?))/i.test(href);
-                    if (isJobPath && !isJobsCategory) {
-                        // require either a '-job' suffix with digits or 'search-job' pattern
-                        if (/(?:-job\d+)|(search-job\d+)/i.test(href)) {
+                if (/^\/job\/[^\/]+\/[^\/]+-job\d+$|^\/job\/[a-z0-9\-]+\/[a-z0-9\-]+-job\d+$/i.test(href)) {
                     const abs = normalizeJobUrl(href, base);
                     if (abs && !abs.includes('#')) {
                         links.add(abs);
-                    }
                     }
                 }
             });
@@ -483,112 +458,67 @@ async function main() {
         }
 
         function findNextPage($, base) {
-            // Heuristic-based pagination detection for Caterer.com
-            // 1) rel=next -> most reliable
-            const relNext = $('a[rel="next"]').first().attr('href');
-            if (relNext) return toAbs(relNext, base);
-
-            // 2) aria-label/title containing "next" (case-insensitive)
-            const ariaNext = $('a[aria-label*="next" i], a[title*="next" i]').first().attr('href');
-            if (ariaNext) return toAbs(ariaNext, base);
-
-            // 3) anchor links where visible text contains "next" or common arrows
-            const arrowNext = $('a[href]').filter((_, el) => {
+            // Caterer.com uses ?page=N pagination (seen in fetched HTML: ?page=2, ?page=3, etc.)
+            const nextLink = $('a[href*="page="]').filter((_, el) => {
                 const text = $(el).text().trim().toLowerCase();
-                if (!text) return false;
-                if (text === 'next' || text.includes('next')) return true;
-                // Some sites use > › » symbols for next links
-                const arrowMatch = /^[›»>]+$/u.test(text) || /›|»|>/.test(text);
-                if (arrowMatch) return true;
-                return false;
+                return text === 'next' || text.includes('next');
             }).first().attr('href');
-            if (arrowNext) return toAbs(arrowNext, base);
-
-            // 4) Search for page parameter explicit links (?page=N) or /page/N path
+            
+            if (nextLink) return toAbs(nextLink, base);
+            
+            // Fallback: try to find current page and calculate next
             const currentUrl = new URL(base);
-            const currentPage = parseInt(currentUrl.searchParams.get('page') || currentUrl.pathname.match(/\/page\/(\d+)/)?.[1] || '1');
+            const currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
+            
+            // Check if a link to next page number exists
             const nextPageNum = currentPage + 1;
-
-            // Try query param match
-            const nextQuery = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
-            if (nextQuery) return toAbs(nextQuery, base);
-
-            // Try path-based pagination e.g., /page/2
-            const nextPath = $(`a[href*="/page/${nextPageNum}"]`).first().attr('href');
-            if (nextPath) return toAbs(nextPath, base);
-
-            // 5) Fallback: find any anchor which increments page in query string
-            const pageLinks = $('a[href*="page="]').map((_, el) => $(el).attr('href')).get();
-            for (const p of pageLinks) {
-                const m = String(p).match(/page=(\d+)/);
-                if (m && Number(m[1]) === nextPageNum) return toAbs(p, base);
-            }
-
-            // No obvious next page found
+            const nextPageLink = $(`a[href*="page=${nextPageNum}"]`).first().attr('href');
+            if (nextPageLink) return toAbs(nextPageLink, base);
+            
             return null;
         }
 
-        const crawler = new PlaywrightCrawler({
+        const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: userMaxRequestRetries,
+            maxRequestRetries: 6,
             useSessionPool: true,
-            minConcurrency: 1,
-            maxConcurrency: userMaxConcurrency,
+            minConcurrency: 2,
+            maxConcurrency: 8,
             autoscaledPoolOptions: {
-                desiredConcurrency: Math.max(1, Math.floor(userMaxConcurrency / 2)),
-                maxConcurrency: userMaxConcurrency,
-                minConcurrency: 1,
+                desiredConcurrency: 4,
+                maxConcurrency: 8,
+                minConcurrency: 2,
             },
-            requestHandlerTimeoutSecs: 60,
-            navigationTimeoutSecs: 30,
-            persistCookiesPerSession: persistCookiesPerSessionInput,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 100,
                 sessionOptions: {
-                    maxUsageCount: 10,
-                    maxAgeSecs: 600,
+                    maxUsageCount: 8,
+                    maxAgeSecs: 300,
                 },
             },
-            launchContext: {
-                launchOptions: {
-                    headless: true,
-                    args: [
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox',
-                        '--disable-gpu',
-                        '--disable-blink-features=AutomationControlled',
-                    ],
-                },
-            },
+            
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
-                async ({ request, page }) => {
+                async ({ request, session }) => {
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
-                    await page.setExtraHTTPHeaders({
+                    request.headers = {
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept-Encoding': 'gzip, deflate, br, zstd',
                         'Referer': referer,
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=0, i',
-                    });
-                    await page.setViewportSize({ width: 1366, height: 768 });
-                    await page.route('**/*', (route) => {
-                        const r = route.request();
-                        const type = r.resourceType();
-                        const url = r.url();
-                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                            return route.abort();
-                        }
-                        if (/(doubleclick|googletagmanager|google-analytics|facebook|optimizely|hotjar|segment\.io)/i.test(url)) {
-                            return route.abort();
-                        }
-                        return route.continue();
-                    });
-                    // Human-like delay with jitter (minDelayMs - maxDelayMs)
-                    const delay = Math.random() * (maxDelayMs - minDelayMs) + minDelayMs;
+                    };
+                    // Remove bot-identifying headers
+                    delete request.headers['DNT'];
+                    delete request.headers['dnt'];
+                    
+                    // Human-like delay with jitter (300-900ms)
+                    const delay = Math.random() * 600 + 300;
                     await sleep(delay);
                 },
             ],
@@ -601,31 +531,28 @@ async function main() {
                 stats.requestErrors += 1;
                 
                 // Retire session on blocking or serious errors
-                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha|cloudflare/i.test(message))) {
+                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha/i.test(message))) {
                     crawlerLog.warning('Session retired due to blocking signal', { url: request.url, statusCode });
                     session.retire();
                     stats.sessionsRetired += 1;
                 }
                 
-                // Check for various error types
-                const isTimeout = /timeout|timed out/i.test(message);
-                const isNetworkError = /net::|network|connection|ECONNREFUSED|ENOTFOUND/i.test(message);
-                const isBlocked = statusCode === 403 || statusCode === 429 || /403|429/i.test(message);
+                const isHttp2Reset = /nghttp2/i.test(message);
+                const isBlocked = statusCode === 403 || statusCode === 429;
                 
                 // Exponential backoff with jitter
-                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400);
-                const jitter = Math.random() * 800;
-                const multiplier = isBlocked ? 2.5 : (isTimeout ? 1.2 : 1.0);
-                const waitMs = Math.min(35000, baseWait * multiplier + jitter);
+                const baseWait = Math.min(25000, (2 ** Math.min(retries, 7)) * 500);
+                const jitter = Math.random() * 1000;
+                const multiplier = isBlocked ? 2.0 : (isHttp2Reset ? 1.5 : 1.0);
+                const waitMs = Math.min(40000, baseWait * multiplier + jitter);
                 
                 crawlerLog.warning(
                     isBlocked ? 'Blocked response detected, extended backoff' : 
-                    isTimeout ? 'Timeout error, backing off' :
-                    isNetworkError ? 'Network error, retrying with backoff' :
+                    isHttp2Reset ? 'HTTP/2 stream reset, backing off' : 
                     'Request error, exponential backoff with jitter', 
                     {
                         url: request.url,
-                        message: message.slice(0, 150),
+                        message,
                         statusCode,
                         waitMs: Math.round(waitMs),
                         retryCount: retries,
@@ -640,7 +567,7 @@ async function main() {
                 });
                 if (session) session.retire();
             },
-            async requestHandler({ request, page, enqueueLinks, log: crawlerLog, response, session }) {
+            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
                 try {
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping further processing');
@@ -649,17 +576,7 @@ async function main() {
 
                     const label = request.userData?.label || 'LIST';
                     const pageNo = request.userData?.pageNo || 1;
-                    
-                    // Wait for page to be ready
-                    try {
-                        await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-                    } catch (err) {
-                        crawlerLog.warning(`waitForLoadState timed out: ${err.message}`);
-                    }
-                    
-                    const html = await page.content();
-                    const $ = cheerioLoad(html);
-                    const statusCode = response?.status ?? response?.statusCode;
+                    const statusCode = response?.statusCode ?? response?.status;
                     
                     // Enhanced blocking detection
                     if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
@@ -673,11 +590,11 @@ async function main() {
                         throw new Error(`Blocked with status ${statusCode}`);
                     }
                     
-                    // Check for captcha or access denial in page content - only in title or error containers to avoid false positives
+                    // Check for captcha or access denial in page content
                     const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
-                    const errorDivs = typeof $ === 'function' ? $('.error, #error, [class*="error-"], [id*="error-"]').text().toLowerCase() : '';
-                    const blockSignals = ['access denied', 'temporarily blocked', 'captcha', 'cloudflare', 'please verify', 'security check'];
-                    const isBlocked = blockSignals.some(sig => pageTitle.includes(sig) || errorDivs.includes(sig));
+                    const bodyText = typeof $ === 'function' ? $('body').text().toLowerCase() : '';
+                    const blockSignals = ['access denied', 'temporarily blocked', 'captcha', 'cloudflare', 'please verify'];
+                    const isBlocked = blockSignals.some(sig => pageTitle.includes(sig) || bodyText.includes(sig));
                     
                     if ($ && isBlocked) {
                         stats.blockedResponses += 1;
@@ -701,27 +618,12 @@ async function main() {
                     stats.listPagesProcessed += 1;
                     crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
                     
-                    // Check if page loaded properly
-                    const bodyText = $('body').text();
-                    if (bodyText.length < 100) {
-                        crawlerLog.warning('Page appears empty, possibly blocked or loading issue', {
-                            url: request.url,
-                            bodyLength: bodyText.length,
-                            titleText: $('title').text().trim().slice(0, 100)
-                        });
-                        throw new Error('Empty page content detected');
-                    }
-                    
                     // Extract jobs directly from listing page
                     const jobs = [];
                     
-                    // Find all job links - try multiple selectors for robustness
-                    let jobElements = $('h2 a[href*="/job/"]');
-                    if (jobElements.length === 0) {
-                        // Fallback selectors if h2 structure changes
-                        jobElements = $('.job-title a[href*="/job/"], .vacancy-title a[href*="/job/"], [class*="job"] h3 a[href*="/job/"]');
-                    }
-                    crawlerLog.info(`Found ${jobElements.length} potential job links on page ${pageNo}`);
+                    // Find all job links in h2 tags - more reliable selector
+                    const jobElements = $('h2 a[href*="/job/"]');
+                    crawlerLog.info(`Found ${jobElements.length} potential job links`);
                     
                     jobElements.each((idx, el) => {
                         try {
@@ -746,16 +648,10 @@ async function main() {
                             if (companyLink.length) {
                                 company = companyLink.text().trim();
                             } else {
-                                // Additional selectors commonly used on Caterer listings
-                                const companyNodes = $jobContainer.find('[class*="recruiter"], [class*="company"], [data-testid*="recruiter"], [data-testid*="company"]').first();
-                                if (companyNodes.length) {
-                                    company = companyNodes.text().trim();
-                                } else {
-                                    // Fallback: look for company text patterns
-                                    const containerText = $jobContainer.text();
-                                    const companyMatch = containerText.match(/(?:by|company|employer)[:\s]+([^\n]+)/i);
-                                    if (companyMatch) company = companyMatch[1].trim();
-                                }
+                                // Fallback: look for company text patterns
+                                const containerText = $jobContainer.text();
+                                const companyMatch = containerText.match(/(?:by|company|employer):\s*([^\n]+)/i);
+                                if (companyMatch) company = companyMatch[1].trim();
                             }
                             
                             // Extract location - typically in the job container
@@ -808,7 +704,6 @@ async function main() {
                                     '.job-type',
                                     '[class*="employment"]',
                                     '[class*="contract"]',
-                                    '[data-testid*="employment"]',
                                     'span:contains("Full")',
                                     'span:contains("Part")'
                                 ];
@@ -914,9 +809,8 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination - check buffered jobs too when details collection is enabled
-                    const effectiveCount = saved + (collectDetails ? pendingListings.size : 0);
-                    if (effectiveCount < RESULTS_WANTED && pageNo < MAX_PAGES) {
+                    // Handle pagination
+                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url);
                         if (next) {
                             crawlerLog.info(`Pagination: Moving to page ${pageNo + 1}`, {
@@ -939,13 +833,16 @@ async function main() {
                     } else if (pageNo >= MAX_PAGES) {
                         crawlerLog.info('Max pages limit reached', { maxPages: MAX_PAGES, currentPage: pageNo });
                     }
-                    // Pagination logic completed, continue to next request
+                    // Human-like reading time (400-800ms)
+                    await sleep((Math.random() * 400 + 400));
+                    return;
                 }
 
                 if (label === 'DETAIL') {
                     stats.detailPagesProcessed += 1;
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping detail page');
+                        await sleep((Math.random() * 0.3 + 0.2) * 1000);
                         return;
                     }
                     
@@ -965,7 +862,7 @@ async function main() {
                         }
                         
                         if (!data.company) {
-                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company, [data-testid*="recruiter"], [data-testid*="company"]').first().text().trim() || null;
+                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
                         }
                         
                         if (!data.description_html) {
@@ -1022,7 +919,6 @@ async function main() {
                                 '[class*="job-type"]',
                                 '[class*="employment"]',
                                 '[class*="contract-type"]',
-                                '[data-testid*="employment"]',
                                 '.job-details [class*="type"]',
                                 'dt:contains("Job Type") + dd',
                                 'dt:contains("Employment Type") + dd'
@@ -1070,7 +966,8 @@ async function main() {
                     } catch (err) {
                         crawlerLog.error(`DETAIL extraction failed: ${err.message}`);
                     }
-                    // Detail processing complete
+                    // Human-like reading time for detail pages (500-1000ms)
+                    await sleep((Math.random() * 500 + 500));
                 }
                 } catch (handlerError) {
                     stats.requestErrors += 1;
@@ -1087,9 +984,6 @@ async function main() {
                 }
             }
         });
-
-        // Note: Crawler manages its own queue internally; requestQueue variable kept for potential future enhancements
-        requestQueue = null;
 
         log.info(`Starting crawler with ${initial.length} initial URL(s):`, initial);
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1, referrer: 'https://www.caterer.com/' } })));
@@ -1122,7 +1016,6 @@ async function main() {
             blockedResponses: stats.blockedResponses,
             sessionsRetired: stats.sessionsRetired,
             requestErrors: stats.requestErrors,
-            requeued: stats.requeued,
             successRate: stats.successRate,
             recencyFiltered: stats.recencyFiltered,
             jobsWithJobType: stats.jobsWithJobType,
