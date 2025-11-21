@@ -1,6 +1,7 @@
 {
   "name": "caterer-jobs-actor",
   "version": "1.0.0",
+  "type": "module",
   "dependencies": {
         "apify": "^3.4.2",
         "crawlee": "^3.13.8",

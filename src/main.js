@@ -559,7 +559,6 @@ async function main() {
                 },
             },
             browserPoolOptions: {
-                useIncognitoPages: true,
             },
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
