@@ -1,8 +1,7 @@
 // Caterer Job Scraper - Production-ready implementation
-// Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
+// Stack: Apify + Crawlee + PlaywrightCrawler + Cheerio + header-generator
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
-// gotScraping removed - not needed after simplifying error handling
+import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import fs from 'fs/promises';
 
@@ -526,10 +525,7 @@ async function main() {
             return null;
         }
 
-        // Create a got-scraping instance that explicitly disables HTTP/2 for fallbacks
-        // Fallback logic removed for speed and simplicity
-
-        const crawler = new CheerioCrawler({
+        const crawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
             maxRequestRetries: userMaxRequestRetries,
             useSessionPool: true,
@@ -550,27 +546,41 @@ async function main() {
                     maxAgeSecs: 300,
                 },
             },
-            
+            launchContext: {
+                launchOptions: {
+                    headless: true,
+                    args: [
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox',
+                        '--disable-gpu',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--disable-blink-features=AutomationControlled',
+                    ],
+                },
+            },
+            browserPoolOptions: {
+                useIncognitoPages: true,
+            },
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
-                async ({ request, session }) => {
-                    // Clean up any invalid fields that may exist on requests
-                    try { delete request.useHttp2; } catch (err) { /* noop */ }
+                async ({ request, page }) => {
                     const headers = getHeaders();
                     const referer = request.userData?.referrer || 'https://www.caterer.com/';
                     const fetchSite = referer.includes('caterer.com') ? 'same-origin' : 'same-site';
-                    request.headers = {
+                    await page.setExtraHTTPHeaders({
                         ...headers,
                         'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': referer,
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=0, i',
-                    };
-                    // Remove bot-identifying headers
-                    delete request.headers['DNT'];
-                    delete request.headers['dnt'];
-                    
+                    });
+                    await page.setViewportSize({ width: 1366, height: 768 });
+                    await page.route('**/*', (route) => {
+                        const type = route.request().resourceType();
+                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                        return route.continue();
+                    });
                     // Human-like delay with jitter (minDelayMs - maxDelayMs)
                     const delay = Math.random() * (maxDelayMs - minDelayMs) + minDelayMs;
                     await sleep(delay);
@@ -629,7 +639,7 @@ async function main() {
                 });
                 if (session) session.retire();
             },
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response, session }) {
+            async requestHandler({ request, page, enqueueLinks, log: crawlerLog, response, session }) {
                 try {
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info('Results limit reached, skipping further processing');
@@ -638,7 +648,11 @@ async function main() {
 
                     const label = request.userData?.label || 'LIST';
                     const pageNo = request.userData?.pageNo || 1;
-                    const statusCode = response?.statusCode ?? response?.status;
+                    // Ensure DOM is ready and hydrate Cheerio snapshot
+                    await page.waitForLoadState('domcontentloaded');
+                    const html = await page.content();
+                    const $ = cheerioLoad(html);
+                    const statusCode = response?.status ?? response?.statusCode;
                     
                     // Enhanced blocking detection
                     if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
