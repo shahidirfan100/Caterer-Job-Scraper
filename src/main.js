@@ -536,8 +536,9 @@ async function main() {
                 maxConcurrency: userMaxConcurrency,
                 minConcurrency: 1,
             },
-            requestHandlerTimeoutSecs: 30,
-            navigationTimeoutSecs: 20,
+            requestHandlerTimeoutSecs: 45,
+            navigationTimeoutSecs: 45,
+            navigationWaitUntil: 'domcontentloaded',
             persistCookiesPerSession: persistCookiesPerSessionInput,
             sessionPoolOptions: {
                 maxPoolSize: 50,
@@ -553,12 +554,21 @@ async function main() {
                         '--disable-dev-shm-usage',
                         '--no-sandbox',
                         '--disable-gpu',
-                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--disable-http2',
+                        '--disable-features=IsolateOrigins,site-per-process,NetworkService',
                         '--disable-blink-features=AutomationControlled',
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--ignore-certificate-errors',
                     ],
+                    viewport: { width: 1366, height: 768 },
                 },
             },
             browserPoolOptions: {
+                useIncognitoPages: true,
+                fingerprintOptions: {
+                    useFingerprintPerProxySession: true,
+                },
             },
             // Stealth headers and throttling handled in hooks
             preNavigationHooks: [
@@ -574,10 +584,12 @@ async function main() {
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=0, i',
                     });
-                    await page.setViewportSize({ width: 1366, height: 768 });
                     await page.route('**/*', (route) => {
-                        const type = route.request().resourceType();
+                        const r = route.request();
+                        const type = r.resourceType();
+                        const url = r.url();
                         if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                        if (/(doubleclick|googletagmanager|google-analytics|facebook|optimizely|hotjar|segment\.io)/i.test(url)) return route.abort();
                         return route.continue();
                     });
                     // Human-like delay with jitter (minDelayMs - maxDelayMs)
@@ -648,6 +660,13 @@ async function main() {
                     const label = request.userData?.label || 'LIST';
                     const pageNo = request.userData?.pageNo || 1;
                     // Ensure DOM is ready and hydrate Cheerio snapshot
+                    if (!response) {
+                        try {
+                            response = await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        } catch (err) {
+                            crawlerLog.warning(`Manual goto retry failed: ${err.message}`);
+                        }
+                    }
                     await page.waitForLoadState('domcontentloaded');
                     const html = await page.content();
                     const $ = cheerioLoad(html);
@@ -723,10 +742,16 @@ async function main() {
                             if (companyLink.length) {
                                 company = companyLink.text().trim();
                             } else {
-                                // Fallback: look for company text patterns
-                                const containerText = $jobContainer.text();
-                                const companyMatch = containerText.match(/(?:by|company|employer):\s*([^\n]+)/i);
-                                if (companyMatch) company = companyMatch[1].trim();
+                                // Additional selectors commonly used on Caterer listings
+                                const companyNodes = $jobContainer.find('[class*="recruiter"], [class*="company"], [data-testid*="recruiter"], [data-testid*="company"]').first();
+                                if (companyNodes.length) {
+                                    company = companyNodes.text().trim();
+                                } else {
+                                    // Fallback: look for company text patterns
+                                    const containerText = $jobContainer.text();
+                                    const companyMatch = containerText.match(/(?:by|company|employer)[:\s]+([^\n]+)/i);
+                                    if (companyMatch) company = companyMatch[1].trim();
+                                }
                             }
                             
                             // Extract location - typically in the job container
@@ -779,6 +804,7 @@ async function main() {
                                     '.job-type',
                                     '[class*="employment"]',
                                     '[class*="contract"]',
+                                    '[data-testid*="employment"]',
                                     'span:contains("Full")',
                                     'span:contains("Part")'
                                 ];
@@ -935,7 +961,7 @@ async function main() {
                         }
                         
                         if (!data.company) {
-                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company').first().text().trim() || null;
+                            data.company = $('[class*="recruiter"], [class*="employer"], .company, .job-company, [data-testid*="recruiter"], [data-testid*="company"]').first().text().trim() || null;
                         }
                         
                         if (!data.description_html) {
@@ -992,6 +1018,7 @@ async function main() {
                                 '[class*="job-type"]',
                                 '[class*="employment"]',
                                 '[class*="contract-type"]',
+                                '[data-testid*="employment"]',
                                 '.job-details [class*="type"]',
                                 'dt:contains("Job Type") + dd',
                                 'dt:contains("Employment Type") + dd'
