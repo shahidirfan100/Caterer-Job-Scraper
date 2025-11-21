@@ -72,7 +72,7 @@ const shouldKeepByRecency = (dateValue) => {
 let HeaderGenerator;
 try {
     const hg = await import('header-generator');
-    HeaderGenerator = hg.default;
+    HeaderGenerator = hg.HeaderGenerator || hg.default;
 } catch (error) {
     log.warning('header-generator not available, using fallback headers:', error.message);
     HeaderGenerator = null;
@@ -82,9 +82,10 @@ const initHeaderGenerator = () => {
     if (!HeaderGenerator || headerGeneratorInstance) return;
     try {
         headerGeneratorInstance = new HeaderGenerator({
-            browsers: ['chrome', 'firefox'],
+            browsers: [{ name: 'chrome', minVersion: 120 }, { name: 'firefox', minVersion: 120 }],
             operatingSystems: ['windows', 'macos', 'linux'],
             devices: ['desktop'],
+            locales: ['en-US', 'en-GB'],
         });
         log.info('HeaderGenerator initialized');
     } catch (error) {
@@ -169,12 +170,11 @@ async function main() {
 
         // Production defaults for stealth and reliability (internal - not in schema)
         const useResidentialProxy = true; // prefer residential proxies for stealth
-        // HTTP/2 errors handled via natural retry mechanism
-        // Stealth-y defaults — but can be overridden by environment variables
-        const minDelayMs = Number(process.env.APIFY_MIN_DELAY_MS || 150); // human-like min jitter
-        const maxDelayMs = Number(process.env.APIFY_MAX_DELAY_MS || 600); // human-like max jitter
-        const userMaxConcurrency = Math.max(1, Number(process.env.APIFY_MAX_CONCURRENCY || 8)); // faster default — adjust with env
-        const userMaxRequestRetries = 8; // retry strategy for transient errors
+        // Stealth-y defaults — can be overridden by environment variables
+        const minDelayMs = Number(process.env.APIFY_MIN_DELAY_MS || 200); // human-like min jitter
+        const maxDelayMs = Number(process.env.APIFY_MAX_DELAY_MS || 800); // human-like max jitter
+        const userMaxConcurrency = Math.max(1, Number(process.env.APIFY_MAX_CONCURRENCY || 5)); // conservative default for residential proxies
+        const userMaxRequestRetries = 6; // retry strategy for transient errors
         const persistCookiesPerSessionInput = true; // keep cookies per session for stealth
         const postedWithinInput = safeStr(input.postedWithin, 'any');
 
@@ -371,10 +371,13 @@ async function main() {
         try {
             const useDefaultProxy = !proxyConfiguration || Object.keys(proxyConfiguration).length === 0;
             const proxyOptions = useDefaultProxy
-                ? { useApifyProxy: true, apifyProxyGroups: useResidentialProxy ? ['RESIDENTIAL', 'DATACENTER'] : ['DATACENTER'] }
+                ? { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] }
                 : proxyConfiguration;
             proxyConf = await Actor.createProxyConfiguration(proxyOptions);
-            log.info('Proxy configuration ready', { defaultProxy: useDefaultProxy });
+            log.info('Proxy configuration ready', { 
+                defaultProxy: useDefaultProxy, 
+                groups: useDefaultProxy ? 'RESIDENTIAL' : 'custom' 
+            });
         } catch (e) {
             log.warning('Failed to create proxy configuration, continuing without proxy (may reduce success rate):', e.message);
             proxyConf = undefined;
@@ -536,14 +539,14 @@ async function main() {
                 maxConcurrency: userMaxConcurrency,
                 minConcurrency: 1,
             },
-            requestHandlerTimeoutSecs: 45,
-            navigationTimeoutSecs: 45,
+            requestHandlerTimeoutSecs: 60,
+            navigationTimeoutSecs: 30,
             persistCookiesPerSession: persistCookiesPerSessionInput,
             sessionPoolOptions: {
                 maxPoolSize: 50,
                 sessionOptions: {
-                    maxUsageCount: 8,
-                    maxAgeSecs: 300,
+                    maxUsageCount: 10,
+                    maxAgeSecs: 600,
                 },
             },
             launchContext: {
@@ -553,20 +556,8 @@ async function main() {
                         '--disable-dev-shm-usage',
                         '--no-sandbox',
                         '--disable-gpu',
-                        '--disable-http2',
-                        '--disable-features=IsolateOrigins,site-per-process,NetworkService',
                         '--disable-blink-features=AutomationControlled',
-                        '--disable-extensions',
-                        '--disable-background-networking',
-                        '--ignore-certificate-errors',
                     ],
-                    viewport: { width: 1366, height: 768 },
-                },
-            },
-            browserPoolOptions: {
-                useIncognitoPages: true,
-                fingerprintOptions: {
-                    useFingerprintPerProxySession: true,
                 },
             },
             // Stealth headers and throttling handled in hooks
@@ -583,12 +574,17 @@ async function main() {
                         'Sec-Fetch-Site': fetchSite,
                         'Priority': 'u=0, i',
                     });
+                    await page.setViewportSize({ width: 1366, height: 768 });
                     await page.route('**/*', (route) => {
                         const r = route.request();
                         const type = r.resourceType();
                         const url = r.url();
-                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
-                        if (/(doubleclick|googletagmanager|google-analytics|facebook|optimizely|hotjar|segment\.io)/i.test(url)) return route.abort();
+                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+                            return route.abort();
+                        }
+                        if (/(doubleclick|googletagmanager|google-analytics|facebook|optimizely|hotjar|segment\.io)/i.test(url)) {
+                            return route.abort();
+                        }
                         return route.continue();
                     });
                     // Human-like delay with jitter (minDelayMs - maxDelayMs)
@@ -598,8 +594,6 @@ async function main() {
             ],
 
             async errorHandler({ request, error, session, log: crawlerLog }) {
-                // Remove stale, non-schema fields from the request that may cause update errors
-                try { delete request.useHttp2; } catch (err) { /* noop */ }
                 const retries = request.retryCount ?? 0;
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || error?.status;
@@ -607,40 +601,37 @@ async function main() {
                 stats.requestErrors += 1;
                 
                 // Retire session on blocking or serious errors
-                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha/i.test(message))) {
+                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha|cloudflare/i.test(message))) {
                     crawlerLog.warning('Session retired due to blocking signal', { url: request.url, statusCode });
                     session.retire();
                     stats.sessionsRetired += 1;
                 }
                 
-                const isHttp2Reset = /nghttp2/i.test(message);
-                if (isHttp2Reset) {
-                    stats.http2Errors = (stats.http2Errors || 0) + 1;
-                }
-                const isBlocked = statusCode === 403 || statusCode === 429;
+                // Check for various error types
+                const isTimeout = /timeout|timed out/i.test(message);
+                const isNetworkError = /net::|network|connection|ECONNREFUSED|ENOTFOUND/i.test(message);
+                const isBlocked = statusCode === 403 || statusCode === 429 || /403|429/i.test(message);
                 
                 // Exponential backoff with jitter
-                const baseWait = Math.min(25000, (2 ** Math.min(retries, 7)) * 500);
-                const jitter = Math.random() * 1000;
-                const multiplier = isBlocked ? 2.0 : (isHttp2Reset ? 1.5 : 1.0);
-                const waitMs = Math.min(40000, baseWait * multiplier + jitter);
+                const baseWait = Math.min(20000, (2 ** Math.min(retries, 6)) * 400);
+                const jitter = Math.random() * 800;
+                const multiplier = isBlocked ? 2.5 : (isTimeout ? 1.2 : 1.0);
+                const waitMs = Math.min(35000, baseWait * multiplier + jitter);
                 
                 crawlerLog.warning(
                     isBlocked ? 'Blocked response detected, extended backoff' : 
-                    isHttp2Reset ? 'HTTP/2 stream reset, backing off' : 
+                    isTimeout ? 'Timeout error, backing off' :
+                    isNetworkError ? 'Network error, retrying with backoff' :
                     'Request error, exponential backoff with jitter', 
                     {
                         url: request.url,
-                        message,
+                        message: message.slice(0, 150),
                         statusCode,
                         waitMs: Math.round(waitMs),
                         retryCount: retries,
                     }
                 );
                 await sleep(waitMs);
-                
-                // HTTP/2 errors and other transient failures will be retried naturally via maxRequestRetries
-                // Removed complex fallback logic to improve speed and reliability
             },
             async failedRequestHandler({ request, error }, { session }) {
                 log.error(`Request failed after ${request.retryCount} retries: ${request.url}`, { 
@@ -658,15 +649,14 @@ async function main() {
 
                     const label = request.userData?.label || 'LIST';
                     const pageNo = request.userData?.pageNo || 1;
-                    // Ensure DOM is ready and hydrate Cheerio snapshot
-                    if (!response) {
-                        try {
-                            response = await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                        } catch (err) {
-                            crawlerLog.warning(`Manual goto retry failed: ${err.message}`);
-                        }
+                    
+                    // Wait for page to be ready
+                    try {
+                        await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+                    } catch (err) {
+                        crawlerLog.warning(`waitForLoadState timed out: ${err.message}`);
                     }
-                    await page.waitForLoadState('domcontentloaded');
+                    
                     const html = await page.content();
                     const $ = cheerioLoad(html);
                     const statusCode = response?.status ?? response?.statusCode;
@@ -711,12 +701,27 @@ async function main() {
                     stats.listPagesProcessed += 1;
                     crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
                     
+                    // Check if page loaded properly
+                    const bodyText = $('body').text();
+                    if (bodyText.length < 100) {
+                        crawlerLog.warning('Page appears empty, possibly blocked or loading issue', {
+                            url: request.url,
+                            bodyLength: bodyText.length,
+                            titleText: $('title').text().trim().slice(0, 100)
+                        });
+                        throw new Error('Empty page content detected');
+                    }
+                    
                     // Extract jobs directly from listing page
                     const jobs = [];
                     
-                    // Find all job links in h2 tags - more reliable selector
-                    const jobElements = $('h2 a[href*="/job/"]');
-                    crawlerLog.info(`Found ${jobElements.length} potential job links`);
+                    // Find all job links - try multiple selectors for robustness
+                    let jobElements = $('h2 a[href*="/job/"]');
+                    if (jobElements.length === 0) {
+                        // Fallback selectors if h2 structure changes
+                        jobElements = $('.job-title a[href*="/job/"], .vacancy-title a[href*="/job/"], [class*="job"] h3 a[href*="/job/"]');
+                    }
+                    crawlerLog.info(`Found ${jobElements.length} potential job links on page ${pageNo}`);
                     
                     jobElements.each((idx, el) => {
                         try {
