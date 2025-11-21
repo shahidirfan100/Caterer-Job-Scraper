@@ -1,7 +1,7 @@
 {
   "name": "caterer-jobs-actor",
   "version": "1.0.0",
-  "description": "Lightweight Caterer Job Scraper using Cheerio (Crawlee + gotScraping).",
+  "description": "High-performance Caterer Job Scraper using Crawlee + gotScraping with anti-blocking optimizations",
   "type": "module",
   "scripts": {
     "start": "node src/main.js"

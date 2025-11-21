@@ -1,5 +1,5 @@
-// Caterer Job Scraper - Production-ready implementation
-// Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator
+// Caterer Job Scraper - High-performance implementation with anti-blocking
+// Stack: Apify + Crawlee + CheerioCrawler + gotScraping + header-generator + Residential Proxies
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
@@ -352,15 +352,23 @@ async function main() {
         if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location));
 
-        // Defensive proxyConfiguration handling
+        // Enhanced proxy configuration with fallback strategy
         let proxyConf = undefined;
         try {
             const useDefaultProxy = !proxyConfiguration || Object.keys(proxyConfiguration).length === 0;
             const proxyOptions = useDefaultProxy
-                ? { useApifyProxy: true, apifyProxyGroups: ['DATACENTER'] }
+                ? {
+                    useApifyProxy: true,
+                    apifyProxyGroups: ['RESIDENTIAL', 'DATACENTER'], // Prefer residential for better success rate
+                    apifyProxyCountry: 'GB', // Target UK for Caterer.com
+                  }
                 : proxyConfiguration;
             proxyConf = await Actor.createProxyConfiguration(proxyOptions);
-            log.info('Proxy configuration ready', { defaultProxy: useDefaultProxy });
+            log.info('Proxy configuration ready', {
+                defaultProxy: useDefaultProxy,
+                groups: proxyOptions.apifyProxyGroups,
+                country: proxyOptions.apifyProxyCountry
+            });
         } catch (e) {
             log.warning('Failed to create proxy configuration, continuing without proxy (may reduce success rate):', e.message);
             proxyConf = undefined;
@@ -480,22 +488,26 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 6,
+            maxRequestRetries: 8,
             useSessionPool: true,
-            minConcurrency: 2,
-            maxConcurrency: 8,
+            minConcurrency: 1,
+            maxConcurrency: 6,
             autoscaledPoolOptions: {
-                desiredConcurrency: 4,
-                maxConcurrency: 8,
-                minConcurrency: 2,
+                desiredConcurrency: 3,
+                maxConcurrency: 6,
+                minConcurrency: 1,
+                scaleUpStepRatio: 0.3,
+                scaleDownStepRatio: 0.5,
+                scaleUpThreshold: 0.8,
+                scaleDownThreshold: 0.3,
             },
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 60,
+            requestHandlerTimeoutSecs: 120,
+            navigationTimeoutSecs: 90,
             sessionPoolOptions: {
-                maxPoolSize: 100,
+                maxPoolSize: 150,
                 sessionOptions: {
-                    maxUsageCount: 8,
-                    maxAgeSecs: 300,
+                    maxUsageCount: 12,
+                    maxAgeSecs: 600,
                 },
             },
             
@@ -517,8 +529,13 @@ async function main() {
                     delete request.headers['DNT'];
                     delete request.headers['dnt'];
                     
-                    // Human-like delay with jitter (300-900ms)
-                    const delay = Math.random() * 600 + 300;
+                    // Intelligent delay based on session usage and time patterns
+                    const sessionUsage = session?.usageCount || 0;
+                    const baseDelay = sessionUsage < 3 ? 800 : sessionUsage < 6 ? 1200 : 1800;
+                    const jitter = Math.random() * 400 - 200; // -200 to +200ms jitter
+                    const timeOfDayFactor = Math.sin((new Date().getHours() / 24) * Math.PI * 2) * 0.3 + 0.7; // Peak during business hours
+                    const delay = Math.max(500, baseDelay * timeOfDayFactor + jitter);
+
                     await sleep(delay);
                 },
             ],
@@ -527,35 +544,51 @@ async function main() {
                 const retries = request.retryCount ?? 0;
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || error?.status;
-                
+
                 stats.requestErrors += 1;
-                
-                // Retire session on blocking or serious errors
-                if (session && (statusCode === 403 || statusCode === 429 || /blocked|denied|captcha/i.test(message))) {
-                    crawlerLog.warning('Session retired due to blocking signal', { url: request.url, statusCode });
+
+                // Enhanced blocking detection
+                const isBlocked = statusCode === 403 || statusCode === 429 || statusCode === 503 ||
+                    /blocked|denied|captcha|cloudflare|access denied|temporarily unavailable/i.test(message);
+
+                if (session && isBlocked) {
+                    crawlerLog.warning('Session retired due to blocking signal', { url: request.url, statusCode, message: message.slice(0, 100) });
                     session.retire();
                     stats.sessionsRetired += 1;
                 }
-                
-                const isHttp2Reset = /nghttp2/i.test(message);
-                const isBlocked = statusCode === 403 || statusCode === 429;
-                
-                // Exponential backoff with jitter
-                const baseWait = Math.min(25000, (2 ** Math.min(retries, 7)) * 500);
-                const jitter = Math.random() * 1000;
-                const multiplier = isBlocked ? 2.0 : (isHttp2Reset ? 1.5 : 1.0);
-                const waitMs = Math.min(40000, baseWait * multiplier + jitter);
-                
+
+                const isHttp2Reset = /nghttp2|stream reset|connection reset/i.test(message);
+                const isTimeout = /timeout|timed out/i.test(message);
+                const isNetworkError = /ECONNRESET|ENOTFOUND|ECONNREFUSED/i.test(message);
+
+                // Adaptive backoff strategy
+                let baseWait;
+                if (isBlocked) {
+                    baseWait = Math.min(60000, (2 ** Math.min(retries, 6)) * 2000); // Up to 1 minute for blocks
+                } else if (isHttp2Reset) {
+                    baseWait = Math.min(30000, (2 ** Math.min(retries, 5)) * 1000); // Up to 30 seconds for HTTP2
+                } else if (isTimeout) {
+                    baseWait = Math.min(20000, (2 ** Math.min(retries, 4)) * 800); // Up to 20 seconds for timeouts
+                } else {
+                    baseWait = Math.min(15000, (2 ** Math.min(retries, 4)) * 500); // Standard backoff
+                }
+
+                const jitter = Math.random() * 2000 - 1000; // -1s to +1s jitter
+                const waitMs = Math.max(1000, baseWait + jitter);
+
                 crawlerLog.warning(
-                    isBlocked ? 'Blocked response detected, extended backoff' : 
-                    isHttp2Reset ? 'HTTP/2 stream reset, backing off' : 
-                    'Request error, exponential backoff with jitter', 
+                    isBlocked ? '🚫 Blocked response detected, extended backoff' :
+                    isHttp2Reset ? '🔄 HTTP/2 stream reset, backing off' :
+                    isTimeout ? '⏰ Timeout error, backing off' :
+                    isNetworkError ? '🌐 Network error, backing off' :
+                    '⚠️ Request error, exponential backoff with jitter',
                     {
                         url: request.url,
-                        message,
+                        message: message.slice(0, 150),
                         statusCode,
                         waitMs: Math.round(waitMs),
                         retryCount: retries,
+                        sessionUsage: session?.usageCount,
                     }
                 );
                 await sleep(waitMs);
@@ -578,10 +611,12 @@ async function main() {
                     const pageNo = request.userData?.pageNo || 1;
                     const statusCode = response?.statusCode ?? response?.status;
                     
-                    // Enhanced blocking detection
-                    if (statusCode && [403, 429, 503].includes(Number(statusCode))) {
+                    // Comprehensive blocking detection with multiple signals
+                    const isBlockedStatus = [403, 429, 503, 502, 504].includes(Number(statusCode));
+
+                    if (isBlockedStatus) {
                         stats.blockedResponses += 1;
-                        crawlerLog.warning(`Blocked with status ${statusCode} on ${request.url}`);
+                        crawlerLog.warning(`🚫 Blocked with status ${statusCode} on ${request.url}`);
                         if (session) {
                             session.retire();
                             stats.sessionsRetired += 1;
@@ -589,22 +624,42 @@ async function main() {
                         }
                         throw new Error(`Blocked with status ${statusCode}`);
                     }
-                    
-                    // Check for captcha or access denial in page content
-                    const pageTitle = typeof $ === 'function' ? $('title').first().text().toLowerCase() : '';
-                    const bodyText = typeof $ === 'function' ? $('body').text().toLowerCase() : '';
-                    const blockSignals = ['access denied', 'temporarily blocked', 'captcha', 'cloudflare', 'please verify'];
-                    const isBlocked = blockSignals.some(sig => pageTitle.includes(sig) || bodyText.includes(sig));
-                    
-                    if ($ && isBlocked) {
-                        stats.blockedResponses += 1;
-                        crawlerLog.warning(`Detected blocking content on ${request.url}`);
-                        if (session) {
-                            session.retire();
-                            stats.sessionsRetired += 1;
-                            crawlerLog.info('Session retired due to blocking detection', { sessionId: session.id?.slice(0, 8) });
+
+                    // Enhanced content-based blocking detection
+                    if ($) {
+                        const pageTitle = $('title').first().text().toLowerCase();
+                        const bodyText = $('body').text().toLowerCase();
+                        const htmlContent = $.html().toLowerCase();
+
+                        const blockSignals = [
+                            'access denied', 'temporarily blocked', 'captcha', 'cloudflare',
+                            'please verify', 'security check', 'blocked', 'forbidden',
+                            'rate limit', 'too many requests', 'bot detected',
+                            'automated requests', 'suspicious activity'
+                        ];
+
+                        const isBlocked = blockSignals.some(sig =>
+                            pageTitle.includes(sig) || bodyText.includes(sig) || htmlContent.includes(sig)
+                        );
+
+                        // Check for common anti-bot patterns
+                        const hasCaptchaForm = $('form[action*="captcha"], input[name*="captcha"], [class*="captcha"]').length > 0;
+                        const hasRecaptcha = $('[class*="recaptcha"], [id*="recaptcha"]').length > 0;
+                        const hasHcaptcha = $('[class*="hcaptcha"], [id*="hcaptcha"]').length > 0;
+
+                        if (isBlocked || hasCaptchaForm || hasRecaptcha || hasHcaptcha) {
+                            stats.blockedResponses += 1;
+                            crawlerLog.warning(`🚫 Detected blocking content on ${request.url}`, {
+                                hasCaptcha: hasCaptchaForm || hasRecaptcha || hasHcaptcha,
+                                title: pageTitle.slice(0, 50)
+                            });
+                            if (session) {
+                                session.retire();
+                                stats.sessionsRetired += 1;
+                                crawlerLog.info('Session retired due to blocking detection', { sessionId: session.id?.slice(0, 8) });
+                            }
+                            throw new Error('Access denied or captcha detected');
                         }
-                        throw new Error('Access denied or captcha detected');
                     }
                     
                     crawlerLog.info(`Processing ${label} page`, { 
