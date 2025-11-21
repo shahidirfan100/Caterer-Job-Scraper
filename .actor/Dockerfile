@@ -9,6 +9,9 @@ RUN npm ls crawlee apify puppeteer playwright
 # Copy just package files to leverage Docker layer cache.
 COPY --chown=myuser:myuser package*.json ./
 
+# Copy Dockerfile for version check
+COPY --chown=myuser:myuser .actor/Dockerfile ./Dockerfile
+
 # Check Playwright version is the same as the one from base image.
 RUN node check-playwright-version.mjs
 
