@@ -538,7 +538,6 @@ async function main() {
             },
             requestHandlerTimeoutSecs: 45,
             navigationTimeoutSecs: 45,
-            navigationWaitUntil: 'domcontentloaded',
             persistCookiesPerSession: persistCookiesPerSessionInput,
             sessionPoolOptions: {
                 maxPoolSize: 50,
