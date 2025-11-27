@@ -80,7 +80,7 @@ const normalizeSalaryText = (text) => {
     if (!text) return null;
     const cleaned = String(text)
         .replace(/\u00a3/g, '£')
-        .replace(/�/g, '£')
+        .replace(/\ufffd/g, '£')
         .replace(/\s+/g, ' ')
         .trim();
     return cleaned || null;
@@ -92,7 +92,7 @@ try {
     const hg = await import('header-generator');
     HeaderGenerator = hg.default || hg.HeaderGenerator;
 } catch (error) {
-    log.warning('header-generator not available:', error.message);
+    log.warning('header-generator not available:', error?.message || String(error));
     HeaderGenerator = null;
 }
 
@@ -217,6 +217,7 @@ async function main() {
         // Proxy configuration - CRITICAL for avoiding blocks
         let proxyConfiguration = null;
         let getNewProxyUrl = null;
+        let proxySessionId = null;
         
         try {
             const proxyConfig = input.proxyConfiguration || {
@@ -236,6 +237,21 @@ async function main() {
             log.warning('Proxy setup failed, continuing without proxy (higher block risk):', e.message);
             getNewProxyUrl = async () => null;
         }
+
+        const rotateProxySession = () => {
+            proxySessionId = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            return proxySessionId;
+        };
+
+        const getProxyUrlForRequest = async (rotate = false) => {
+            if (!getNewProxyUrl) return null;
+            if (rotate || !proxySessionId) rotateProxySession();
+            try {
+                return await proxyConfiguration?.newUrl({ sessionId: proxySessionId });
+            } catch {
+                return await getNewProxyUrl();
+            }
+        };
 
         // Stats tracking
         const stats = {
@@ -260,12 +276,19 @@ async function main() {
             return u.href;
         };
 
+        const refererPool = [
+            'https://www.google.co.uk/',
+            'https://www.bing.com/search?q=uk+jobs',
+            'https://www.yahoo.com/',
+            'https://duckduckgo.com/?q=uk+jobs',
+        ];
+
         // Make stealth request using got-scraping with rotating proxy
         const makeRequest = async (url, referer = 'https://www.google.co.uk/', retries = 4) => {
             for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
                     const headers = getStealthHeaders(referer);
-                    const proxyUrl = await getNewProxyUrl();
+                    const proxyUrl = await getProxyUrlForRequest(attempt > 1);
                     
                     const options = {
                         url,
@@ -304,8 +327,10 @@ async function main() {
                         log.warning(`Blocked (${response.statusCode}) on attempt ${attempt}:`, { url: url.slice(0, 60) });
                         
                         if (attempt < retries) {
+                            rotateProxySession();
+                            referer = refererPool[Math.floor(Math.random() * refererPool.length)];
                             const backoff = Math.min(45000, 8000 * Math.pow(1.5, attempt - 1));
-                            log.info(`Backing off ${Math.round(backoff / 1000)}s before retry...`);
+                            log.info(`Backing off ${Math.round(backoff / 1000)}s before retry with new proxy...`);
                             await sleep(backoff + Math.random() * 5000);
                             continue;
                         }
@@ -321,6 +346,8 @@ async function main() {
                         log.warning(`Content blocking detected on attempt ${attempt}`);
                         
                         if (attempt < retries) {
+                            rotateProxySession();
+                            referer = refererPool[Math.floor(Math.random() * refererPool.length)];
                             const backoff = Math.min(60000, 12000 * Math.pow(1.5, attempt - 1));
                             await sleep(backoff + Math.random() * 8000);
                             continue;
