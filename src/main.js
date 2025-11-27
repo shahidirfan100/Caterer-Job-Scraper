@@ -276,9 +276,17 @@ async function main() {
                         options.proxyUrl = proxyUrl;
                     }
 
-                    log.debug(`Request attempt ${attempt}/${retries}:`, { url: url.slice(0, 80), hasProxy: !!proxyUrl });
+                    log.info(`Request attempt ${attempt}/${retries}:`, { 
+                        url: url.slice(0, 80), 
+                        hasProxy: !!proxyUrl 
+                    });
                     
                     const response = await gotScraping(options);
+                    
+                    log.info(`Response received:`, {
+                        statusCode: response.statusCode,
+                        contentLength: response.body?.length || 0
+                    });
                     
                     // Check for blocking status codes
                     if ([403, 429, 503, 502, 504].includes(response.statusCode)) {
@@ -333,6 +341,14 @@ async function main() {
         // Extract jobs from list page
         const extractJobsFromList = ($, pageUrl) => {
             const jobs = [];
+            const seenUrls = new Set();
+            
+            // Log page structure for debugging
+            log.info('Extracting jobs from page:', {
+                totalLinks: $('a').length,
+                jobLinks: $('a[href*="/job/"]').length,
+                h2JobLinks: $('h2 a[href*="/job/"]').length
+            });
             
             // Primary selector: job links in h2 tags (Caterer.com structure)
             $('h2 a[href*="/job/"]').each((_, el) => {
@@ -340,10 +356,16 @@ async function main() {
                     const $link = $(el);
                     const href = $link.attr('href');
                     
-                    // Match job URL pattern: /job/{slug}/{company}-job{id}
-                    if (!href || !/\/job\/[^\/]+\/[^\/]+-job\d+/i.test(href)) return;
+                    // Match job URL pattern: /job/{slug}/{any}-job{id} or /job/{slug}/job{id}
+                    // Examples: /job/chef/search-job106216010, /job/executive-chef/just-chefs-job106268130
+                    if (!href || !/\/job\/[^\/]+\/.*job\d+/i.test(href)) return;
                     
                     const jobUrl = new URL(href, pageUrl).href;
+                    
+                    // Skip duplicates
+                    if (seenUrls.has(jobUrl)) return;
+                    seenUrls.add(jobUrl);
+                    
                     const title = $link.text().trim();
                     
                     if (!title || title.length < 3) return;
@@ -416,17 +438,22 @@ async function main() {
                 }
             });
             
-            // Secondary selector: look for job cards with different structure
+            log.info(`Primary selector extracted ${jobs.length} jobs`);
+            
+            // Secondary selector: look for all job links (fallback)
             if (jobs.length === 0) {
-                $('a[href*="/job/"][href*="-job"]').each((_, el) => {
+                log.info('Primary selector found 0 jobs, trying secondary selector...');
+                $('a[href*="/job/"]').each((_, el) => {
                     try {
                         const $link = $(el);
                         const href = $link.attr('href');
-                        if (!href || !/\/job\/.*-job\d+/i.test(href)) return;
+                        // Match any job URL with job ID pattern
+                        if (!href || !/\/job\/[^\/]+\/.*job\d+/i.test(href)) return;
                         
                         const jobUrl = new URL(href, pageUrl).href;
                         // Skip if already processed
-                        if (jobs.some(j => j.url === jobUrl)) return;
+                        if (seenUrls.has(jobUrl)) return;
+                        seenUrls.add(jobUrl);
                         
                         const title = $link.text().trim() || $link.attr('title') || '';
                         if (title.length < 3 || title.length > 200) return;
@@ -678,21 +705,35 @@ async function main() {
             }
             
             const referer = pageNum === 1 ? 'https://www.caterer.com/' : initialUrl;
-            const html = await makeRequest(currentUrl, referer);
+            let html = await makeRequest(currentUrl, referer);
             
             if (!html) {
                 log.warning(`❌ Failed to fetch page ${pageNum} after all retries`);
                 // Try once more with longer delay
                 await humanDelay(15000, 25000);
-                const retryHtml = await makeRequest(currentUrl, referer);
-                if (!retryHtml) {
+                html = await makeRequest(currentUrl, referer);
+                if (!html) {
                     log.error('Stopping: Unable to fetch list page');
                     break;
                 }
             }
             
+            // Check if we got actual content
+            if (html.length < 5000) {
+                log.warning('Response too short, might be blocked:', { length: html.length });
+                log.debug('Response preview:', html.slice(0, 500));
+            }
+            
             const $ = cheerioLoad(html || '');
             stats.pagesProcessed++;
+            
+            // Debug: Log page info
+            const pageTitle = $('title').text();
+            log.info('Page loaded:', {
+                title: pageTitle.slice(0, 80),
+                htmlLength: (html || '').length,
+                hasJobsText: (html || '').includes('/job/')
+            });
             
             // Extract jobs from list
             const jobs = extractJobsFromList($, currentUrl);
