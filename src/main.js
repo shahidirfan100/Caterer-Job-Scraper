@@ -76,6 +76,16 @@ const shouldKeepByRecency = (dateValue) => {
     return (Date.now() - parsed.getTime()) <= recencyWindowMs;
 };
 
+const normalizeSalaryText = (text) => {
+    if (!text) return null;
+    const cleaned = String(text)
+        .replace(/\u00a3/g, '£')
+        .replace(/�/g, '£')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return cleaned || null;
+};
+
 // Header Generator Setup
 let HeaderGenerator;
 try {
@@ -187,6 +197,7 @@ async function main() {
         const MAX_PAGES = safeInt(input.max_pages, 20);
         const collectDetails = safeBool(input.collectDetails, true);
         const startUrl = safeStr(input.startUrl, '');
+        const debugSaveHtml = safeBool(input.debugSaveHtml, false);
 
         postedWithinLabel = normalizePostedWithin(input.postedWithin);
         recencyWindowMs = RECENCY_WINDOWS[postedWithinLabel] || null;
@@ -198,6 +209,7 @@ async function main() {
             max_pages: MAX_PAGES,
             collectDetails,
             postedWithin: postedWithinLabel,
+            debugSaveHtml,
         });
 
         initHeaderGenerator();
@@ -209,8 +221,6 @@ async function main() {
         try {
             const proxyConfig = input.proxyConfiguration || {
                 useApifyProxy: true,
-                apifyProxyGroups: ['RESIDENTIAL'],
-                apifyProxyCountry: 'GB',
             };
             proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
             getNewProxyUrl = async () => {
@@ -221,7 +231,7 @@ async function main() {
                 }
             };
             const testUrl = await getNewProxyUrl();
-            log.info('Proxy configured:', { hasProxy: !!testUrl, groups: proxyConfig.apifyProxyGroups });
+            log.info('Proxy configured:', { hasProxy: !!testUrl, configProvided: !!input.proxyConfiguration });
         } catch (e) {
             log.warning('Proxy setup failed, continuing without proxy (higher block risk):', e.message);
             getNewProxyUrl = async () => null;
@@ -338,70 +348,58 @@ async function main() {
             return null;
         };
 
+        
         // Extract jobs from list page
         const extractJobsFromList = ($, pageUrl) => {
             const jobs = [];
             const seenUrls = new Set();
-            
+
+            const pushJob = (job) => {
+                if (!job?.url) return;
+                if (seenUrls.has(job.url)) return;
+                seenUrls.add(job.url);
+                jobs.push(job);
+            };
+
             // Log page structure for debugging
             log.info('Extracting jobs from page:', {
                 totalLinks: $('a').length,
                 jobLinks: $('a[href*="/job/"]').length,
-                h2JobLinks: $('h2 a[href*="/job/"]').length
+                h2JobLinks: $('h2 a[href*="/job/"]').length,
+                dataJobItems: $('[data-at="job-item"], [data-testid="job-card"]').length,
             });
-            
-            // Primary selector: job links in h2 tags (Caterer.com structure)
-            $('h2 a[href*="/job/"]').each((_, el) => {
+
+            // Prefer explicit job cards (Caterer currently uses data-at="job-item")
+            $('[data-at="job-item"], [data-testid="job-card"]').each((_, el) => {
                 try {
-                    const $link = $(el);
-                    const href = $link.attr('href');
-                    
-                    // Match job URL pattern: /job/{slug}/{any}-job{id} or /job/{slug}/job{id}
-                    // Examples: /job/chef/search-job106216010, /job/executive-chef/just-chefs-job106268130
-                    if (!href || !/\/job\/[^\/]+\/.*job\d+/i.test(href)) return;
-                    
+                    const $card = $(el);
+                    const $titleLink = $card.find('[data-at="job-title"], h2 a[href*="/job/"]').first();
+                    const href = $titleLink.attr('href');
+                    if (!href || !/\/job\/[^/]+\/.*job\d+/i.test(href)) return;
+
                     const jobUrl = new URL(href, pageUrl).href;
-                    
-                    // Skip duplicates
-                    if (seenUrls.has(jobUrl)) return;
-                    seenUrls.add(jobUrl);
-                    
-                    const title = $link.text().trim();
-                    
+                    const title = ($titleLink.text() || '').trim();
                     if (!title || title.length < 3) return;
-                    
-                    // Find parent container for additional info
-                    const $container = $link.closest('article, section, [class*="job"], [class*="vacancy"], li, div').first();
-                    const containerText = $container.text();
-                    
-                    // Extract company - usually in a link to company jobs
+
+                    const containerText = $card.text().replace(/\s+/g, ' ').trim();
+
                     let company = null;
-                    const companyLink = $container.find('a[href*="/jobs/"]').not($link).first();
-                    if (companyLink.length) {
-                        company = companyLink.text().trim();
-                    }
-                    if (!company) {
-                        // Try to find company in text
-                        const companyMatch = containerText.match(/(?:at|by|with)\s+([A-Z][A-Za-z\s&]+?)(?:\s*[-–|•]|\s+(?:in|located))/);
-                        if (companyMatch) company = companyMatch[1].trim();
-                    }
-                    
-                    // Extract location - UK postcodes or city names
+                    const companyText = $card.find('[data-at="company-name"], [data-qa="company"], [class*="company"], [class*="employer"]').first().text();
+                    if (companyText) company = companyText.trim() || null;
+
                     let location = null;
-                    const postcodeMatch = containerText.match(/[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}/i);
-                    if (postcodeMatch) {
-                        location = postcodeMatch[0].toUpperCase();
-                    } else {
-                        const cityMatch = containerText.match(/(?:in\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+)?)/);
-                        if (cityMatch) location = cityMatch[1].trim();
-                    }
-                    
-                    // Extract salary
+                    const locationText = $card.find('[data-at="job-location"], [data-qa="location"], [class*="location"]').first().text();
+                    if (locationText) location = locationText.trim() || null;
+
                     let salary = null;
-                    const salaryMatch = containerText.match(/£[\d,]+(?:\.\d{2})?(?:\s*[-–]\s*£[\d,]+(?:\.\d{2})?)?(?:\s*(?:per|p\/|\/)\s*(?:hour|annum|year|day|week|month))?/i);
-                    if (salaryMatch) salary = salaryMatch[0].trim();
-                    
-                    // Extract job type
+                    const salaryText = $card.find('[data-at="salary"], [data-qa="salary"], [class*="salary"], .wage').first().text();
+                    if (salaryText) salary = normalizeSalaryText(salaryText);
+
+                    if (!salary) {
+                        const salaryMatch = containerText.match(/[\u00a3][\d,]+(?:\.\d{2})?(?:\s*[-–]\s*[\u00a3][\d,]+(?:\.\d{2})?)?(?:\s*(?:per|p\/|\/)\s*(?:hour|annum|year|day|week|month))?/i);
+                        if (salaryMatch) salary = normalizeSalaryText(salaryMatch[0]);
+                    }
+
                     let jobType = null;
                     const typePatterns = ['full time', 'full-time', 'part time', 'part-time', 'permanent', 'contract', 'temporary', 'freelance'];
                     const lowerText = containerText.toLowerCase();
@@ -411,17 +409,16 @@ async function main() {
                             break;
                         }
                     }
-                    
-                    // Extract date
+
                     let datePosted = null;
-                    const dateMatch = containerText.match(/(\d+)\s*(hour|day|week|month)s?\s*ago/i);
+                    const dateMatch = containerText.match(/(\d+)\s*(minute|hour|day|week|month)s?\s*ago/i);
                     if (dateMatch) {
                         datePosted = normalizePostedDateValue(dateMatch[0]);
                     } else if (lowerText.includes('today') || lowerText.includes('just')) {
                         datePosted = new Date().toISOString();
                     }
-                    
-                    jobs.push({
+
+                    pushJob({
                         title,
                         company,
                         location,
@@ -432,33 +429,100 @@ async function main() {
                         description_html: null,
                         description_text: null,
                     });
-                    
+                } catch (err) {
+                    log.debug('Error parsing job card:', err.message);
+                }
+            });
+
+            // Primary selector: job links in h2 tags (Caterer.com structure)
+            $('h2 a[href*="/job/"]').each((_, el) => {
+                try {
+                    const $link = $(el);
+                    const href = $link.attr('href');
+
+                    if (!href || !/\/job\/[^\/]+\/.*job\d+/i.test(href)) return;
+
+                    const jobUrl = new URL(href, pageUrl).href;
+                    const title = $link.text().trim();
+                    if (!title || title.length < 3) return;
+
+                    const $container = $link.closest('article, section, [class*="job"], [class*="vacancy"], li, div').first();
+                    const containerText = $container.text().replace(/\s+/g, ' ').trim();
+
+                    let company = null;
+                    const companyLink = $container.find('a[href*="/jobs/"]').not($link).first();
+                    if (companyLink.length) {
+                        company = companyLink.text().trim();
+                    }
+                    if (!company) {
+                        const companyMatch = containerText.match(/(?:at|by|with)\s+([A-Z][A-Za-z\s&]+?)(?:\s*[-–]|$)/);
+                        if (companyMatch) company = companyMatch[1].trim();
+                    }
+
+                    let location = null;
+                    const postcodeMatch = containerText.match(/[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}/i);
+                    if (postcodeMatch) {
+                        location = postcodeMatch[0].toUpperCase();
+                    } else {
+                        const cityMatch = containerText.match(/(?:in\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+)?)/);
+                        if (cityMatch) location = cityMatch[1].trim();
+                    }
+
+                    let salary = null;
+                    const salaryMatch = containerText.match(/[\u00a3][\d,]+(?:\.\d{2})?(?:\s*[-–]\s*[\u00a3][\d,]+(?:\.\d{2})?)?(?:\s*(?:per|p\/|\/)\s*(?:hour|annum|year|day|week|month))?/i);
+                    if (salaryMatch) salary = normalizeSalaryText(salaryMatch[0]);
+
+                    let jobType = null;
+                    const typePatterns = ['full time', 'full-time', 'part time', 'part-time', 'permanent', 'contract', 'temporary', 'freelance'];
+                    const lowerText = containerText.toLowerCase();
+                    for (const pattern of typePatterns) {
+                        if (lowerText.includes(pattern)) {
+                            jobType = pattern.split(/[\s-]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                            break;
+                        }
+                    }
+
+                    let datePosted = null;
+                    const dateMatch = containerText.match(/(\d+)\s*(hour|day|week|month)s?\s*ago/i);
+                    if (dateMatch) {
+                        datePosted = normalizePostedDateValue(dateMatch[0]);
+                    } else if (lowerText.includes('today') || lowerText.includes('just')) {
+                        datePosted = new Date().toISOString();
+                    }
+
+                    pushJob({
+                        title,
+                        company,
+                        location,
+                        salary,
+                        job_type: jobType,
+                        date_posted: datePosted,
+                        url: jobUrl,
+                        description_html: null,
+                        description_text: null,
+                    });
+
                 } catch (err) {
                     log.debug('Error parsing job element:', err.message);
                 }
             });
-            
-            log.info(`Primary selector extracted ${jobs.length} jobs`);
-            
-            // Secondary selector: look for all job links (fallback)
+
             if (jobs.length === 0) {
-                log.info('Primary selector found 0 jobs, trying secondary selector...');
+                // Secondary selector: look for all job links (fallback)
+                log.info('Primary selectors found 0 jobs, trying secondary selector...');
                 $('a[href*="/job/"]').each((_, el) => {
                     try {
                         const $link = $(el);
                         const href = $link.attr('href');
-                        // Match any job URL with job ID pattern
                         if (!href || !/\/job\/[^\/]+\/.*job\d+/i.test(href)) return;
-                        
+
                         const jobUrl = new URL(href, pageUrl).href;
-                        // Skip if already processed
                         if (seenUrls.has(jobUrl)) return;
-                        seenUrls.add(jobUrl);
-                        
+
                         const title = $link.text().trim() || $link.attr('title') || '';
                         if (title.length < 3 || title.length > 200) return;
-                        
-                        jobs.push({
+
+                        pushJob({
                             title,
                             company: null,
                             location: null,
@@ -474,11 +538,11 @@ async function main() {
                     }
                 });
             }
-            
+
             return jobs;
         };
 
-        // Extract job details from detail page
+// Extract job details from detail page
         const extractJobDetails = ($, url) => {
             const details = {};
             
@@ -738,6 +802,10 @@ async function main() {
             // Extract jobs from list
             const jobs = extractJobsFromList($, currentUrl);
             stats.jobsFound += jobs.length;
+
+            if (debugSaveHtml && pageNum === 1 && (jobs.length === 0 || html.length < 5000)) {
+                await Actor.setValue('DEBUG_LIST_PAGE', { url: currentUrl, html: html.slice(0, 200000) });
+            }
             
             log.info(`📋 Found ${jobs.length} jobs on page ${pageNum}`);
             
