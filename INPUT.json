@@ -1,6 +1,7 @@
 {
-  "keyword": "head chef",
-  "location": "London",
-  "results_wanted": 10,
-  "max_pages": 3
+  "keyword": "chef",
+  "location": "",
+  "results_wanted": 5,
+  "max_pages": 2,
+  "collectDetails": false
 }

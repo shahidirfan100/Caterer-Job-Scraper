@@ -218,24 +218,33 @@ async function main() {
         let proxyConfiguration = null;
         let getNewProxyUrl = null;
         let proxySessionId = null;
+        let useProxy = true;
         
         try {
             const proxyConfig = input.proxyConfiguration || {
                 useApifyProxy: true,
+                apifyProxyGroups: ['RESIDENTIAL', 'BUYPROXIES94952'],
+                apifyProxyCountry: 'GB',
             };
             proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
             getNewProxyUrl = async () => {
                 try {
                     return await proxyConfiguration?.newUrl();
-                } catch {
+                } catch (err) {
+                    log.debug('Failed to get proxy URL:', err.message);
                     return null;
                 }
             };
             const testUrl = await getNewProxyUrl();
-            log.info('Proxy configured:', { hasProxy: !!testUrl, configProvided: !!input.proxyConfiguration });
+            log.info('Proxy configured:', { 
+                hasProxy: !!testUrl, 
+                configProvided: !!input.proxyConfiguration,
+                groups: proxyConfig.apifyProxyGroups 
+            });
         } catch (e) {
-            log.warning('Proxy setup failed, continuing without proxy (higher block risk):', e.message);
+            log.warning('Proxy setup failed, continuing without proxy:', e.message);
             getNewProxyUrl = async () => null;
+            useProxy = false;
         }
 
         const rotateProxySession = () => {
@@ -284,16 +293,19 @@ async function main() {
         ];
 
         // Make stealth request using got-scraping with rotating proxy
-        const makeRequest = async (url, referer = 'https://www.google.co.uk/', retries = 4) => {
+        const makeRequest = async (url, referer = 'https://www.google.co.uk/', retries = 5, tryWithoutProxy = true) => {
             for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
                     const headers = getStealthHeaders(referer);
-                    const proxyUrl = await getProxyUrlForRequest(attempt > 1);
+                    
+                    // On last 2 attempts, try without proxy as fallback
+                    const shouldUseProxy = useProxy && attempt < retries - (tryWithoutProxy ? 1 : 0);
+                    const proxyUrl = shouldUseProxy ? await getProxyUrlForRequest(attempt > 1) : null;
                     
                     const options = {
                         url,
                         headers,
-                        timeout: { request: 60000 },
+                        timeout: { request: 90000 },
                         retry: { limit: 0 },
                         throwHttpErrors: false,
                         // got-scraping auto-generates browser-like TLS fingerprint
@@ -307,6 +319,8 @@ async function main() {
 
                     if (proxyUrl) {
                         options.proxyUrl = proxyUrl;
+                    } else if (attempt >= retries - 1 && tryWithoutProxy) {
+                        log.info(`Attempt ${attempt}: Trying WITHOUT proxy as fallback`);
                     }
 
                     log.info(`Request attempt ${attempt}/${retries}:`, { 
@@ -361,17 +375,32 @@ async function main() {
 
                 } catch (error) {
                     stats.requestsFailed++;
+                    const isTimeout = /timeout|timed out/i.test(error.message);
+                    const isConnection = /ECONNREFUSED|ENOTFOUND|ECONNRESET|socket hang up/i.test(error.message);
+                    const isProxyError = /proxy/i.test(error.message);
+                    
                     log.warning(`Request error (attempt ${attempt}/${retries}):`, { 
-                        error: error.message?.slice(0, 100),
-                        url: url.slice(0, 60)
+                        error: error.message?.slice(0, 150),
+                        url: url.slice(0, 60),
+                        isTimeout,
+                        isConnection,
+                        isProxyError
                     });
                     
+                    // If proxy errors, disable proxy for next attempts
+                    if (isProxyError && useProxy) {
+                        log.warning('Proxy error detected, will try without proxy on next attempts');
+                        useProxy = false;
+                    }
+                    
                     if (attempt < retries) {
-                        const backoff = 5000 * attempt + Math.random() * 3000;
+                        const backoff = isTimeout ? 10000 : 5000 * attempt + Math.random() * 3000;
+                        log.info(`Waiting ${Math.round(backoff/1000)}s before retry...`);
                         await sleep(backoff);
                     }
                 }
             }
+            log.error('All request attempts failed for:', url.slice(0, 80));
             return null;
         };
 
@@ -772,15 +801,14 @@ async function main() {
             maxPages: MAX_PAGES 
         });
 
-        // Warm up: Visit homepage first (looks more human)
-        log.info('🔄 Warming up with homepage visit...');
-        const homepageHtml = await makeRequest('https://www.caterer.com/', 'https://www.google.co.uk/', 2);
-        if (homepageHtml) {
-            log.info('✓ Homepage loaded successfully');
-        } else {
-            log.warning('⚠ Homepage request failed, continuing anyway...');
+        // Test connection first
+        log.info('🔄 Testing connection...');
+        const testHtml = await makeRequest('https://www.caterer.com/', 'https://www.google.co.uk/', 3, true);
+        if (!testHtml) {
+            throw new Error('Unable to connect to caterer.com - all connection attempts failed');
         }
-        await humanDelay(3000, 6000);
+        log.info('✓ Connection test successful', { responseLength: testHtml.length });
+        await humanDelay(2000, 4000);
 
         // Process list pages
         while (saved < RESULTS_WANTED && pageNum <= MAX_PAGES) {
@@ -796,15 +824,15 @@ async function main() {
             }
             
             const referer = pageNum === 1 ? 'https://www.caterer.com/' : initialUrl;
-            let html = await makeRequest(currentUrl, referer);
+            let html = await makeRequest(currentUrl, referer, 5, true);
             
             if (!html) {
-                log.warning(`❌ Failed to fetch page ${pageNum} after all retries`);
-                // Try once more with longer delay
-                await humanDelay(15000, 25000);
-                html = await makeRequest(currentUrl, referer);
+                log.warning(`❌ Failed to fetch page ${pageNum}, will retry after delay`);
+                // Try once more with even longer delay
+                await humanDelay(20000, 30000);
+                html = await makeRequest(currentUrl, referer, 5, true);
                 if (!html) {
-                    log.error('Stopping: Unable to fetch list page');
+                    log.error('Stopping: Unable to fetch list page after all attempts');
                     break;
                 }
             }
@@ -861,7 +889,7 @@ async function main() {
                     // Fetch detail page for richer data
                     await humanDelay(2500, 5000);
                     
-                    const detailHtml = await makeRequest(job.url, currentUrl);
+                    const detailHtml = await makeRequest(job.url, currentUrl, 4, true);
                     
                     if (detailHtml) {
                         const $detail = cheerioLoad(detailHtml);
