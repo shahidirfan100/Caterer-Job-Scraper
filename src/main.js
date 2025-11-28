@@ -59,6 +59,8 @@ const looksBlockedHtml = (html) => {
 
 /**
  * Extract RecommenderWidget_listing_list JSON from HTML using regex.
+ * (This is the widget that contains "These jobs were popular with other job seekers"
+ * and also has proper salary, location, companyName, etc.)
  */
 const extractRecommenderState = (html) => {
     const match = html.match(
@@ -93,8 +95,33 @@ const extractJobsFromJsonState = (html, pageUrl) => {
     });
 };
 
+/**
+ * Utility: given a container text, extract a clean salary string like:
+ * "£28000.00 - £30000.00 per annum" or "£15.00 - £18.00 per hour".
+ */
+const extractCleanSalaryFromText = (text) => {
+    if (!text) return null;
+    const compact = text.replace(/\s+/g, ' ').trim();
+    // Prefer "£... per ..." pattern
+    const perMatch = compact.match(/(£[^£]+?per (?:hour|annum|year|week|day))/i);
+    if (perMatch) return perMatch[1].trim();
+
+    // Fallback: first "£... " chunk
+    const simpleMatch = compact.match(/(£[^£]+?)(?:\s{2,}|$)/);
+    if (simpleMatch) return simpleMatch[1].trim();
+
+    return null;
+};
+
+/**
+ * DOM fallback for listing jobs – with style/script stripped and cleaned fields.
+ */
 const extractJobsFromDom = (html, pageUrl) => {
     const $ = cheerio.load(html);
+
+    // Remove style/script/noscript so they don't pollute text()
+    $('style,script,noscript').remove();
+
     const urlObj = new URL(pageUrl);
     const seen = new Set();
     const jobs = [];
@@ -105,9 +132,13 @@ const extractJobsFromDom = (html, pageUrl) => {
         const jobUrl = new URL(href, urlObj.origin).href;
         if (seen.has(jobUrl)) return;
 
-        const title = $(el).text().trim();
-        if (!title || title.length < 3) return;
+        // Clean title: remove nested style/script from this <a> only
+        const $aClean = $(el).clone();
+        $aClean.find('style,script,noscript').remove();
+        const title = $aClean.text().replace(/\s+/g, ' ').trim();
+        if (!title || title.length < 2) return;
 
+        // Container around the job card
         const container =
             $(el).closest('article').length
                 ? $(el).closest('article')
@@ -117,38 +148,49 @@ const extractJobsFromDom = (html, pageUrl) => {
                 ? $(el).closest('div')
                 : $(el).parent();
 
-        const siblingTexts = [];
-        container.find('span, p, div').each((__, node) => {
-            const t = $(node).text().trim();
-            if (t) siblingTexts.push(t);
-        });
+        const $containerClean = container.clone();
+        $containerClean.find('style,script,noscript').remove();
 
-        const salary =
-            siblingTexts.find((t) => t.includes('£')) ||
-            siblingTexts.find((t) => /per (hour|annum|year)/i.test(t)) ||
-            null;
+        const fullText = $containerClean.text().replace(/\s+/g, ' ').trim();
 
-        const company =
-            siblingTexts.find(
-                (t) =>
-                    !t.includes('£') &&
-                    !/ago$/i.test(t) &&
-                    t.length <= 80 &&
-                    /[A-Za-z]/.test(t),
-            ) || null;
+        // Company: often in img alt or a short label near the title
+        let company = $containerClean.find('img[alt]').attr('alt') || null;
+        if (!company || company.length < 2 || company.length > 80) {
+            // fallback: first short non-salary chunk that isn't the title
+            const parts = fullText.split(/(?=[A-Z])/).map((p) => p.trim());
+            const candidate = parts.find(
+                (p) =>
+                    p &&
+                    p !== title &&
+                    !p.includes('£') &&
+                    !/ago$/i.test(p) &&
+                    p.length <= 80,
+            );
+            if (candidate) company = candidate;
+        }
 
-        const location =
-            siblingTexts.find(
-                (t) => /[A-Za-z]{3,}/.test(t) && /[,]/.test(t) && t.length <= 80,
-            ) || null;
+        const cleanSalary = extractCleanSalaryFromText(fullText);
+
+        // Location: text between company and salary in the container text
+        let location = null;
+        if (company && cleanSalary) {
+            const idxCompany = fullText.indexOf(company);
+            const idxSalary = fullText.indexOf(cleanSalary);
+            if (idxCompany !== -1 && idxSalary !== -1 && idxSalary > idxCompany) {
+                location = fullText
+                    .slice(idxCompany + company.length, idxSalary)
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            }
+        }
 
         jobs.push({
             source: 'caterer.com',
             job_id: null,
             title,
-            company,
-            location,
-            salary,
+            company: company || null,
+            location: location || null,
+            salary: cleanSalary || null,
             date_posted: null,
             url: jobUrl,
         });
@@ -160,17 +202,17 @@ const extractJobsFromDom = (html, pageUrl) => {
 };
 
 /**
- * Parse job detail page HTML to get description (and optionally company/salary/date, but we
- * mainly care about description here).
+ * Parse job detail HTML to get description (and optionally improved company/salary/date).
+ * We do JSON-LD first, then a clean DOM fallback that strips style/script.
  */
 const extractJobDetail = (html) => {
-    const $ = cheerio.load(html);
     const result = {};
 
-    // 1) JSON-LD JobPosting
-    $('script[type="application/ld+json"]').each((_, el) => {
+    // JSON-LD pass
+    const $ld = cheerio.load(html);
+    $ld('script[type="application/ld+json"]').each((_, el) => {
         try {
-            const json = $(el).text();
+            const json = $ld(el).text();
             const data = JSON.parse(json || '{}');
             const entries = Array.isArray(data) ? data : [data];
 
@@ -208,10 +250,15 @@ const extractJobDetail = (html) => {
         }
     });
 
-    // 2) DOM fallback for description
+    // Clean DOM fallback (strip style/script)
+    const $ = cheerio.load(html);
+    $('style,script,noscript').remove();
+
     if (!result.description_html) {
         const descEl =
             $('[data-at="job-description"]').first() ||
+            $('[data-at*="job-description"]').first() ||
+            $('#job-description').first() ||
             $('.job-description').first() ||
             $('main article').first() ||
             $('main section').first();
@@ -222,11 +269,34 @@ const extractJobDetail = (html) => {
         }
     }
 
+    // Conservative salary/location/title overrides from DOM if still missing
+    if (!result.salary) {
+        const text = $('body').text().replace(/\s+/g, ' ');
+        const cleanSalary = extractCleanSalaryFromText(text);
+        if (cleanSalary && cleanSalary.length <= 80) {
+            result.salary = cleanSalary;
+        }
+    }
+
+    if (!result.company) {
+        const companyFromImg = $('img[alt]').first().attr('alt');
+        if (companyFromImg && companyFromImg.length <= 80) {
+            result.company = companyFromImg;
+        }
+    }
+
+    if (!result.title) {
+        const h1 = $('h1').first().text().replace(/\s+/g, ' ').trim();
+        if (h1 && h1.length <= 120) {
+            result.title = h1;
+        }
+    }
+
     return result;
 };
 
 /**
- * Playwright handshake: one real browser visit to get cookies, UA, and the HTML of the first page.
+ * Playwright handshake: one real browser visit to get cookies, UA, and page-1 HTML.
  */
 const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
     const fp = randomFingerprint();
@@ -371,7 +441,8 @@ const httpFetchHtml = async (url, userAgent, cookieHeader, proxyUrl) => {
 };
 
 /**
- * Enrich a set of jobs with detail data (description, maybe better salary/company/date).
+ * Enrich a set of jobs with detail data (description, company, salary, etc).
+ * Uses limited concurrency for stealth & performance.
  */
 const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, maxConcurrency = 3) => {
     const enriched = [];
@@ -387,11 +458,22 @@ const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, ma
                 const html = await httpFetchHtml(baseJob.url, userAgent, cookieHeader, proxyUrl);
                 const detail = extractJobDetail(html);
 
+                // Only override fields if detail has clean values
                 const job = {
                     ...baseJob,
-                    // Only override if detail provides something new
-                    company: detail.company || baseJob.company || null,
-                    salary: detail.salary || baseJob.salary || null,
+                    title:
+                        (detail.title && detail.title.length <= 120 && !detail.title.includes('{')) ||
+                        !baseJob.title
+                            ? detail.title || baseJob.title
+                            : baseJob.title,
+                    company:
+                        (detail.company && detail.company.length <= 80) || !baseJob.company
+                            ? detail.company || baseJob.company
+                            : baseJob.company,
+                    salary:
+                        (detail.salary && detail.salary.length <= 120) || !baseJob.salary
+                            ? detail.salary || baseJob.salary
+                            : baseJob.salary,
                     date_posted: detail.date_posted || baseJob.date_posted || null,
                     job_type: detail.job_type || null,
                     description_html: detail.description_html || null,
@@ -437,7 +519,7 @@ await Actor.main(async () => {
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('Starting Caterer.com HYBRID job scraper (with descriptions)', {
+    log.info('Starting Caterer.com HYBRID job scraper (clean fields + descriptions)', {
         keyword,
         location,
         startUrl: startUrlToUse,
