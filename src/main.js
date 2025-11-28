@@ -1,12 +1,16 @@
+// src/main.js
 import { Actor, log } from 'apify';
 import { Dataset, PlaywrightCrawler } from 'crawlee';
 import fs from 'fs/promises';
 import { chromium } from 'playwright';
 import { execSync } from 'child_process';
 
+/**
+ * Convert Caterer-style "X days ago" text into ISO timestamp.
+ */
 const parsePostedDate = (text) => {
     if (!text) return null;
-    const lower = text.toLowerCase().replace('posted', '').trim();
+    const lower = text.toLowerCase().replace('published', '').replace('posted', '').trim();
 
     if (lower.includes('today') || lower.includes('just now')) {
         return new Date().toISOString();
@@ -54,16 +58,20 @@ const dismissPopups = async (page) => {
     const selectors = [
         'button:has-text("Accept all")',
         'button:has-text("Accept All")',
-        '[id*="accept"]',
+        '[id*="accept"][type="button"]',
         '[data-testid*="accept"]',
         '.js-accept-consent',
     ];
 
     for (const selector of selectors) {
-        const btn = page.locator(selector);
-        if (await btn.first().isVisible({ timeout: 1000 }).catch(() => false)) {
-            await btn.first().click().catch(() => {});
-            break;
+        try {
+            const btn = page.locator(selector).first();
+            if (await btn.isVisible({ timeout: 1000 })) {
+                await btn.click({ delay: 50 }).catch(() => {});
+                break;
+            }
+        } catch {
+            // ignore
         }
     }
 };
@@ -77,7 +85,10 @@ await Actor.main(async () => {
     } catch (err) {
         log.warning('Playwright browser check failed, attempting installation', { message: err.message });
         try {
-            execSync('npx crawlee install-playwright-browsers --yes', { stdio: 'inherit', timeout: 180000 });
+            execSync('npx crawlee install-playwright-browsers --yes', {
+                stdio: 'inherit',
+                timeout: 180000,
+            });
             log.info('Playwright browsers installed successfully');
         } catch (installErr) {
             log.error('Automatic Playwright installation failed', { error: installErr.message });
@@ -85,14 +96,14 @@ await Actor.main(async () => {
         }
     }
 
+    // Load input either from Actor input or local INPUT.json (for local dev)
     let input = (await Actor.getInput()) ?? null;
-
     if (!input) {
         try {
             const rawLocalInput = await fs.readFile(new URL('../INPUT.json', import.meta.url), 'utf8');
             input = JSON.parse(rawLocalInput);
             log.info('Loaded input from local INPUT.json fallback');
-        } catch (err) {
+        } catch {
             input = {};
         }
     }
@@ -118,7 +129,10 @@ await Actor.main(async () => {
         collectDetails,
     });
 
-    const hasProxyCredentials = Boolean(proxyFromInput) || process.env.APIFY_PROXY_PASSWORD || process.env.APIFY_TOKEN;
+    // Proxy configuration
+    const hasProxyCredentials =
+        Boolean(proxyFromInput) || process.env.APIFY_PROXY_PASSWORD || process.env.APIFY_TOKEN;
+
     let proxyConfiguration;
     if (hasProxyCredentials) {
         try {
@@ -152,18 +166,6 @@ await Actor.main(async () => {
         requestHandlerTimeoutSecs: 90,
         navigationTimeoutSecs: 45,
         maxConcurrency: 2,
-        gotoFunction: async ({ page, request, log: gotoLog }) => {
-            try {
-                return await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            } catch (err) {
-                const msg = err?.message || '';
-                gotoLog.warning('Goto failed, will retry if retries remain', { url: request.url, error: msg });
-                if (msg.includes('ERR_EMPTY_RESPONSE') || msg.includes('ERR_TUNNEL_CONNECTION_FAILED') || msg.includes('ERR_HTTP2')) {
-                    throw new Error(`Transport error: ${msg}`);
-                }
-                throw err;
-            }
-        },
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 30,
@@ -187,39 +189,85 @@ await Actor.main(async () => {
             },
         },
         preNavigationHooks: [
-            async ({ page }) => {
+            async ({ page, request }) => {
                 const fingerprint = randomFingerprint();
-                await page.setViewportSize(fingerprint.viewport).catch(() => {});
-                await page.setExtraHTTPHeaders({
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-                    Connection: 'keep-alive',
-                });
-                await page.setUserAgent(fingerprint.ua).catch(() => {});
+
+                try {
+                    await page.setViewportSize(fingerprint.viewport);
+                } catch {
+                    // ignore
+                }
+
+                try {
+                    await page.setExtraHTTPHeaders({
+                        Accept:
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+                        Connection: 'keep-alive',
+                        Referer: 'https://www.caterer.com/',
+                    });
+                } catch {
+                    // ignore
+                }
+
+                try {
+                    await page.setUserAgent(fingerprint.ua);
+                } catch {
+                    // ignore
+                }
+
                 await page.addInitScript(() => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en-US', 'en'] });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-GB', 'en-US', 'en'],
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3],
+                    });
+                    // eslint-disable-next-line no-undef
                     window.chrome = { runtime: {} };
                 });
+
+                log.debug('Navigating', { url: request.url });
             },
         ],
+
+        /**
+         * Main handler: handles both list and detail pages.
+         */
         async requestHandler({ request, page, log: crawlerLog, session, crawler: crawlerInstance }) {
             const { label = 'LIST', pageNum = 1, listData } = request.userData ?? {};
 
             await dismissPopups(page);
+
             const pageTitle = await page.title();
             const html = await page.content();
             const htmlLength = html.length;
-            const mainResponse = page.mainFrame()?.response();
-            const status = mainResponse?.status?.();
 
+            const mainResponse = page.mainFrame()?.response?.();
+            let status;
+            try {
+                status = await mainResponse?.status?.();
+            } catch {
+                status = undefined;
+            }
+
+            // Basic bot / block detection
             const lowerHtml = html.toLowerCase();
-            const blocked = ['captcha', 'access denied', 'just a moment', 'verify you are a human', 'unusual traffic']
-                .some((needle) => lowerHtml.includes(needle));
+            const blocked = ['captcha', 'access denied', 'verify you are a human', 'unusual traffic'].some(
+                (needle) => lowerHtml.includes(needle),
+            );
 
             if (blocked) {
-                await Actor.setValue(`BLOCKED_${Date.now()}`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                try {
+                    await Actor.setValue(
+                        `BLOCKED_${Date.now()}`,
+                        await page.screenshot({ fullPage: true }),
+                        { contentType: 'image/png' },
+                    );
+                } catch {
+                    // ignore
+                }
                 session?.retire();
                 throw new Error('Blocked or captcha detected');
             }
@@ -231,46 +279,116 @@ await Actor.main(async () => {
                     throw new Error(`Received bad status ${status}`);
                 }
 
-                const found = await page.waitForSelector('[data-at="job-item"], a[href*="/job/"]', { timeout: 15000 }).catch(() => null);
+                // Wait for at least one job link to appear
+                const found = await page
+                    .waitForSelector('a[href*="/job/"]', { timeout: 15000 })
+                    .catch(() => null);
+
                 if (!found) {
                     if (pageNum === 1) {
                         await Actor.setValue('DEBUG_HTML', html, { contentType: 'text/html' });
-                        await Actor.setValue('DEBUG_SCREENSHOT', await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                        await Actor.setValue(
+                            'DEBUG_SCREENSHOT',
+                            await page.screenshot({ fullPage: true }),
+                            { contentType: 'image/png' },
+                        );
                     }
                     throw new Error('No job listings found on page');
                 }
 
+                // Extract jobs from list page using robust heuristics
                 const jobs = await page.evaluate((pageUrl) => {
-                    const cards = Array.from(document.querySelectorAll('[data-at="job-item"]'));
+                    const results = [];
                     const seen = new Set();
 
-                    return cards.map((card) => {
-                        const titleAnchor = card.querySelector('[data-at="job-item-title"] a, a[href*="/job/"]');
-                        const href = titleAnchor?.getAttribute('href');
-                        if (!href) return null;
+                    const anchors = Array.from(
+                        document.querySelectorAll('main a[href*="/job/"], a[href*="/job/"]'),
+                    );
+
+                    for (const anchor of anchors) {
+                        const href = anchor.getAttribute('href');
+                        if (!href) continue;
 
                         const jobUrl = new URL(href, pageUrl).href;
-                        if (seen.has(jobUrl)) return null;
-                        seen.add(jobUrl);
+                        if (seen.has(jobUrl)) continue;
 
-                        const salaryText = card.querySelector('[data-at="job-item-salary-info"]')?.textContent?.trim() || null;
-                        const rawDate = card.querySelector('[data-at="job-item-timeago"]')?.textContent?.trim() || null;
+                        const titleText = anchor.textContent?.trim() || '';
+                        // Ignore nav / footer links by requiring non-trivial title
+                        if (!titleText || titleText.length < 3) continue;
 
-                        return {
-                            title: titleAnchor?.textContent?.trim() || null,
-                            company: card.querySelector('[data-at="job-item-company-name"]')?.textContent?.trim() || null,
-                            location: card.querySelector('[data-at="job-item-location"]')?.textContent?.trim() || null,
-                            salary: salaryText,
+                        // Try to find a container around the job (heading + siblings)
+                        const heading =
+                            anchor.closest('h2, h3') ||
+                            anchor.parentElement?.closest('h2, h3') ||
+                            anchor.parentElement;
+
+                        const container = heading?.parentElement || heading;
+                        const siblings = [];
+                        if (container) {
+                            let el = container.nextElementSibling;
+                            let steps = 0;
+                            while (el && steps < 10) {
+                                siblings.push(el);
+                                el = el.nextElementSibling;
+                                steps++;
+                            }
+                        }
+
+                        const siblingTexts = siblings
+                            .map((el) => el.textContent?.trim())
+                            .filter(Boolean);
+
+                        const salary =
+                            siblingTexts.find((t) => t.includes('£')) ||
+                            siblingTexts.find((t) => /per (hour|annum|year)/i.test(t)) ||
+                            null;
+
+                        const rawDate =
+                            siblingTexts.find((t) => /ago$/i.test(t) || /last \d+ days?/i.test(t)) ||
+                            null;
+
+                        const location =
+                            siblingTexts.find((t) =>
+                                /\b[A-Z]{1,2}\d{1,2}\b/.test(t) || /[A-Za-z]+,\s*[A-Za-z]/.test(t),
+                            ) || null;
+
+                        // Company often appears as a single short line between title and location
+                        let company = null;
+                        if (siblingTexts.length) {
+                            const candidate = siblingTexts[0];
+                            if (
+                                candidate &&
+                                !candidate.includes('£') &&
+                                !candidate.toLowerCase().includes('ago') &&
+                                candidate.length <= 60
+                            ) {
+                                company = candidate;
+                            }
+                        }
+
+                        results.push({
+                            title: titleText,
+                            company,
+                            location,
+                            salary,
                             raw_date: rawDate,
                             url: jobUrl,
                             description_html: null,
                             description_text: null,
-                        };
-                    }).filter(Boolean);
+                        });
+
+                        seen.add(jobUrl);
+                    }
+
+                    return results;
                 }, request.url);
 
                 stats.jobsExtracted += jobs.length;
-                crawlerLog.info(`Extracted ${jobs.length} jobs on page ${pageNum}`, { url: request.url, title: pageTitle, htmlLength });
+                crawlerLog.info(`Extracted ${jobs.length} jobs on page ${pageNum}`, {
+                    url: request.url,
+                    title: pageTitle,
+                    htmlLength,
+                });
 
                 for (const job of jobs) {
                     if (savedCount >= results_wanted) break;
@@ -281,30 +399,45 @@ await Actor.main(async () => {
                     if (normalizedDate) job.date_posted = normalizedDate;
 
                     if (collectDetails) {
-                        await crawlerInstance.addRequests([{
-                            url: job.url,
-                            userData: { label: 'DETAIL', listData: job },
-                        }]);
+                        await crawlerInstance.addRequests([
+                            {
+                                url: job.url,
+                                userData: { label: 'DETAIL', listData: job },
+                            },
+                        ]);
                     } else {
                         await Dataset.pushData(job);
                         savedUrls.add(job.url);
                         savedCount++;
                         stats.jobsSaved++;
-                        crawlerLog.info(`Saved job ${savedCount}/${results_wanted}`, { title: job.title, url: job.url });
+                        crawlerLog.info(`Saved job ${savedCount}/${results_wanted}`, {
+                            title: job.title,
+                            url: job.url,
+                        });
                     }
                 }
 
+                // Small jitter to be less botty
+                await page.waitForTimeout(500 + Math.random() * 1000);
+
+                // Pagination
                 if (savedCount < results_wanted && pageNum < max_pages) {
                     const nextPage = pageNum + 1;
                     const hasNext = await page.evaluate((nextNum) => {
-                        return Boolean(document.querySelector(`a[href*="page=${nextNum}"]`));
+                        // Look for any link mentioning the next page number in href or text
+                        const selector = `a[href*="page=${nextNum}"]`;
+                        if (document.querySelector(selector)) return true;
+                        const anchors = Array.from(document.querySelectorAll('a'));
+                        return anchors.some((a) => a.textContent.trim() === String(nextNum));
                     }, nextPage);
 
                     if (hasNext) {
-                        await crawlerInstance.addRequests([{
-                            url: buildSearchUrl(keyword, location, nextPage),
-                            userData: { label: 'LIST', pageNum: nextPage },
-                        }]);
+                        await crawlerInstance.addRequests([
+                            {
+                                url: buildSearchUrl(keyword, location, nextPage),
+                                userData: { label: 'LIST', pageNum: nextPage },
+                            },
+                        ]);
                         crawlerLog.info('Queued next page', { nextPage });
                     } else {
                         crawlerLog.info('Pagination ended (no link for next page)');
@@ -315,12 +448,20 @@ await Actor.main(async () => {
                 if (savedUrls.has(listData.url)) return;
 
                 stats.detailPagesProcessed++;
+
                 await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-                await page.waitForSelector('h1, [data-at="job-description"], article', { timeout: 12000 }).catch(() => {});
+                await dismissPopups(page);
+                await page
+                    .waitForSelector('h1, [data-at="job-description"], article', {
+                        timeout: 12000,
+                    })
+                    .catch(() => {});
 
                 const detailData = await page.evaluate(() => {
                     const result = {};
-                    const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+                    const scripts = Array.from(
+                        document.querySelectorAll('script[type="application/ld+json"]'),
+                    );
 
                     for (const script of scripts) {
                         try {
@@ -329,41 +470,66 @@ await Actor.main(async () => {
                             for (const item of entries) {
                                 if (item['@type'] === 'JobPosting') {
                                     result.title = item.title ?? result.title;
-                                    result.company = item.hiringOrganization?.name ?? result.company;
-                                    result.location = item.jobLocation?.address?.addressLocality ?? result.location;
-                                    result.salary = item.baseSalary?.value?.value ?? result.salary;
+                                    result.company =
+                                        item.hiringOrganization?.name ?? result.company;
+                                    result.location =
+                                        item.jobLocation?.address?.addressLocality ??
+                                        result.location;
+                                    result.salary =
+                                        item.baseSalary?.value?.value ??
+                                        item.baseSalary?.value?.minValue ??
+                                        result.salary;
                                     result.job_type = item.employmentType ?? result.job_type;
                                     if (item.description && !result.description_html) {
                                         result.description_html = item.description;
-                                        result.description_text = item.description.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+                                        result.description_text = item.description
+                                            .replace(/<[^>]*>/g, ' ')
+                                            .replace(/\s+/g, ' ')
+                                            .trim();
                                     }
                                     if (item.datePosted && !result.date_posted) {
                                         result.date_posted = item.datePosted;
                                     }
                                 }
                             }
-                        } catch (e) {
-                            /* ignore malformed JSON-LD */
+                        } catch {
+                            // ignore malformed JSON-LD
                         }
                     }
 
                     if (!result.title) {
-                        result.title = document.querySelector('h1')?.textContent?.trim() || null;
+                        result.title =
+                            document.querySelector('h1')?.textContent?.trim() || null;
                     }
                     if (!result.company) {
-                        result.company = document.querySelector('[data-at*="company"], [class*="company"]')?.textContent?.trim() || null;
+                        const companyEl =
+                            document.querySelector('[data-at*="company"], [class*="company"]') ||
+                            document.querySelector('section h3');
+                        result.company = companyEl?.textContent?.trim() || null;
                     }
                     if (!result.location) {
-                        result.location = document.querySelector('[data-at*="location"], [class*="location"]')?.textContent?.trim() || null;
+                        const locEl =
+                            document.querySelector('[data-at*="location"], [class*="location"]') ||
+                            document.querySelector('h1 + div, h1 + p');
+                        result.location = locEl?.textContent?.trim() || null;
                     }
                     if (!result.salary) {
-                        result.salary = document.querySelector('[data-at*="salary"], [class*="salary"]')?.textContent?.trim() || null;
+                        const salaryEl = Array.from(
+                            document.querySelectorAll('span, p, li, div'),
+                        ).find((el) => el.textContent.includes('£'));
+                        result.salary = salaryEl?.textContent?.trim() || null;
                     }
                     if (!result.description_html) {
-                        const descEl = document.querySelector('[data-at="job-description"], .job-description, article');
+                        const descEl =
+                            document.querySelector(
+                                '[data-at="job-description"], .job-description, article',
+                            ) ||
+                            document.querySelector('main article') ||
+                            document.querySelector('main section');
                         if (descEl) {
                             result.description_html = descEl.innerHTML;
-                            result.description_text = descEl.textContent?.replace(/\s+/g, ' ').trim() || null;
+                            result.description_text =
+                                descEl.textContent?.replace(/\s+/g, ' ').trim() || null;
                         }
                     }
 
@@ -372,7 +538,9 @@ await Actor.main(async () => {
 
                 const job = {
                     ...listData,
-                    ...Object.fromEntries(Object.entries(detailData).filter(([, value]) => value != null)),
+                    ...Object.fromEntries(
+                        Object.entries(detailData).filter(([, value]) => value != null),
+                    ),
                 };
 
                 if (!job.date_posted && job.raw_date) {
@@ -384,9 +552,16 @@ await Actor.main(async () => {
                 savedUrls.add(job.url);
                 savedCount++;
                 stats.jobsSaved++;
-                crawlerLog.info(`Saved detail job ${savedCount}/${results_wanted}`, { title: job.title, url: job.url });
+                crawlerLog.info(`Saved detail job ${savedCount}/${results_wanted}`, {
+                    title: job.title,
+                    url: job.url,
+                });
             }
         },
+
+        /**
+         * Handle hard failures with diagnostics & gentle session retirement.
+         */
         async failedRequestHandler({ request, error, session, log: crawlerLog, page }) {
             const retryCount = request.retryCount ?? 0;
             let shot;
@@ -394,15 +569,31 @@ await Actor.main(async () => {
                 if (page) {
                     shot = await page.screenshot({ fullPage: true });
                 }
-            } catch (e) {
-                /* ignore screenshot failure */
+            } catch {
+                // ignore screenshot failure
             }
-            crawlerLog.error('Request failed', { url: request.url, error: error.message, retryCount });
+
+            crawlerLog.error('Request failed', {
+                url: request.url,
+                error: error.message,
+                retryCount,
+            });
+
+            // Retire the session so we get a fresh identity / proxy
             session?.retire();
+
+            // Persist diagnostics after a couple of retries
             if (retryCount >= 2) {
-                await Actor.setValue(`FAILED_${Date.now()}.txt`, `URL: ${request.url}\nError: ${error.message}\nStack: ${error.stack ?? ''}`);
+                await Actor.setValue(
+                    `FAILED_${Date.now()}.txt`,
+                    `URL: ${request.url}\nError: ${error.message}\nStack: ${
+                        error.stack ?? ''
+                    }`,
+                );
                 if (shot) {
-                    await Actor.setValue(`FAILED_${Date.now()}.png`, shot, { contentType: 'image/png' });
+                    await Actor.setValue(`FAILED_${Date.now()}.png`, shot, {
+                        contentType: 'image/png',
+                    });
                 }
             }
         },
@@ -410,10 +601,12 @@ await Actor.main(async () => {
 
     log.info('Crawler created, starting run', { startUrl: startUrlToUse });
 
-    await crawler.run([{
-        url: startUrlToUse,
-        userData: { label: 'LIST', pageNum: 1 },
-    }]);
+    await crawler.run([
+        {
+            url: startUrlToUse,
+            userData: { label: 'LIST', pageNum: 1 },
+        },
+    ]);
 
     log.info('Scraping completed', {
         jobsSaved: savedCount,
