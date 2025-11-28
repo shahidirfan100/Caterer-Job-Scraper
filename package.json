@@ -4,9 +4,9 @@
   "description": "Production-grade Caterer.com job scraper using Playwright with comprehensive stealth measures.",
   "type": "module",
   "dependencies": {
-    "apify": "3.5.2",
-    "crawlee": "3.15.3",
-    "playwright": "1.48.2"
+    "apify": "3.5.0",
+    "crawlee": "3.15.1",
+    "playwright": "1.54.1"
   },
   "devDependencies": {
     "@apify/eslint-config": "^1.0.0",
