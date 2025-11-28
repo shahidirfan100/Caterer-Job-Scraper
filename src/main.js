@@ -2,6 +2,7 @@
 // Simplified approach: Use Crawlee's battle-tested infrastructure for maximum reliability
 import { Actor } from 'apify';
 import { CheerioCrawler, ProxyConfiguration, Dataset } from 'crawlee';
+import { HeaderGenerator } from 'header-generator';
 
 await Actor.init();
 
@@ -23,11 +24,18 @@ try {
         collectDetails,
     });
 
-    // Use Apify's proxy configuration - simpler and more reliable
-    const proxyConfiguration = await Actor.createProxyConfiguration({
-        groups: ['RESIDENTIAL'],
-        countryCode: 'GB',
-    });
+    // Use Apify's proxy configuration - with fallback
+    let proxyConfiguration;
+    try {
+        proxyConfiguration = await Actor.createProxyConfiguration({
+            groups: ['RESIDENTIAL'],
+            countryCode: 'GB',
+        });
+        Actor.log.info('✓ Proxy configured');
+    } catch (proxyError) {
+        Actor.log.warning('Proxy setup failed, will try without proxy', { error: proxyError.message });
+        proxyConfiguration = undefined;
+    }
 
     let savedCount = 0;
     const savedUrls = new Set();
@@ -72,32 +80,126 @@ try {
         return null;
     };
 
+    Actor.log.info('Creating crawler...');
+    
+    // Initialize header generator for realistic browser fingerprints
+    const headerGenerator = new HeaderGenerator({
+        browsers: [
+            { name: "chrome", minVersion: 130, maxVersion: 131 }, // Nov 2025 Chrome versions
+        ],
+        devices: ["desktop"],
+        locales: ["en-GB", "en-US"],
+        operatingSystems: ["windows"],
+    });
+    
     const crawler = new CheerioCrawler({
         proxyConfiguration,
         maxRequestsPerCrawl: max_pages * 30, // Limit total requests
         maxRequestRetries: 5,
         requestHandlerTimeoutSecs: 60,
-        maxConcurrency: 2, // Lower concurrency to avoid rate limiting
-        minConcurrency: 1,
+        maxConcurrency: 1, // Sequential requests only for maximum stealth
         
-        // Session management for better success rate
+        // Aggressive session rotation for better stealth - rotate every 3-5 requests
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 50,
             sessionOptions: {
-                maxUsageCount: 10,
-                maxAgeSecs: 300,
+                maxUsageCount: 4, // Reduced from 10 to 4 for aggressive rotation
+                maxAgeSecs: 150, // Reduced from 300 to 150 seconds (2.5 minutes)
             },
         },
+        
+        // Add custom headers before each request for stealth
+        preNavigationHooks: [
+            async ({ request, session }, gotoOptions) => {
+                const headers = headerGenerator.getHeaders({
+                    httpVersion: '2',
+                    operatingSystems: ['windows'],
+                    browsers: [{ name: 'chrome', minVersion: 130, maxVersion: 131 }],
+                });
+                
+                // Override with specific headers for better stealth
+                headers['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+                headers['accept-language'] = 'en-GB,en;q=0.9,en-US;q=0.8';
+                headers['accept-encoding'] = 'gzip, deflate, br';
+                headers['cache-control'] = 'max-age=0';
+                headers['sec-fetch-dest'] = 'document';
+                headers['sec-fetch-mode'] = 'navigate';
+                headers['sec-fetch-site'] = 'none';
+                headers['sec-fetch-user'] = '?1';
+                headers['upgrade-insecure-requests'] = '1';
+                
+                // Apply headers to request
+                if (!request.headers) {
+                    request.headers = {};
+                }
+                Object.assign(request.headers, headers);
+            },
+        ],
+        
+        // Add human-like delays after each request
+        postNavigationHooks: [
+            async ({ request }) => {
+                // Random delay between 2-5 seconds to simulate human reading
+                const delay = 2000 + Math.random() * 3000;
+                Actor.log.debug(`Human delay: ${Math.round(delay)}ms before next request`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            },
+        ],
 
-        async requestHandler({ request, $, crawler: crawlerInstance, log, session }) {
+        async requestHandler({ request, $, crawler: crawlerInstance, log, session, response }) {
             const { label, pageNum = 1 } = request.userData;
-
+            
+            // Get HTML content for logging and block detection
+            const html = $.html();
+            const htmlLength = html.length;
+            const pageTitle = $('title').text().trim();
+            
             log.info(`Processing ${label} page`, {
                 url: request.url,
                 pageNum,
-                statusCode: 200,
+                statusCode: response?.statusCode || 'unknown',
+                htmlLength,
+                pageTitle: pageTitle.substring(0, 80),
+                sessionId: session?.id,
             });
+            
+            Actor.log.info('Request successful', {
+                url: request.url,
+                contentLength: htmlLength,
+                title: pageTitle,
+            });
+            
+            // Block detection - check for captcha or blocked content
+            const htmlLower = html.toLowerCase();
+            const blockIndicators = [
+                'captcha',
+                'access denied',
+                'blocked',
+                'why have i been blocked',
+                'cloudflare',
+                'ray id:',
+                'attention required',
+                'security check',
+            ];
+            
+            const isBlocked = blockIndicators.some(indicator => htmlLower.includes(indicator));
+            if (isBlocked) {
+                Actor.log.error('🚫 BLOCKED! Captcha or access denied detected', {
+                    url: request.url,
+                    pageTitle,
+                    htmlLength,
+                });
+                
+                // Retire the session immediately
+                if (session) {
+                    session.retire();
+                    Actor.log.warning('Session retired due to block detection');
+                }
+                
+                // Throw error to trigger retry with new session/IP
+                throw new Error('Page blocked or captcha detected');
+            }
 
             if (label === 'LIST') {
                 stats.listPagesProcessed++;
@@ -175,6 +277,38 @@ try {
 
                 log.info(`Extracted ${jobs.length} jobs from page ${pageNum}`);
                 stats.jobsExtracted += jobs.length;
+                
+                // Fallback for empty results - detailed debugging on page 1
+                if (jobs.length === 0 && pageNum === 1) {
+                    Actor.log.error('⚠️ NO JOBS FOUND on page 1! Debugging...', {
+                        url: request.url,
+                        htmlLength,
+                        pageTitle,
+                        h2Links: $('h2 a').length,
+                        h2JobLinks: $('h2 a[href*="/job/"]').length,
+                        allJobLinks: $('a[href*="/job/"]').length,
+                        anyH2: $('h2').length,
+                    });
+                    
+                    // Try alternative selectors
+                    const altSelectors = [
+                        'a[href*="/job/"]',
+                        '.job-title a',
+                        '[class*="job"] a[href*="/job/"]',
+                        'article a[href*="/job/"]',
+                    ];
+                    
+                    for (const selector of altSelectors) {
+                        const count = $(selector).length;
+                        if (count > 0) {
+                            Actor.log.warning(`Alternative selector found ${count} matches: ${selector}`);
+                        }
+                    }
+                    
+                    // Log sample of HTML structure
+                    const sampleHTML = $.html().substring(0, 2000);
+                    Actor.log.debug('HTML sample (first 2000 chars):', sampleHTML);
+                }
 
                 // Save jobs
                 for (const job of jobs) {
@@ -285,20 +419,46 @@ try {
             }
         },
 
-        failedRequestHandler({ request, error }, { log, session }) {
+        async failedRequestHandler({ request, error }, { log, session }) {
+            const retryCount = request.retryCount || 0;
+            
+            // Calculate exponential backoff: 2^retry * 1000ms + random jitter (0-1000ms)
+            const baseDelay = Math.pow(2, retryCount) * 1000;
+            const jitter = Math.random() * 1000;
+            const totalDelay = baseDelay + jitter;
+            
             log.error(`Request failed for ${request.url}`, {
                 error: error.message,
-                retries: request.retryCount,
+                retries: retryCount,
+                nextRetryIn: `${Math.round(totalDelay / 1000)}s`,
             });
+            
+            Actor.log.error('Failed request details', {
+                url: request.url,
+                error: error.message,
+                willRetry: retryCount < 5,
+            });
+            
+            // Apply exponential backoff delay before retry
+            if (retryCount < 5) {
+                Actor.log.info(`Waiting ${Math.round(totalDelay / 1000)}s before retry #${retryCount + 1}`);
+                await new Promise(resolve => setTimeout(resolve, totalDelay));
+            }
+            
             // Retire session on failure
             if (session) {
                 session.retire();
+                Actor.log.info('Session retired due to failure');
             }
         },
     });
+    
+    Actor.log.info('✓ Crawler created successfully');
 
     // Start crawling
     const startUrl = buildSearchUrl(keyword, location, 1);
+    Actor.log.info('Starting crawler', { startUrl });
+    
     await crawler.run([{
         url: startUrl,
         userData: { label: 'LIST', pageNum: 1 },
