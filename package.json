@@ -1,7 +1,8 @@
 {
   "name": "caterer-jobs-actor",
-  "version": "3.0.0",
-  "description": "Production-grade Caterer.com job scraper using Playwright with comprehensive stealth measures.",
+    "version": "3.0.0",
+    "description": "Production-grade Caterer.com job scraper using Playwright with comprehensive stealth measures.",
+    "type": "module",
 "dependencies": {
         "apify": "^3.4.2",
         "crawlee": "^3.13.8",

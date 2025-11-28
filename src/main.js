@@ -6,6 +6,19 @@ import { chromium } from 'playwright';
 
 await Actor.init();
 
+// Quick runtime check: ensure Playwright browsers are available (helps debug empty runs)
+try {
+    // perform a quick launch & close to verify installation
+    const tmpBrowser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+    await tmpBrowser.close();
+    Actor.log.info('Playwright browsers check passed (Chromium launch succeeded)');
+} catch (err) {
+    Actor.log.error('Playwright browser check failed — Playwright browsers may be missing or not installed in the image.', {
+        message: err.message,
+        suggestion: 'Run `npx crawlee install-playwright-browsers` locally or add a postinstall script in package.json',
+    });
+}
+
 try {
     const input = await Actor.getInput() ?? {};
     const {
