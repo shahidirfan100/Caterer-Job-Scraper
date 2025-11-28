@@ -1,20 +1,21 @@
-# Caterer Job Scraper - Hospitality & Catering Jobs
+# Caterer Job Scraper - Hospitality & Catering Jobs 🚀
 
-> **Extract comprehensive job listings from Caterer.com** - The UK's leading hospitality and catering recruitment platform. Perfect for job seekers, recruiters, and industry analysts tracking hospitality career opportunities.
+> **Production-grade job scraper using Playwright** - Extract comprehensive job listings from Caterer.com with advanced stealth measures and JavaScript rendering. The UK's leading hospitality and catering recruitment data source.
 
 ## 🌟 What This Actor Does
 
-The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com, providing structured data about hospitality and catering positions across the UK. Whether you're a job seeker looking for your next role, a recruiter monitoring the market, or an analyst studying industry trends, this actor delivers clean, actionable job data.
+The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com using **Playwright** for full JavaScript rendering and comprehensive anti-detection measures. Built for production use with residential proxies, browser fingerprinting, and human-like behavior simulation.
 
 ### ✨ Key Features
 
-- **Comprehensive Data Extraction**: Captures job titles, companies, locations, salaries, and full descriptions
-- **Flexible Search Options**: Search by keywords, locations, or specific URLs
-- **Smart Pagination**: Automatically handles multiple result pages
-- **Detail Page Scraping**: Optional full job description collection
-- **Date Filtering**: Focus on recently posted jobs (24h, 7d, 30d, or any time)
-- **Structured JSON Output**: Clean, consistent data format for easy processing
-- **Reliable Performance**: Built for production use with error handling and retries
+- **🎭 Playwright Rendering**: Full browser rendering for JavaScript-heavy pages
+- **🥷 Stealth Measures**: Advanced anti-detection (webdriver bypass, fingerprinting, random delays)
+- **🌍 Residential Proxies**: UK-based residential IPs with aggressive session rotation
+- **📊 Comprehensive Data**: Job titles, companies, locations, salaries, descriptions, and dates
+- **🔄 Smart Pagination**: Automatic multi-page crawling with dynamic content detection
+- **🎯 Flexible Search**: Search by keywords, locations, or specific URLs
+- **📸 Debug Screenshots**: Automatic screenshot capture on blocks or errors
+- **⚡ Fast & Reliable**: Optimized selectors, exponential backoff, and error recovery
 
 ## 🎯 Perfect For
 
