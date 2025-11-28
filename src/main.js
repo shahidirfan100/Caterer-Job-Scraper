@@ -3,20 +3,46 @@
 import { Actor } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { chromium } from 'playwright';
+import { execSync } from 'child_process';
 
 await Actor.init();
 
 // Quick runtime check: ensure Playwright browsers are available (helps debug empty runs)
+const runtimeLogger = (Actor && Actor.log) ? Actor.log : console;
+let browsersAvailable = false;
 try {
     // perform a quick launch & close to verify installation
     const tmpBrowser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
     await tmpBrowser.close();
-    Actor.log.info('Playwright browsers check passed (Chromium launch succeeded)');
+    runtimeLogger.info?.('Playwright browsers check passed (Chromium launch succeeded)');
+    browsersAvailable = true;
 } catch (err) {
-    Actor.log.error('Playwright browser check failed — Playwright browsers may be missing or not installed in the image.', {
+    // Try to remediate by attempting to install browsers (best-effort)
+    runtimeLogger.error?.('Playwright browser check failed — Playwright browsers may be missing or not installed in the image.', {
         message: err.message,
-        suggestion: 'Run `npx crawlee install-playwright-browsers` locally or add a postinstall script in package.json',
     });
+
+    try {
+        runtimeLogger.info?.('Attempting to install Playwright browsers now (this may take some time)');
+        // Install browsers using crawlee helper
+        execSync('npx crawlee install-playwright-browsers --yes', { stdio: 'inherit', timeout: 180000 });
+        // try launching again
+        const tmpBrowser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+        await tmpBrowser.close();
+        runtimeLogger.info?.('Playwright browsers installed and launch succeeded');
+        browsersAvailable = true;
+    } catch (installErr) {
+        runtimeLogger.error?.('Automatic installation of Playwright browsers failed. Please install manually.', {
+            installError: installErr.message,
+            suggestion: 'Run `npx crawlee install-playwright-browsers` or ensure browser binaries are present in the image',
+        });
+    }
+}
+
+if (!browsersAvailable) {
+    runtimeLogger.error?.('Playwright browsers not available, exiting early to avoid silent failures');
+    // Give a clear error and exit so the run doesn't succeed silently with zero data
+    process.exit(1);
 }
 
 try {
