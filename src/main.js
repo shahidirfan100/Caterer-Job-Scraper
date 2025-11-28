@@ -59,7 +59,6 @@ const looksBlockedHtml = (html) => {
 
 /**
  * Extract RecommenderWidget_listing_list JSON from HTML using regex.
- * Falls back to null if the structure changes.
  */
 const extractRecommenderState = (html) => {
     const match = html.match(
@@ -73,9 +72,6 @@ const extractRecommenderState = (html) => {
     }
 };
 
-/**
- * Parse jobs from the JSON state (preferred: clean salary, company, location, datePosted, url).
- */
 const extractJobsFromJsonState = (html, pageUrl) => {
     const state = extractRecommenderState(html);
     if (!state?.props?.jobAdsData?.items?.length) return [];
@@ -97,9 +93,6 @@ const extractJobsFromJsonState = (html, pageUrl) => {
     });
 };
 
-/**
- * Fallback: parse jobs from DOM using cheerio.
- */
 const extractJobsFromDom = (html, pageUrl) => {
     const $ = cheerio.load(html);
     const urlObj = new URL(pageUrl);
@@ -167,13 +160,75 @@ const extractJobsFromDom = (html, pageUrl) => {
 };
 
 /**
- * Do one Playwright "handshake" to get cookies & prove we're a real browser.
- * Returns { userAgent, cookieHeader } which are then used by got-scraping.
+ * Parse job detail page HTML to get description (and optionally company/salary/date, but we
+ * mainly care about description here).
  */
-const doPlaywrightHandshake = async (
-    startUrl,
-    proxyConfiguration,
-) => {
+const extractJobDetail = (html) => {
+    const $ = cheerio.load(html);
+    const result = {};
+
+    // 1) JSON-LD JobPosting
+    $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+            const json = $(el).text();
+            const data = JSON.parse(json || '{}');
+            const entries = Array.isArray(data) ? data : [data];
+
+            for (const item of entries) {
+                if (item['@type'] !== 'JobPosting') continue;
+
+                if (item.description && !result.description_html) {
+                    result.description_html = item.description;
+                    result.description_text = item.description
+                        .replace(/<[^>]*>/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                }
+                if (item.hiringOrganization?.name && !result.company) {
+                    result.company = item.hiringOrganization.name;
+                }
+                if (item.baseSalary && !result.salary) {
+                    const val = item.baseSalary.value;
+                    if (typeof val === 'string') {
+                        result.salary = val;
+                    } else if (val?.value || val?.minValue || val?.maxValue) {
+                        const v = val.value ?? val.minValue ?? val.maxValue;
+                        result.salary = `${v} ${val.currency || ''}`.trim();
+                    }
+                }
+                if (item.datePosted && !result.date_posted) {
+                    result.date_posted = item.datePosted;
+                }
+                if (item.employmentType && !result.job_type) {
+                    result.job_type = item.employmentType;
+                }
+            }
+        } catch {
+            // ignore
+        }
+    });
+
+    // 2) DOM fallback for description
+    if (!result.description_html) {
+        const descEl =
+            $('[data-at="job-description"]').first() ||
+            $('.job-description').first() ||
+            $('main article').first() ||
+            $('main section').first();
+
+        if (descEl && descEl.length) {
+            result.description_html = descEl.html();
+            result.description_text = descEl.text().replace(/\s+/g, ' ').trim();
+        }
+    }
+
+    return result;
+};
+
+/**
+ * Playwright handshake: one real browser visit to get cookies, UA, and the HTML of the first page.
+ */
+const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
     const fp = randomFingerprint();
     const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : null;
 
@@ -221,12 +276,25 @@ const doPlaywrightHandshake = async (
                 window.chrome = { runtime: {} };
             });
 
-            await dismissPopupsPlaywright(page);
+            await page.route('**/*', (route) => {
+                const req = route.request();
+                const type = req.resourceType();
+                const url = req.url();
+                if (['image', 'media', 'font'].includes(type)) {
+                    return route.abort();
+                }
+                if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(url)) {
+                    return route.abort();
+                }
+                return route.continue();
+            });
 
             const response = await page.goto(startUrl, {
                 waitUntil: 'domcontentloaded',
                 timeout: 20000,
             });
+
+            await dismissPopupsPlaywright(page);
 
             const status = response ? response.status() : null;
             const html = await page.content();
@@ -236,9 +304,7 @@ const doPlaywrightHandshake = async (
             }
 
             const cookies = await context.cookies(BASE_URL);
-            const cookieHeader = cookies
-                .map((c) => `${c.name}=${c.value}`)
-                .join('; ');
+            const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 
             await browser.close();
 
@@ -247,7 +313,12 @@ const doPlaywrightHandshake = async (
                 haveCookies: !!cookieHeader,
             });
 
-            return { userAgent: fp.ua, cookieHeader, proxyUrl };
+            return {
+                userAgent: fp.ua,
+                cookieHeader,
+                proxyUrl,
+                initialHtml: html,
+            };
         } catch (err) {
             log.warning('Playwright handshake failed', {
                 attempt,
@@ -255,16 +326,101 @@ const doPlaywrightHandshake = async (
             });
             if (attempt === 2) {
                 log.warning(
-                    'Falling back to HTTP-only scraping (got-scraping) without browser cookies.',
+                    'Falling back to HTTP-only scraping without browser cookies. Blocking risk may increase.',
                 );
-                return { userAgent: fp.ua, cookieHeader: '', proxyUrl };
+                const fallbackFp = randomFingerprint();
+                return {
+                    userAgent: fallbackFp.ua,
+                    cookieHeader: '',
+                    proxyUrl: null,
+                    initialHtml: null,
+                };
             }
         }
     }
+};
 
-    // Should never get here due to return in loop, but TS-style safety:
-    const fallbackFp = randomFingerprint();
-    return { userAgent: fallbackFp.ua, cookieHeader: '', proxyUrl: null };
+/**
+ * HTTP fetch helper using got-scraping with browser-like headers + proxy.
+ */
+const httpFetchHtml = async (url, userAgent, cookieHeader, proxyUrl) => {
+    const res = await gotScraping({
+        url,
+        proxyUrl: proxyUrl || undefined,
+        timeout: { request: 15000 },
+        http2: false,
+        headers: {
+            'User-Agent': userAgent,
+            Accept:
+                'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+            Connection: 'keep-alive',
+            Referer: BASE_URL + '/',
+            ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+        },
+    });
+
+    const { statusCode, body } = res;
+    const html = body || '';
+
+    if (statusCode === 403 || looksBlockedHtml(html)) {
+        throw new Error(`Blocked on HTTP (status: ${statusCode})`);
+    }
+
+    return html;
+};
+
+/**
+ * Enrich a set of jobs with detail data (description, maybe better salary/company/date).
+ */
+const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, maxConcurrency = 3) => {
+    const enriched = [];
+    let index = 0;
+
+    const worker = async () => {
+        while (true) {
+            const i = index++;
+            if (i >= jobs.length) break;
+            const baseJob = jobs[i];
+
+            try {
+                const html = await httpFetchHtml(baseJob.url, userAgent, cookieHeader, proxyUrl);
+                const detail = extractJobDetail(html);
+
+                const job = {
+                    ...baseJob,
+                    // Only override if detail provides something new
+                    company: detail.company || baseJob.company || null,
+                    salary: detail.salary || baseJob.salary || null,
+                    date_posted: detail.date_posted || baseJob.date_posted || null,
+                    job_type: detail.job_type || null,
+                    description_html: detail.description_html || null,
+                    description_text: detail.description_text || null,
+                };
+
+                enriched.push(job);
+            } catch (err) {
+                log.warning('Detail fetch failed, keeping list-only data', {
+                    url: baseJob.url,
+                    error: err.message,
+                });
+                enriched.push({
+                    ...baseJob,
+                    description_html: null,
+                    description_text: null,
+                });
+            }
+        }
+    };
+
+    const workers = [];
+    const workersCount = Math.min(maxConcurrency, jobs.length || 1);
+    for (let i = 0; i < workersCount; i++) {
+        workers.push(worker());
+    }
+    await Promise.all(workers);
+
+    return enriched;
 };
 
 await Actor.main(async () => {
@@ -275,17 +431,19 @@ await Actor.main(async () => {
         startUrl = '',
         results_wanted = 20,
         max_pages = 5,
+        max_detail_concurrency = 3,
         proxyConfiguration: proxyFromInput,
     } = input;
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('Starting Caterer.com hybrid job scraper', {
+    log.info('Starting Caterer.com HYBRID job scraper (with descriptions)', {
         keyword,
         location,
         startUrl: startUrlToUse,
         results_wanted,
         max_pages,
+        max_detail_concurrency,
     });
 
     // Proxy configuration
@@ -311,8 +469,8 @@ await Actor.main(async () => {
         log.info('No Apify proxy credentials detected, running without proxy');
     }
 
-    // 1) One Playwright handshake to get cookies & UA
-    const { userAgent, cookieHeader, proxyUrl } = await doPlaywrightHandshake(
+    // 1) Handshake
+    const { userAgent, cookieHeader, proxyUrl, initialHtml } = await doPlaywrightHandshake(
         startUrlToUse,
         proxyConfiguration,
     );
@@ -329,111 +487,123 @@ await Actor.main(async () => {
     const savedUrls = new Set();
     let savedCount = 0;
 
-    // 2) Fast HTTP loop over listing pages using got-scraping
     const pagesToVisit = Math.max(1, Math.min(max_pages, 20)); // safety cap
+    let initialHtmlUsed = false;
 
     for (let pageNum = 1; pageNum <= pagesToVisit; pageNum++) {
         if (savedCount >= results_wanted) break;
 
-        const url =
-            pageNum === 1 ? startUrlToUse : buildSearchUrl(keyword, location, pageNum);
-        log.info(`Fetching listing page ${pageNum}/${pagesToVisit}`, { url });
+        const url = pageNum === 1 ? startUrlToUse : buildSearchUrl(keyword, location, pageNum);
+        log.info(`Processing listing page ${pageNum}/${pagesToVisit}`, { url });
 
+        let html;
         try {
-            const res = await gotScraping({
-                url,
-                proxyUrl: proxyUrl || undefined,
-                timeout: { request: 15000 },
-                http2: false, // HTTP/2 off often helps with finicky sites
-                headers: {
-                    'User-Agent': userAgent,
-                    Accept:
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-                    Connection: 'keep-alive',
-                    Referer: BASE_URL + '/',
-                    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-                },
-            });
-
-            const { statusCode, body } = res;
-            const html = body || '';
-
-            if (statusCode === 403 || looksBlockedHtml(html)) {
-                stats.pagesBlockedOrCaptcha++;
-                log.warning('Blocked on HTTP (listing page)', {
-                    url,
-                    statusCode,
-                });
-                break; // stop further pages, we’re clearly being blocked
-            }
-
-            stats.pagesFetched++;
-
-            // Prefer JSON state
-            let jobs = extractJobsFromJsonState(html, url);
-            stats.jobsFromJson += jobs.length;
-
-            // Fallback to DOM via cheerio
-            if (!jobs.length) {
-                const domJobs = extractJobsFromDom(html, url);
-                jobs = domJobs;
-                stats.jobsFromDomFallback += domJobs.length;
-                log.info(`DOM fallback extracted ${domJobs.length} jobs`, {
-                    url,
-                    pageNum,
-                });
+            if (pageNum === 1 && initialHtml && !initialHtmlUsed) {
+                html = initialHtml;
+                initialHtmlUsed = true;
+                log.info('Using HTML from Playwright handshake for page 1');
             } else {
-                log.info(`JSON state extracted ${jobs.length} jobs`, {
-                    url,
-                    pageNum,
-                });
-            }
-
-            if (!jobs.length) {
-                log.info('No jobs found on page, stopping pagination.', {
-                    url,
-                    pageNum,
-                });
-                break;
-            }
-
-            // Save jobs, respecting results_wanted & de-duplicating
-            for (const job of jobs) {
-                if (savedCount >= results_wanted) break;
-                if (!job.url || savedUrls.has(job.url)) continue;
-
-                const finalJob = {
-                    ...job,
-                    keyword_search: keyword || null,
-                    location_search: location || null,
-                    extracted_at: new Date().toISOString(),
-                };
-
-                await Dataset.pushData(finalJob);
-                savedUrls.add(job.url);
-                savedCount++;
-                stats.jobsSaved++;
-
-                log.info(`Saved job ${savedCount}/${results_wanted}`, {
-                    title: finalJob.title,
-                    url: finalJob.url,
-                });
-            }
-
-            // Small jitter between pages
-            if (pageNum < pagesToVisit && savedCount < results_wanted) {
-                const waitMs = 300 + Math.floor(Math.random() * 400);
-                await Actor.sleep(waitMs);
+                html = await httpFetchHtml(url, userAgent, cookieHeader, proxyUrl);
             }
         } catch (err) {
             stats.pagesFailed++;
+            if (String(err.message || '').includes('Blocked on HTTP')) {
+                stats.pagesBlockedOrCaptcha++;
+                log.warning('Blocked while fetching listing page, stopping pagination', {
+                    url,
+                    error: err.message,
+                });
+                break;
+            }
             log.warning('Failed to fetch listing page', {
                 url,
                 pageNum,
                 error: err.message,
             });
-            // If many pages fail, break; for now we just continue to next page.
+            continue;
+        }
+
+        stats.pagesFetched++;
+
+        // Extract jobs from JSON or DOM
+        let jobs = extractJobsFromJsonState(html, url);
+        if (jobs.length) {
+            stats.jobsFromJson += jobs.length;
+            log.info(`Extracted ${jobs.length} jobs from JSON state`, {
+                url,
+                pageNum,
+            });
+        } else {
+            const domJobs = extractJobsFromDom(html, url);
+            jobs = domJobs;
+            stats.jobsFromDomFallback += domJobs.length;
+            log.info(`Extracted ${domJobs.length} jobs from DOM fallback`, {
+                url,
+                pageNum,
+            });
+        }
+
+        if (!jobs.length) {
+            log.info('No jobs found on page; stopping pagination.', { url, pageNum });
+            break;
+        }
+
+        // Filter + cap jobs we actually need from this page
+        const remainingNeeded = results_wanted - savedCount;
+        const pageJobsToProcess = [];
+        for (const job of jobs) {
+            if (pageJobsToProcess.length >= remainingNeeded) break;
+            if (!job.url || savedUrls.has(job.url)) continue;
+            pageJobsToProcess.push(job);
+            savedUrls.add(job.url); // reserve URL early to avoid duplicates across pages
+        }
+
+        if (!pageJobsToProcess.length) {
+            log.info('No new jobs from this page (all duplicates or already enough).', {
+                url,
+                pageNum,
+            });
+            continue;
+        }
+
+        // Enrich with descriptions in parallel via HTTP
+        log.info(`Fetching details for ${pageJobsToProcess.length} jobs`, {
+            pageNum,
+            concurrency: max_detail_concurrency,
+        });
+
+        const enrichedJobs = await enrichJobsWithDetails(
+            pageJobsToProcess,
+            userAgent,
+            cookieHeader,
+            proxyUrl,
+            max_detail_concurrency,
+        );
+
+        for (const job of enrichedJobs) {
+            if (savedCount >= results_wanted) break;
+
+            const finalJob = {
+                ...job,
+                keyword_search: keyword || null,
+                location_search: location || null,
+                extracted_at: new Date().toISOString(),
+            };
+
+            await Dataset.pushData(finalJob);
+            savedCount++;
+            stats.jobsSaved++;
+
+            log.info(`Saved job ${savedCount}/${results_wanted}`, {
+                title: finalJob.title,
+                url: finalJob.url,
+            });
+        }
+
+        // Small jitter between pages
+        if (pageNum < pagesToVisit && savedCount < results_wanted) {
+            const waitMs = 300 + Math.floor(Math.random() * 400);
+            await Actor.sleep(waitMs);
         }
     }
 

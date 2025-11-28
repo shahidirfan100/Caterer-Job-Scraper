@@ -63,13 +63,6 @@
       "editor": "number",
       "default": 20
     },
-    "debugSaveHtml": {
-      "title": "Save first page HTML when empty",
-      "type": "boolean",
-      "description": "When enabled, stores the first list page HTML in KEY_VALUE_STORE (key DEBUG_LIST_PAGE) if no jobs are found or the response looks blocked.",
-      "editor": "checkbox",
-      "default": false
-    },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
