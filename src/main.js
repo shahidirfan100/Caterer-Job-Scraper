@@ -36,6 +36,20 @@ const buildSearchUrl = (keyword, location, page = 1) => {
     return url.href;
 };
 
+const randomFingerprint = () => {
+    const mobile = Math.random() < 0.35;
+    if (mobile) {
+        return {
+            ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
+            viewport: { width: 390, height: 844 },
+        };
+    }
+    return {
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        viewport: { width: 1366, height: 768 },
+    };
+};
+
 const dismissPopups = async (page) => {
     const selectors = [
         'button:has-text("Accept all")',
@@ -138,10 +152,26 @@ await Actor.main(async () => {
         requestHandlerTimeoutSecs: 90,
         navigationTimeoutSecs: 45,
         maxConcurrency: 2,
+        navigationOptions: {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+        },
+        gotoFunction: async ({ page, request, log: gotoLog }) => {
+            try {
+                return await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            } catch (err) {
+                const msg = err?.message || '';
+                gotoLog.warning('Goto failed, will retry if retries remain', { url: request.url, error: msg });
+                if (msg.includes('ERR_EMPTY_RESPONSE') || msg.includes('ERR_TUNNEL_CONNECTION_FAILED') || msg.includes('ERR_HTTP2')) {
+                    throw new Error(`Transport error: ${msg}`);
+                }
+                throw err;
+            }
+        },
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 30,
-            sessionOptions: { maxUsageCount: 5, maxAgeSecs: 300 },
+            sessionOptions: { maxUsageCount: 2, maxAgeSecs: 300 },
         },
         launchContext: {
             launcher: chromium,
@@ -162,12 +192,14 @@ await Actor.main(async () => {
         },
         preNavigationHooks: [
             async ({ page }) => {
-                await page.setViewportSize({ width: 1366, height: 768 }).catch(() => {});
+                const fingerprint = randomFingerprint();
+                await page.setViewportSize(fingerprint.viewport).catch(() => {});
                 await page.setExtraHTTPHeaders({
                     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
                     Connection: 'keep-alive',
                 });
+                await page.setUserAgent(fingerprint.ua).catch(() => {});
                 await page.addInitScript(() => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false });
                     Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en-US', 'en'] });
@@ -183,6 +215,8 @@ await Actor.main(async () => {
             const pageTitle = await page.title();
             const html = await page.content();
             const htmlLength = html.length;
+            const mainResponse = page.mainFrame()?.response();
+            const status = mainResponse?.status?.();
 
             const lowerHtml = html.toLowerCase();
             const blocked = ['captcha', 'access denied', 'just a moment', 'verify you are a human', 'unusual traffic']
@@ -196,6 +230,10 @@ await Actor.main(async () => {
 
             if (label === 'LIST') {
                 stats.listPagesProcessed++;
+
+                if (status && status >= 400) {
+                    throw new Error(`Received bad status ${status}`);
+                }
 
                 const found = await page.waitForSelector('[data-at="job-item"], a[href*="/job/"]', { timeout: 15000 }).catch(() => null);
                 if (!found) {
@@ -353,12 +391,23 @@ await Actor.main(async () => {
                 crawlerLog.info(`Saved detail job ${savedCount}/${results_wanted}`, { title: job.title, url: job.url });
             }
         },
-        async failedRequestHandler({ request, error, session, log: crawlerLog }) {
+        async failedRequestHandler({ request, error, session, log: crawlerLog, page }) {
             const retryCount = request.retryCount ?? 0;
+            let shot;
+            try {
+                if (page) {
+                    shot = await page.screenshot({ fullPage: true });
+                }
+            } catch (e) {
+                /* ignore screenshot failure */
+            }
             crawlerLog.error('Request failed', { url: request.url, error: error.message, retryCount });
             session?.retire();
             if (retryCount >= 2) {
                 await Actor.setValue(`FAILED_${Date.now()}.txt`, `URL: ${request.url}\nError: ${error.message}\nStack: ${error.stack ?? ''}`);
+                if (shot) {
+                    await Actor.setValue(`FAILED_${Date.now()}.png`, shot, { contentType: 'image/png' });
+                }
             }
         },
     });
