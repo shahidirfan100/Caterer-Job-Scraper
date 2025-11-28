@@ -152,10 +152,6 @@ await Actor.main(async () => {
         requestHandlerTimeoutSecs: 90,
         navigationTimeoutSecs: 45,
         maxConcurrency: 2,
-        navigationOptions: {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000,
-        },
         gotoFunction: async ({ page, request, log: gotoLog }) => {
             try {
                 return await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
