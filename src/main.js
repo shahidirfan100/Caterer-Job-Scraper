@@ -223,8 +223,7 @@ async function main() {
         try {
             const proxyConfig = input.proxyConfiguration || {
                 useApifyProxy: true,
-                apifyProxyGroups: ['RESIDENTIAL', 'BUYPROXIES94952'],
-                apifyProxyCountry: 'GB',
+                apifyProxyGroups: ['RESIDENTIAL'],
             };
             proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
             getNewProxyUrl = async () => {
@@ -293,21 +292,26 @@ async function main() {
         ];
 
         // Make stealth request using got-scraping with rotating proxy
-        const makeRequest = async (url, referer = 'https://www.google.co.uk/', retries = 5, tryWithoutProxy = true) => {
+        const makeRequest = async (url, referer = 'https://www.google.co.uk/', retries = 6, tryWithoutProxy = true) => {
             for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
                     const headers = getStealthHeaders(referer);
                     
-                    // On last 2 attempts, try without proxy as fallback
-                    const shouldUseProxy = useProxy && attempt < retries - (tryWithoutProxy ? 1 : 0);
+                    // Try without proxy on attempts 3+ if tryWithoutProxy is true
+                    // Or if useProxy is already disabled
+                    const shouldUseProxy = useProxy && attempt < 3;
                     const proxyUrl = shouldUseProxy ? await getProxyUrlForRequest(attempt > 1) : null;
                     
                     const options = {
                         url,
                         headers,
-                        timeout: { request: 90000 },
+                        timeout: { 
+                            request: 120000, // 2 minutes
+                            connect: 30000   // 30 seconds to connect
+                        },
                         retry: { limit: 0 },
                         throwHttpErrors: false,
+                        http2: false, // Disable HTTP/2 for better compatibility
                         // got-scraping auto-generates browser-like TLS fingerprint
                         headerGeneratorOptions: {
                             browsers: ['chrome'],
@@ -319,13 +323,12 @@ async function main() {
 
                     if (proxyUrl) {
                         options.proxyUrl = proxyUrl;
-                    } else if (attempt >= retries - 1 && tryWithoutProxy) {
-                        log.info(`Attempt ${attempt}: Trying WITHOUT proxy as fallback`);
                     }
 
                     log.info(`Request attempt ${attempt}/${retries}:`, { 
                         url: url.slice(0, 80), 
-                        hasProxy: !!proxyUrl 
+                        hasProxy: !!proxyUrl,
+                        strategy: proxyUrl ? 'with-proxy' : 'direct'
                     });
                     
                     const response = await gotScraping(options);
@@ -798,16 +801,18 @@ async function main() {
         log.info('🚀 Starting Caterer.com scraper:', { 
             startUrl: initialUrl,
             target: RESULTS_WANTED,
-            maxPages: MAX_PAGES 
+            maxPages: MAX_PAGES,
+            useProxy
         });
 
-        // Test connection first
-        log.info('🔄 Testing connection...');
-        const testHtml = await makeRequest('https://www.caterer.com/', 'https://www.google.co.uk/', 3, true);
-        if (!testHtml) {
-            throw new Error('Unable to connect to caterer.com - all connection attempts failed');
+        // Warm up with homepage (optional - won't fail if unsuccessful)
+        log.info('🔄 Warming up...');
+        const testHtml = await makeRequest('https://www.caterer.com/', 'https://www.google.co.uk/', 2, true);
+        if (testHtml) {
+            log.info('✓ Homepage loaded', { length: testHtml.length });
+        } else {
+            log.warning('⚠ Homepage request failed, will proceed anyway');
         }
-        log.info('✓ Connection test successful', { responseLength: testHtml.length });
         await humanDelay(2000, 4000);
 
         // Process list pages
@@ -824,16 +829,37 @@ async function main() {
             }
             
             const referer = pageNum === 1 ? 'https://www.caterer.com/' : initialUrl;
-            let html = await makeRequest(currentUrl, referer, 5, true);
+            let html = await makeRequest(currentUrl, referer, 6, true);
             
             if (!html) {
                 log.warning(`❌ Failed to fetch page ${pageNum}, will retry after delay`);
-                // Try once more with even longer delay
+                // Try once more with even longer delay and definitely no proxy
                 await humanDelay(20000, 30000);
-                html = await makeRequest(currentUrl, referer, 5, true);
+                useProxy = false; // Force disable proxy for retry
+                html = await makeRequest(currentUrl, referer, 6, true);
                 if (!html) {
-                    log.error('Stopping: Unable to fetch list page after all attempts');
-                    break;
+                    // If this is the first page and we can't get it, try alternative URL
+                    if (pageNum === 1) {
+                        log.warning('Trying alternative approach: direct jobs page');
+                        const altUrl = 'https://www.caterer.com/jobs';
+                        await humanDelay(10000, 15000);
+                        html = await makeRequest(altUrl, 'https://www.google.co.uk/', 6, true);
+                        if (html) {
+                            currentUrl = altUrl;
+                        }
+                    }
+                    
+                    if (!html) {
+                        log.error('Unable to fetch page after all attempts');
+                        if (pageNum === 1) {
+                            log.error('Could not fetch first page - stopping');
+                            break;
+                        } else {
+                            log.warning('Skipping to next page');
+                            pageNum++;
+                            continue;
+                        }
+                    }
                 }
             }
             
