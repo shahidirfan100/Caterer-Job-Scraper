@@ -24,6 +24,9 @@ try {
         collectDetails,
     });
 
+    // Code version log to ensure correct build is running
+    Actor.log.info('Actor code version', { version: 'main_v2', date: new Date().toISOString() });
+
     // Use Apify's proxy configuration - with fallback
     let proxyConfiguration;
     try {
@@ -111,7 +114,7 @@ try {
         
         // Add custom headers before each request for stealth
         preNavigationHooks: [
-            async ({ request, session }, gotoOptions) => {
+            async ({ request, session, log }, gotoOptions) => {
                 const headers = headerGenerator.getHeaders({
                     httpVersion: '2',
                     operatingSystems: ['windows'],
@@ -129,11 +132,16 @@ try {
                 headers['sec-fetch-user'] = '?1';
                 headers['upgrade-insecure-requests'] = '1';
                 
-                // Apply headers to request
-                if (!request.headers) {
-                    request.headers = {};
-                }
-                Object.assign(request.headers, headers);
+                // Apply headers to the navigation options (this applies to HTTP requests)
+                gotoOptions.headers = Object.assign({}, gotoOptions.headers || {}, headers);
+
+                // Debug log to help understand what headers and UA are applied
+                const ua = headers['user-agent'] || headers['User-Agent'] || headers['userAgent'] || 'unknown';
+                Actor.log.info('PreNavigationHooks - applying headers', {
+                    url: request.url,
+                    sessionId: session?.id,
+                    ua: String(ua).substring(0, 100),
+                });
             },
         ],
         
@@ -148,7 +156,8 @@ try {
         ],
 
         async requestHandler({ request, $, crawler: crawlerInstance, log, session, response }) {
-            const { label, pageNum = 1 } = request.userData;
+            try {
+                const { label, pageNum = 1 } = request.userData;
             
             // Get HTML content for logging and block detection
             const html = $.html();
@@ -203,6 +212,16 @@ try {
 
             if (label === 'LIST') {
                 stats.listPagesProcessed++;
+                Actor.log.info('Selector counts', {
+                    h2_job_a: $('h2 a[href*="/job/"]').length,
+                    a_job: $('a[href*="/job/"]').length,
+                    h2_all: $('h2').length,
+                });
+                
+                // Log a couple of samples (safe and truncated)
+                const sampleH2 = $('h2 a[href*="/job/"]').slice(0, 3).map((_, el) => $(el).text().trim()).get();
+                const sampleAJob = $('a[href*="/job/"]').slice(0, 3).map((_, el) => $(el).text().trim()).get();
+                Actor.log.info('Selector samples', { sampleH2, sampleAJob });
                 
                 // Extract jobs from list page
                 const jobs = [];
@@ -416,6 +435,14 @@ try {
                 savedCount++;
                 stats.jobsSaved++;
                 log.info(`✓ Saved job ${savedCount}/${results_wanted}: ${job.title}`);
+            }
+            } catch (err) {
+                Actor.log.error('RequestHandler error', {
+                    url: request.url,
+                    message: err.message,
+                    stack: err.stack,
+                });
+                throw err;
             }
         },
 
