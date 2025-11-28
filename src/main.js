@@ -134,9 +134,9 @@ await Actor.main(async () => {
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
         maxRequestsPerCrawl: max_pages * 40,
-        maxRequestRetries: 2,
-        requestHandlerTimeoutSecs: 75,
-        navigationTimeoutSecs: 35,
+        maxRequestRetries: 4,
+        requestHandlerTimeoutSecs: 90,
+        navigationTimeoutSecs: 45,
         maxConcurrency: 2,
         useSessionPool: true,
         sessionPoolOptions: {
@@ -153,7 +153,11 @@ await Actor.main(async () => {
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--lang=en-GB,en-US',
+                    '--disable-http2',
+                    '--disable-features=UseChromeHttpsFirstMode',
+                    '--disable-features=UseDnsHttpsSvcb',
                 ],
+                ignoreHTTPSErrors: true,
             },
         },
         preNavigationHooks: [
@@ -353,6 +357,9 @@ await Actor.main(async () => {
             const retryCount = request.retryCount ?? 0;
             crawlerLog.error('Request failed', { url: request.url, error: error.message, retryCount });
             session?.retire();
+            if (retryCount >= 2) {
+                await Actor.setValue(`FAILED_${Date.now()}.txt`, `URL: ${request.url}\nError: ${error.message}\nStack: ${error.stack ?? ''}`);
+            }
         },
     });
 
