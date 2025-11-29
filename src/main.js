@@ -1,368 +1,393 @@
-import { Actor, log } from 'apify';
-import { CheerioCrawler } from 'crawlee';
-import { chromium } from 'playwright';
-
-// ---------- Helpers ----------
+// src/main.js
+import { Actor, log, Dataset } from 'apify';
+import { PlaywrightCrawler, RequestQueue } from 'crawlee';
 
 /**
- * Normalize whitespace and strip weird CSS fragments (from inline styles leaking into text).
+ * Small helpers
  */
-const cleanText = (text) => {
-    if (!text) return '';
-    let out = text
-        .replace(/\s+/g, ' ')              // collapse whitespace
-        .replace(/\u00A0/g, ' ')           // non-breaking space
-        .trim();
-
-    // Strip common ".res-xxxxx{...}" / ".job-ad-display-xxx{...}" CSS blobs that sometimes leak into text.
-    out = out.replace(/\.res-[^{]+{[^}]*}/g, '')
-             .replace(/\.job-[^{]+{[^}]*}/g, '')
-             .replace(/#no-js-image-[^:]+: [^}]+}/g, '')
-             .replace(/\s+/g, ' ')
-             .trim();
-
-    return out;
+const cleanText = (val) => {
+    if (!val) return null;
+    return val.replace(/\s+/g, ' ').trim() || null;
 };
 
-const parsePostedDate = (text) => {
-    if (!text) return null;
-    const trimmed = cleanText(text.toLowerCase());
-    const now = new Date();
+const guessStartUrl = ({ keyword, location, startUrl }) => {
+    if (startUrl && startUrl.trim()) return startUrl.trim();
 
-    const justDate = (d) => d.toISOString();
-
-    if (trimmed.includes('today')) return justDate(now);
-    if (trimmed.includes('yesterday')) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - 1);
-        return justDate(d);
-    }
-    const m = trimmed.match(/(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago/);
-    if (m) {
-        const value = Number(m[1]);
-        const unit = m[2];
-        const d = new Date(now);
-        const mult = (unit === 'minute' ? 1 :
-                      unit === 'hour' ? 60 :
-                      unit === 'day' ? 60 * 24 :
-                      unit === 'week' ? 60 * 24 * 7 :
-                      unit === 'month' ? 60 * 24 * 30 :
-                      60 * 24 * 365);
-        d.setMinutes(d.getMinutes() - value * mult);
-        return justDate(d);
-    }
-    return null;
+    const base = 'https://www.caterer.com/jobs/search';
+    const params = new URLSearchParams();
+    if (keyword) params.set('keywords', keyword.trim());
+    if (location) params.set('location', location.trim());
+    const url = `${base}?${params.toString()}`;
+    return url;
 };
 
-const buildSearchUrl = (keyword, location, pageNum = 1) => {
-    const base = 'https://www.caterer.com/jobs';
-    const parts = [];
-
-    if (keyword && keyword.trim()) {
-        // Keyword portion
-        const kw = keyword.trim().toLowerCase().replace(/\s+/g, '-');
-        parts.push(encodeURIComponent(kw));
-    }
-
-    if (location && location.trim()) {
-        // Location can be appended after keyword with a hyphen, Caterer is quite forgiving in URLs.
-        const loc = location.trim().toLowerCase().replace(/\s+/g, '-');
-        if (parts.length) {
-            parts[parts.length - 1] += `-${encodeURIComponent(loc)}`;
-        } else {
-            parts.push(encodeURIComponent(loc));
-        }
-    }
-
-    const path = parts.length ? `/${parts.join('/')}` : '';
-    const url = new URL(base + path);
-    if (keyword && !url.searchParams.has('keywords')) url.searchParams.set('keywords', keyword);
-    if (location && !url.searchParams.has('location')) url.searchParams.set('location', location);
-    if (pageNum > 1) url.searchParams.set('page', String(pageNum));
-
+const buildNextPageUrl = (currentUrl, nextPageNum) => {
+    const url = new URL(currentUrl);
+    // Caterer uses ?page=2 on listing URLs
+    url.searchParams.set('page', String(nextPageNum));
     return url.toString();
 };
 
 /**
- * Extract jobs from listing page DOM using Caterer.com structure.
- * We rely on `data-at` attributes for clean fields.
- * This only uses listing pages (no slow detail pages).
+ * Extract jobs from a listing page using ONLY browser DOM & text,
+ * no external libraries (robust against CSS noise).
+ *
+ * We deliberately:
+ *  - Take title from the <a> text only (no CSS junk).
+ *  - Derive company/location/salary/description from innerText lines.
  */
-const extractJobsFromListing = ($, pageUrl) => {
-    const jobs = [];
+const extractJobsFromListingPage = async (page, requestUrl) => {
+    return page.evaluate((pageUrl) => {
+        const jobs = [];
 
-    // Primary selector (this worked in your Playwright version).
-    const cards = $('[data-at="job-item"]');
+        const jobAnchors = Array
+            .from(document.querySelectorAll('h2 a[href*="/job/"]'))
+            // avoid header links or recommended widgets if possible
+            .filter((a) => a.href.includes('/job/'));
 
-    // Fallback for when the data-at structure changes:
-    if (cards.length === 0) {
-        const headings = $('h2, h3').filter((_, el) => {
-            const txt = cleanText($(el).text());
-            return txt && !/filters|related jobs|locations|salaries/i.test(txt);
-        });
+        for (const anchor of jobAnchors) {
+            // Try to get a reasonable "card" container
+            const card =
+                anchor.closest('article') ||
+                anchor.closest('li') ||
+                anchor.closest('[class*="job"]') ||
+                anchor.parentElement?.parentElement ||
+                anchor.parentElement;
 
-        headings.each((_, el) => {
-            const h = $(el);
-            const titleLink = h.find('a[href*="/job/"]').first();
-            const href = titleLink.attr('href') || '';
-            if (!href) return;
+            if (!card) continue;
 
-            const titleRaw = cleanText(titleLink.text() || h.text());
-            const url = new URL(href, pageUrl).toString();
+            const title = anchor.innerText || anchor.textContent || '';
+            const url = anchor.href;
 
-            const company = cleanText(h.nextAll().eq(0).text());
-            const location = cleanText(h.nextAll().eq(1).text());
-            const salary = cleanText(h.nextAll().eq(2).text());
-            const snippet = cleanText(h.nextAll().eq(3).text());
-            const postedText = cleanText(
-                h.nextAll('span, time, p')
-                    .filter((_, el2) => /posted|minute|hour|day|week|month|year|recently/i.test($(el2).text()))
-                    .first()
-                    .text()
-            );
+            // All text lines from the card
+            const linesRaw = (card.innerText || '')
+                .split('\n')
+                .map((l) => l.trim())
+                .filter((l) => !!l);
+
+            if (!linesRaw.length) continue;
+
+            // Normalize & de-duplicate consecutive duplicates
+            const lines = [];
+            for (const line of linesRaw) {
+                if (lines.length === 0 || lines[lines.length - 1] !== line) {
+                    lines.push(line);
+                }
+            }
+
+            // 0 = title
+            const titleLine = title.trim();
+            if (!titleLine) continue;
+
+            // Find index of our title in lines, then derive fields from subsequent lines.
+            const titleIdx = lines.findIndex((l) => l === titleLine);
+            if (titleIdx === -1) continue;
+
+            // Heuristic: company is next non-money line
+            let company = null;
+            let location = null;
+            let salary = null;
+            let postedAt = null;
+            let description = null;
+
+            const isMoneyLine = (line) =>
+                /£|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
+
+            const isPostedLine = (line) =>
+                /\b(ago|Today|Yesterday)\b/i.test(line);
+
+            // Company guess
+            for (let i = titleIdx + 1; i < lines.length; i++) {
+                const line = lines[i];
+                if (isMoneyLine(line) || isPostedLine(line)) continue;
+                company = line;
+                break;
+            }
+
+            // Location guess: first line after company that looks like a place
+            const companyIdx = company ? lines.indexOf(company, titleIdx + 1) : -1;
+            for (let i = companyIdx + 1; i < lines.length; i++) {
+                const line = lines[i];
+                if (isMoneyLine(line) || isPostedLine(line)) continue;
+                // crude location heuristic: comma or postcode-like or capitalised words
+                if (
+                    /[A-Z]{1,2}\d[\dA-Z]? ?\d[A-Z]{2}/.test(line) || // UK postcode-ish
+                    line.includes(',') ||
+                    /\b(UK|London|Manchester|Birmingham|Scotland|Wales|England)\b/i.test(line)
+                ) {
+                    location = line;
+                    break;
+                }
+            }
+
+            // Salary: first money-like line after location
+            const locIdx = location ? lines.indexOf(location, (companyIdx + 1) || 0) : companyIdx;
+            for (let i = locIdx + 1; i < lines.length; i++) {
+                const line = lines[i];
+                if (isMoneyLine(line)) {
+                    salary = line;
+                    break;
+                }
+            }
+
+            // Posted at: first "x hours ago" type line near bottom
+            for (let i = lines.length - 1; i >= 0; i--) {
+                if (isPostedLine(lines[i])) {
+                    postedAt = lines[i];
+                    break;
+                }
+            }
+
+            // Description: lines between salary and "more"/posted line
+            const descLines = [];
+            const salaryIdx = salary ? lines.indexOf(salary) : -1;
+            const stopTokens = ['more', 'NEW', 'FEATURED', 'NEWFEATURED'];
+
+            if (salaryIdx !== -1) {
+                for (let i = salaryIdx + 1; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (
+                        stopTokens.includes(line.toUpperCase()) ||
+                        isPostedLine(line)
+                    ) break;
+
+                    // Avoid duplicating the salary line or pure labels
+                    if (!isMoneyLine(line)) {
+                        descLines.push(line);
+                    }
+                }
+            }
+
+            const uniqDescLines = Array.from(new Set(descLines));
+            const descriptionText = uniqDescLines.join(' ');
 
             jobs.push({
-                title: titleRaw || null,
+                title: titleLine,
                 url,
+                // no access to process.env here, but send current page URL for debugging
+                listingPageUrl: pageUrl,
                 company: company || null,
                 location: location || null,
                 salary: salary || null,
-                description_snippet: snippet || null,
-                posted_text: postedText || null,
-                posted_at: parsePostedDate(postedText),
-                source_list_url: pageUrl,
+                description: descriptionText || null,
+                postedAt: postedAt || null,
             });
-        });
+        }
 
         return jobs;
-    }
-
-    // Normal path with `data-at` attributes
-    cards.each((_, el) => {
-        const card = $(el);
-
-        const titleEl = card.find('[data-at="job-title"], a[href*="/job/"]').first();
-        const href = titleEl.attr('href') || '';
-        if (!href) return;
-
-        let titleRaw = cleanText(titleEl.text());
-        if (!titleRaw) {
-            titleRaw = cleanText(card.find('h2, h3').first().text());
-        }
-
-        const url = new URL(href, pageUrl).toString();
-
-        const company = cleanText(
-            card.find('[data-at="job-company-name"]').first().text()
-            || card.find('a[href*="/jobs/"]').first().text()
-        ) || null;
-
-        const location = cleanText(
-            card.find('[data-at="job-location"]').first().text()
-            || card.find('span:contains("London"), span:contains("UK")').first().text()
-        ) || null;
-
-        let salary = cleanText(
-            card.find('[data-at="job-salary"]').first().text()
-        );
-
-        // If salary accidentally contains other fields, try to trim to the currency portion.
-        if (salary && !/[£€$]/.test(salary) && /(per\s+(hour|annum|year|day))/i.test(card.text())) {
-            const txt = cleanText(card.text());
-            const match = txt.match(/([£€$].+?(?:per\s+(?:hour|annum|year|day)|pa|hourly))/i);
-            if (match) salary = cleanText(match[1]);
-        }
-
-        const snippet = cleanText(
-            card.find('[data-at="job-description"], [data-at="job-snippet"]').first().text()
-            || card.find('p').first().text()
-        ) || null;
-
-        const postedText = cleanText(
-            card.find('[data-at="job-posted-date"], time').first().text()
-        ) || null;
-
-        jobs.push({
-            title: titleRaw || null,
-            url,
-            company,
-            location,
-            salary: salary || null,
-            description_snippet: snippet,
-            posted_text: postedText,
-            posted_at: parsePostedDate(postedText),
-            source_list_url: pageUrl,
-        });
-    });
-
-    return jobs;
+    }, requestUrl);
 };
 
-// ---------- Main ----------
-
+/**
+ * MAIN
+ */
 await Actor.main(async () => {
     const input = (await Actor.getInput()) || {};
 
     const {
         keyword = '',
         location = '',
-        startUrl = '',
+        startUrl: inputStartUrl = '',
         results_wanted = 50,
         max_pages = 20,
-        collectDetails = true,          // Kept for compatibility, but we only use listing description for speed.
-        useBrowserHandshake = true,
-        maxConcurrency = 10,            // HTTP-only, we can go fairly high.
+        maxConcurrency = 4,
+        collectDetails = true, // kept for compatibility but NOT used (we already have description from list)
+        proxyConfiguration: proxyInput,
     } = input;
 
-    const target = Number(results_wanted) > 0 ? Number(results_wanted) : 50;
+    const targetResults = Number.isFinite(results_wanted) && results_wanted > 0
+        ? results_wanted
+        : 50;
 
-    // Decide first listing URL
-    const initialUrl = startUrl && startUrl.trim()
-        ? startUrl.trim()
-        : buildSearchUrl(keyword, location, 1);
+    const maxPages = Number.isFinite(max_pages) && max_pages > 0
+        ? max_pages
+        : 20;
 
-    log.info('Starting Caterer.com hybrid HTTP scraper (Playwright handshake + CheerioCrawler)', {
+    const startUrl = guessStartUrl({ keyword, location, startUrl: inputStartUrl });
+
+    log.info('Starting Caterer.com PlaywrightCrawler scraper (listing-only & fast)', {
         keyword,
         location,
-        startUrl: initialUrl,
-        results_wanted: target,
-        max_pages,
-        collectDetails,
+        startUrl,
+        results_wanted: targetResults,
+        max_pages: maxPages,
         maxConcurrency,
-        useBrowserHandshake,
+        collectDetails,
     });
 
-    // Proxy configuration (reuses your existing Apify proxy settings)
-    const proxyConfiguration = await Actor.createProxyConfiguration().catch((err) => {
-        log.warning('Proxy not configured, continuing without Apify proxy.', { error: err?.message });
-        return undefined;
+    const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {});
+    log.info('Proxy configured', { usingCustom: !!proxyInput });
+
+    const requestQueue = await RequestQueue.open();
+    await requestQueue.addRequest({
+        url: startUrl,
+        userData: {
+            label: 'LIST',
+            pageNum: 1,
+        },
     });
 
-    // ---------- Optional Playwright handshake (1 page only) ----------
-    if (useBrowserHandshake) {
-        try {
-            const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : null;
+    let jobsSaved = 0;
 
-            const browser = await chromium.launch({
-                headless: true,
-                args: [
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                ],
-                proxy: proxyUrl ? { server: proxyUrl } : undefined,
-            });
-
-            const context = await browser.newContext({
-                viewport: { width: 1366, height: 768 },
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
-                locale: 'en-GB',
-            });
-
-            const page = await context.newPage();
-            log.info('Playwright handshake: navigating to start URL via full browser', { url: initialUrl });
-
-            await page.goto(initialUrl, {
-                waitUntil: 'domcontentloaded',
-                timeout: 20000,
-            });
-
-            // Small wait for potential anti-bot JS to run, then close. We do not keep cookies; HTTP scraper will be used afterwards.
-            await page.waitForTimeout(2000);
-
-            await browser.close();
-            log.info('Playwright handshake completed, continuing with fast HTTP-only scraper.');
-        } catch (err) {
-            log.warning('Playwright handshake failed, continuing with HTTP-only scraper.', { error: err?.message || String(err) });
-        }
-    }
-
-    // ---------- Fast HTTP scraping with CheerioCrawler ----------
-    const stats = {
-        pagesVisited: 0,
-        pagesQueued: 0,
-        jobsFromPages: 0,
-        jobsSaved: 0,
-    };
-
-    const seenUrls = new Set();
-
-    const crawler = new CheerioCrawler({
+    const crawler = new PlaywrightCrawler({
+        requestQueue,
         proxyConfiguration,
-        // CheerioCrawler internally uses got-scraping + browser-like headers and per-session fingerprints.
+        maxConcurrency,
+        navigationTimeoutSecs: 25,
+        maxRequestRetries: 2,
         useSessionPool: true,
         persistCookiesPerSession: true,
-        maxConcurrency,
-        maxRequestRetries: 2,
-        requestHandlerTimeoutSecs: 45,
 
-        async requestHandler({ request, $, response, session, proxyInfo }) {
-            const { pageNum = 1 } = request.userData;
-            stats.pagesVisited += 1;
+        // Make it stealthy and light
+        browserPoolOptions: {
+            // Use real-world fingerprints
+            fingerprintOptions: {
+                useFingerprintCache: true,
+                fingerprintCacheSize: 5000,
+                fingerprintGeneratorOptions: {
+                    devices: ['desktop'],
+                    browsers: ['chrome'],
+                    operatingSystems: ['windows', 'macos'],
+                },
+            },
+        },
 
-            const url = request.loadedUrl || request.url;
-            log.info('Processing listing page', { url, pageNum });
+        launchContext: {
+            launchOptions: {
+                headless: true,
+                viewport: { width: 1280, height: 800 },
+            },
+        },
 
-            const jobs = extractJobsFromListing($, url);
-            stats.jobsFromPages += jobs.length;
+        preNavigationHooks: [
+            async ({ page, request, session }, gotoOptions) => {
+                // Block junk resources
+                await page.route('**/*', (route) => {
+                    const r = route.request();
+                    const type = r.resourceType();
+                    const url = r.url();
 
-            const remaining = target - stats.jobsSaved;
-            const slice = remaining < jobs.length ? jobs.slice(0, remaining) : jobs;
+                    if (
+                        ['image', 'media', 'font', 'stylesheet'].includes(type) ||
+                        url.includes('google-analytics.com') ||
+                        url.includes('doubleclick.net') ||
+                        url.includes('facebook.com/tr') ||
+                        url.includes('hotjar.com') ||
+                        url.includes('segment.io')
+                    ) {
+                        return route.abort();
+                    }
 
-            for (const job of slice) {
-                if (seenUrls.has(job.url)) continue;
-                seenUrls.add(job.url);
+                    return route.continue();
+                });
 
-                await Actor.pushData(job);
-                stats.jobsSaved += 1;
+                gotoOptions.waitUntil = 'domcontentloaded';
+                gotoOptions.timeout = 25000;
+            },
+        ],
 
-                if (stats.jobsSaved >= target) {
-                    log.info('Target job count reached, stopping crawler.', { target });
-                    // Abort the crawler gracefully – no more pages fetched.
-                    await crawler.autoscaledPool?.abort();
-                    break;
-                }
+        async requestHandler({ page, request, log: crawlerLog }) {
+            const { label, pageNum } = request.userData;
+            if (label !== 'LIST') {
+                crawlerLog.info('Unknown label, skipping', { label, url: request.url });
+                return;
             }
 
-            // Pagination: only enqueue next page if we still need more jobs
-            if (stats.jobsSaved < target && pageNum < max_pages) {
-                const nextPage = pageNum + 1;
-                const nextUrl = startUrl && startUrl.trim()
-                    ? (() => {
-                        const urlObj = new URL(startUrl.trim());
-                        urlObj.searchParams.set('page', String(nextPage));
-                        return urlObj.toString();
-                    })()
-                    : buildSearchUrl(keyword, location, nextPage);
+            const currentPageNum = pageNum || 1;
 
-                stats.pagesQueued += 1;
-                await crawler.addRequests([
+            // Hard stop if we already have enough jobs
+            if (jobsSaved >= targetResults) {
+                crawlerLog.info('Target results already reached, skipping request', {
+                    url: request.url,
+                    jobsSaved,
+                    targetResults,
+                });
+                return;
+            }
+
+            crawlerLog.info('Processing listing page', {
+                url: request.url,
+                pageNum: currentPageNum,
+            });
+
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+            // Wait for at least one job heading to appear
+            await page.waitForTimeout(1000); // small delay to allow SSR content to stabilise
+
+            const jobsOnPage = await extractJobsFromListingPage(page, request.url);
+            const remaining = targetResults - jobsSaved;
+            const toTake = Math.min(remaining, jobsOnPage.length);
+
+            const jobsToSave = jobsOnPage.slice(0, toTake).map((job) => ({
+                ...job,
+                // include some INPUT metadata in each item
+                searchKeyword: keyword || null,
+                searchLocation: location || null,
+            }));
+
+            if (jobsToSave.length) {
+                await Dataset.pushData(jobsToSave);
+                jobsSaved += jobsToSave.length;
+
+                crawlerLog.info(
+                    `Saved ${jobsToSave.length} jobs from page ${currentPageNum}/${maxPages}`,
                     {
-                        url: nextUrl,
-                        userData: { pageNum: nextPage },
+                        url: request.url,
+                        pageNum: currentPageNum,
+                        jobsSaved,
+                        targetResults,
                     },
-                ]);
+                );
+            } else {
+                crawlerLog.warning('No jobs extracted from listing page', {
+                    url: request.url,
+                    pageNum: currentPageNum,
+                });
+            }
 
-                log.info('Queued next listing page', { nextPage, nextUrl });
+            // Pagination: only queue next page if:
+            //  - We still need more results
+            //  - We haven't hit max_pages yet
+            if (jobsSaved < targetResults && currentPageNum < maxPages) {
+                const nextPageNum = currentPageNum + 1;
+                const nextUrl = buildNextPageUrl(request.url, nextPageNum);
+
+                await requestQueue.addRequest({
+                    url: nextUrl,
+                    userData: {
+                        label: 'LIST',
+                        pageNum: nextPageNum,
+                    },
+                });
+
+                crawlerLog.info('Queued next listing page', {
+                    nextPage: nextPageNum,
+                    nextUrl,
+                });
+            } else {
+                crawlerLog.info('Pagination finished or target reached', {
+                    pageNum: currentPageNum,
+                    jobsSaved,
+                    targetResults,
+                    max_pages: maxPages,
+                });
             }
         },
 
-        async failedRequestHandler({ request, error, session, proxyInfo }) {
-            log.warning('Listing request failed', {
+        failedRequestHandler: async ({ request, error, log: crawlerLog }) => {
+            // Mark session as bad for PlaywrightCrawler so it rotates proxy/fingerprint
+            crawlerLog.error('Request failed after retries', {
                 url: request.url,
-                error: error?.message || String(error),
-                retries: request.retryCount,
+                message: error?.message || String(error),
             });
         },
     });
 
-    await crawler.run([
-        { url: initialUrl, userData: { pageNum: 1 } },
-    ]);
+    await crawler.run();
 
-    log.info('Scraping finished', {
-        jobsSaved: stats.jobsSaved,
-        target,
-        stats,
+    log.info('Scraping completed', {
+        jobsSaved,
+        targetResults,
     });
 });
