@@ -1,10 +1,18 @@
 // src/main.js
 import { Actor, log } from 'apify';
+import { PlaywrightCrawler } from 'crawlee';
 import { chromium } from 'playwright';
 
 const BASE_URL = 'https://www.caterer.com';
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+const looksBlockedHtml = (html) => {
+    const lower = html.toLowerCase();
+    return ['captcha', 'access denied', 'verify you are a human', 'unusual traffic'].some((s) =>
+        lower.includes(s),
+    );
+};
 
 /**
  * Parse relative posted dates like "3 days ago", "1 week ago".
@@ -48,15 +56,11 @@ const buildSearchUrl = (keyword, location, page = 1) => {
 };
 
 /**
- * Build URL for the next page by setting ?page=N on top of the original start URL.
+ * Build URL for the next page by setting ?page=N on top of current URL.
  */
-const buildNextPageUrl = (startUrl, pageNum) => {
-    const url = new URL(startUrl);
-    if (pageNum > 1) {
-        url.searchParams.set('page', String(pageNum));
-    } else {
-        url.searchParams.delete('page');
-    }
+const buildNextPageUrl = (currentUrl, nextPageNum) => {
+    const url = new URL(currentUrl);
+    url.searchParams.set('page', String(nextPageNum));
     return url.href;
 };
 
@@ -99,48 +103,6 @@ const dismissPopups = async (page) => {
     }
 };
 
-const looksBlockedHtml = (html) => {
-    const lower = html.toLowerCase();
-    return ['captcha', 'access denied', 'verify you are a human', 'unusual traffic'].some((s) =>
-        lower.includes(s),
-    );
-};
-
-/**
- * Robust goto with retries for transient transport errors like ERR_EMPTY_RESPONSE.
- */
-const gotoWithRetries = async (page, url, maxRetries = 3) => {
-    let lastError;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            log.info('Navigating', { url, attempt });
-            const res = await page.goto(url, {
-                waitUntil: 'domcontentloaded',
-                timeout: 30000,
-            });
-            return res;
-        } catch (err) {
-            lastError = err;
-            const msg = (err && err.message) || '';
-            log.warning('Navigation failed', { url, attempt, message: msg });
-
-            // Only retry for likely network / transport errors
-            if (
-                !msg.includes('ERR_EMPTY_RESPONSE') &&
-                !msg.includes('ERR_CONNECTION_RESET') &&
-                !msg.includes('ETIMEDOUT')
-            ) {
-                break;
-            }
-
-            if (attempt < maxRetries) {
-                await sleep(1000 + Math.floor(Math.random() * 1000));
-            }
-        }
-    }
-    throw lastError;
-};
-
 /**
  * Extract jobs from listing page via JS state + DOM fallback.
  */
@@ -148,7 +110,6 @@ const extractJobsFromListingPage = async (page) => {
     return page.evaluate(() => {
         const jobs = [];
         const seen = new Set();
-
         const urlObj = new URL(location.href);
 
         const pushJob = (job) => {
@@ -157,6 +118,9 @@ const extractJobsFromListingPage = async (page) => {
             seen.add(job.url);
             jobs.push(job);
         };
+
+        const cleanText = (node) =>
+            node.textContent?.replace(/\s+/g, ' ').trim() || '';
 
         // 1) JS state (preferred – clean title, companyName, salary, location)
         try {
@@ -179,10 +143,10 @@ const extractJobsFromListingPage = async (page) => {
                     description_html: null,
                     description_text: null,
                     raw_date: null,
+                    fromState: true,
                 });
             }
 
-            // Sometimes main results are in a "SearchListing" slice
             const searchProps = state?.SearchListing?.props;
             const searchItems = searchProps?.jobAdsData?.items || [];
             for (const item of searchItems) {
@@ -199,15 +163,15 @@ const extractJobsFromListingPage = async (page) => {
                     description_html: null,
                     description_text: null,
                     raw_date: null,
+                    fromState: true,
                 });
             }
         } catch {
             // ignore and rely on DOM fallback
         }
 
-        // 2) DOM fallback if JS state gave nothing or only partial
+        // 2) DOM fallback if JS state gave nothing
         if (!jobs.length) {
-            // Clean up style/script/noscript
             document.querySelectorAll('style,script,noscript').forEach((el) => el.remove());
 
             const anchors = Array.from(
@@ -299,6 +263,7 @@ const extractJobsFromListingPage = async (page) => {
                     description_html: null,
                     description_text: null,
                     raw_date,
+                    fromState: false,
                 });
             }
         }
@@ -415,7 +380,6 @@ const extractJobDetailFromPage = async (page) => {
             }
         }
 
-        // Try to find a "posted x days ago" text for date
         if (!result.date_posted) {
             const txtNode = Array.from(
                 document.querySelectorAll('span, p, li, div'),
@@ -443,7 +407,7 @@ await Actor.main(async () => {
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('Starting Caterer.com Playwright scraper (no Crawlee)', {
+    log.info('Starting Caterer.com PlaywrightCrawler scraper', {
         keyword,
         location,
         startUrl: startUrlToUse,
@@ -456,9 +420,7 @@ await Actor.main(async () => {
     const hasProxyCredentials =
         Boolean(proxyFromInput) || process.env.APIFY_PROXY_PASSWORD || process.env.APIFY_TOKEN;
 
-    let proxyConfiguration = null;
-    let proxyUrl = null;
-
+    let proxyConfiguration;
     if (hasProxyCredentials) {
         try {
             proxyConfiguration = await Actor.createProxyConfiguration(
@@ -467,149 +429,214 @@ await Actor.main(async () => {
                     countryCode: 'GB',
                 },
             );
-            proxyUrl = await proxyConfiguration.newUrl();
             log.info('Proxy configured', { usingCustom: Boolean(proxyFromInput) });
         } catch (proxyError) {
-            log.warning('Proxy setup failed, continuing without proxy', {
-                error: proxyError.message,
-            });
+            log.warning('Proxy setup failed, continuing without proxy', { error: proxyError.message });
         }
     } else {
         log.info('No Apify proxy credentials detected, running without proxy');
     }
 
     const stats = {
-        listPagesVisited: 0,
+        listPagesProcessed: 0,
+        listPagesBlocked: 0,
         listPagesFailed: 0,
-        detailPagesVisited: 0,
+        detailPagesProcessed: 0,
         detailPagesFailed: 0,
+        detailBlocked: 0,
         jobsFromState: 0,
         jobsFromDom: 0,
         jobsSaved: 0,
-        detailBlocked403: 0,
-        blockedPages: 0,
     };
 
     const savedUrls = new Set();
     let savedCount = 0;
 
-    const fp = randomFingerprint();
-
-    const browser = await chromium.launch({
-        headless: true,
-        proxy: proxyUrl ? { server: proxyUrl } : undefined,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--lang=en-GB,en-US',
-            '--disable-http2',
-            '--disable-features=UseChromeHttpsFirstMode',
-            '--disable-features=UseDnsHttpsSvcb',
-        ],
-    });
-
-    try {
-        const context = await browser.newContext({
-            userAgent: fp.ua,
-            viewport: fp.viewport,
-            ignoreHTTPSErrors: true,
-            locale: 'en-GB',
-            extraHTTPHeaders: {
-                Accept:
-                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-                Connection: 'keep-alive',
+    const crawler = new PlaywrightCrawler({
+        proxyConfiguration,
+        useSessionPool: true,
+        sessionPoolOptions: {
+            maxPoolSize: 30,
+            sessionOptions: {
+                maxUsageCount: 8,
+                maxAgeSecs: 900,
             },
-        });
+        },
 
-        const page = await context.newPage();
+        minConcurrency: 1,
+        maxConcurrency: 4,
+        maxRequestRetries: 2,
+        navigationTimeoutSecs: 40,
+        requestHandlerTimeoutSecs: 90,
 
-        await page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-GB', 'en-US', 'en'],
-            });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3],
-            });
-            // eslint-disable-next-line no-undef
-            window.chrome = { runtime: {} };
-        });
+        launchContext: {
+            launcher: chromium,
+            launchOptions: {
+                headless: true,
+                ignoreHTTPSErrors: true,
+                args: [
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--lang=en-GB,en-US',
+                    '--disable-http2',
+                    '--disable-features=UseChromeHttpsFirstMode',
+                    '--disable-features=UseDnsHttpsSvcb',
+                ],
+            },
+        },
 
-        // Block heavy resources
-        await page.route('**/*', (route) => {
-            const req = route.request();
-            const type = req.resourceType();
-            const url = req.url();
+        preNavigationHooks: [
+            async ({ page, request, session }) => {
+                const fp = randomFingerprint();
 
-            if (['image', 'media', 'font'].includes(type)) {
-                return route.abort();
-            }
-            if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(url)) {
-                return route.abort();
-            }
-            return route.continue();
-        });
+                try {
+                    await page.setViewportSize(fp.viewport);
+                } catch {}
 
-        const allJobs = [];
+                try {
+                    await page.setExtraHTTPHeaders({
+                        Accept:
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+                        Connection: 'keep-alive',
+                        Referer: BASE_URL + '/',
+                    });
+                } catch {}
 
-        for (let pageNum = 1; pageNum <= max_pages; pageNum++) {
-            if (savedCount >= results_wanted && !collectDetails) break;
+                try {
+                    await page.setUserAgent(fp.ua);
+                } catch {}
 
-            const url = buildNextPageUrl(startUrlToUse, pageNum);
-            log.info(`Processing listing page ${pageNum}/${max_pages}`, { url });
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-GB', 'en-US', 'en'],
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3],
+                    });
+                    // eslint-disable-next-line no-undef
+                    window.chrome = { runtime: {} };
+                });
 
+                await page.route('**/*', (route) => {
+                    const req = route.request();
+                    const type = req.resourceType();
+                    const url = req.url();
+
+                    if (['image', 'media', 'font'].includes(type)) {
+                        return route.abort();
+                    }
+                    if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(url)) {
+                        return route.abort();
+                    }
+                    return route.continue();
+                });
+
+                log.debug('Navigating', { url: request.url, sessionId: session?.id });
+            },
+        ],
+
+        // MAIN request handler
+        requestHandler: async ({ request, page, log: ctxLog, session, crawler }) => {
+            const { label = 'LIST', pageNum = 1, baseJob } = request.userData ?? {};
+
+            await dismissPopups(page);
+
+            const mainResponse = page.mainFrame()?.response?.();
+            let status;
             try {
-                const res = await gotoWithRetries(page, url);
-                const status = res ? res.status() : null;
+                status = await mainResponse?.status?.();
+            } catch {
+                status = undefined;
+            }
 
-                const html = await page.content();
-                if (status === 403 || looksBlockedHtml(html)) {
-                    stats.blockedPages++;
-                    log.warning('Listing page looks blocked; stopping pagination', {
-                        url,
+            const html = await page.content();
+            if (status === 403 || looksBlockedHtml(html)) {
+                if (label === 'LIST') {
+                    stats.listPagesBlocked++;
+                    ctxLog.warning('Listing page looks blocked, no further pagination', {
+                        url: request.url,
                         status,
                     });
-                    break;
+                } else {
+                    stats.detailBlocked++;
+                    stats.detailPagesFailed++;
+                    ctxLog.warning('Detail page blocked, falling back to listing data only', {
+                        url: request.url,
+                        status,
+                    });
+
+                    if (baseJob && !savedUrls.has(baseJob.url)) {
+                        const jobCopy = { ...baseJob };
+                        if (!jobCopy.date_posted && jobCopy.raw_date) {
+                            jobCopy.date_posted = parsePostedRelative(jobCopy.raw_date);
+                        }
+                        delete jobCopy.raw_date;
+
+                        const finalJob = {
+                            ...jobCopy,
+                            description_html: null,
+                            description_text: null,
+                            keyword_search: null,
+                            location_search: null,
+                            extracted_at: new Date().toISOString(),
+                        };
+
+                        await Actor.pushData(finalJob);
+                        savedUrls.add(finalJob.url);
+                        savedCount++;
+                        stats.jobsSaved++;
+                    }
                 }
 
-                await dismissPopups(page);
+                session?.retire();
+                return; // do NOT throw, let crawler continue
+            }
 
-                stats.listPagesVisited++;
+            if (label === 'LIST') {
+                if (savedCount >= results_wanted && !collectDetails) return;
+
+                stats.listPagesProcessed++;
 
                 const jobs = await extractJobsFromListingPage(page);
 
                 if (!jobs || !jobs.length) {
-                    log.info('No jobs found on listing page, stopping pagination.', {
-                        url,
+                    ctxLog.info('No jobs found on listing page, stopping pagination', {
+                        url: request.url,
                         pageNum,
                     });
-                    break;
+                    return;
                 }
 
-                const fromStateCount = jobs.filter((j) => j.job_id != null).length;
+                const fromStateCount = jobs.filter((j) => j.fromState).length;
                 const fromDomCount = jobs.length - fromStateCount;
                 stats.jobsFromState += fromStateCount;
                 stats.jobsFromDom += fromDomCount;
 
-                log.info(`Extracted ${jobs.length} jobs from listing page`, {
-                    url,
-                    pageNum,
+                ctxLog.info(`Extracted ${jobs.length} jobs on page ${pageNum}`, {
+                    url: request.url,
                     fromState: fromStateCount,
                     fromDom: fromDomCount,
                 });
 
+                const uniqueJobs = [];
+                for (const job of jobs) {
+                    if (!job.url || savedUrls.has(job.url)) continue;
+                    uniqueJobs.push(job);
+                    savedUrls.add(job.url);
+                }
+
                 if (!collectDetails) {
-                    for (const job of jobs) {
+                    for (const job of uniqueJobs) {
                         if (savedCount >= results_wanted) break;
-                        if (!job.url || savedUrls.has(job.url)) continue;
 
                         if (!job.date_posted && job.raw_date) {
                             job.date_posted = parsePostedRelative(job.raw_date);
-                            delete job.raw_date;
                         }
+                        delete job.raw_date;
 
                         const finalJob = {
                             ...job,
@@ -619,168 +646,137 @@ await Actor.main(async () => {
                         };
 
                         await Actor.pushData(finalJob);
-                        savedUrls.add(job.url);
                         savedCount++;
                         stats.jobsSaved++;
 
-                        log.info(`Saved job ${savedCount}/${results_wanted} (listing only)`, {
+                        ctxLog.info(`Saved job ${savedCount}/${results_wanted} (listing only)`, {
                             title: finalJob.title,
                             url: finalJob.url,
                         });
                     }
                 } else {
-                    for (const job of jobs) {
-                        if (!job.url || savedUrls.has(job.url)) continue;
-                        allJobs.push(job);
-                        savedUrls.add(job.url);
-                    }
-                }
+                    const detailRequests = [];
+                    for (const job of uniqueJobs) {
+                        if (savedCount + detailRequests.length >= results_wanted) break;
 
-                const needMoreListing =
-                    collectDetails || savedCount < results_wanted;
-
-                if (!needMoreListing) {
-                    break;
-                }
-
-                // Small jitter between listing pages for stealth
-                if (pageNum < max_pages) {
-                    await sleep(300 + Math.floor(Math.random() * 400));
-                }
-            } catch (err) {
-                stats.listPagesFailed++;
-                log.error('Listing page failed, stopping pagination', {
-                    url,
-                    pageNum,
-                    message: err?.message,
-                });
-                break;
-            }
-        }
-
-        // Detail scraping phase (sequential, stealthy)
-        if (collectDetails && allJobs.length) {
-            log.info('Starting detail scraping', {
-                totalJobs: allJobs.length,
-                target: results_wanted,
-            });
-
-            let detailIndex = 0;
-            for (const baseJob of allJobs) {
-                if (savedCount >= results_wanted) break;
-
-                detailIndex++;
-                log.info(`Detail ${detailIndex}/${allJobs.length}`, {
-                    url: baseJob.url,
-                });
-
-                try {
-                    const res = await gotoWithRetries(page, baseJob.url, 2);
-                    const status = res ? res.status() : null;
-                    const detailHtml = await page.content();
-
-                    if (status === 403 || looksBlockedHtml(detailHtml)) {
-                        stats.detailBlocked403++;
-                        stats.detailPagesFailed++;
-                        log.warning('Detail page blocked (403/CAPTCHA), keeping listing data', {
-                            url: baseJob.url,
-                            status,
+                        detailRequests.push({
+                            url: job.url,
+                            userData: { label: 'DETAIL', baseJob: job },
                         });
-
-                        const jobCopy = { ...baseJob };
-
-                        if (!jobCopy.date_posted && jobCopy.raw_date) {
-                            jobCopy.date_posted = parsePostedRelative(jobCopy.raw_date);
-                        }
-                        delete jobCopy.raw_date;
-
-                        const finalJob = {
-                            ...jobCopy,
-                            keyword_search: keyword || null,
-                            location_search: location || null,
-                            extracted_at: new Date().toISOString(),
-                        };
-
-                        await Actor.pushData(finalJob);
-                        savedCount++;
-                        stats.jobsSaved++;
-
-                        continue;
                     }
 
-                    await dismissPopups(page);
-
-                    stats.detailPagesVisited++;
-
-                    const detailData = await extractJobDetailFromPage(page);
-
-                    const merged = {
-                        ...baseJob,
-                        ...Object.fromEntries(
-                            Object.entries(detailData).filter(([, v]) => v != null),
-                        ),
-                    };
-
-                    if (!merged.date_posted && (merged.raw_date || detailData.raw_date)) {
-                        const parsed = parsePostedRelative(
-                            merged.raw_date || detailData.raw_date,
-                        );
-                        if (parsed) merged.date_posted = parsed;
+                    if (detailRequests.length) {
+                        await crawler.addRequests(detailRequests);
+                        ctxLog.info('Queued detail pages', {
+                            count: detailRequests.length,
+                        });
                     }
-                    delete merged.raw_date;
-
-                    const finalJob = {
-                        ...merged,
-                        keyword_search: keyword || null,
-                        location_search: location || null,
-                        extracted_at: new Date().toISOString(),
-                    };
-
-                    await Actor.pushData(finalJob);
-                    savedCount++;
-                    stats.jobsSaved++;
-
-                    log.info(`Saved job ${savedCount}/${results_wanted} (with detail)`, {
-                        title: finalJob.title,
-                        url: finalJob.url,
-                    });
-
-                    // Small delay between detail pages for stealth
-                    await sleep(300 + Math.floor(Math.random() * 500));
-                } catch (err) {
-                    stats.detailPagesFailed++;
-                    log.warning('Detail page failed, keeping listing data only', {
-                        url: baseJob.url,
-                        message: err?.message,
-                    });
-
-                    const jobCopy = { ...baseJob };
-                    if (!jobCopy.date_posted && jobCopy.raw_date) {
-                        jobCopy.date_posted = parsePostedRelative(jobCopy.raw_date);
-                    }
-                    delete jobCopy.raw_date;
-
-                    const finalJob = {
-                        ...jobCopy,
-                        description_html: null,
-                        description_text: null,
-                        keyword_search: keyword || null,
-                        location_search: location || null,
-                        extracted_at: new Date().toISOString(),
-                    };
-
-                    await Actor.pushData(finalJob);
-                    savedCount++;
-                    stats.jobsSaved++;
-
-                    await sleep(300 + Math.floor(Math.random() * 500));
                 }
-            }
-        }
 
-    } finally {
-        await browser.close().catch(() => {});
-    }
+                const needMore =
+                    collectDetails ||
+                    (savedCount < results_wanted && pageNum < max_pages);
+
+                if (needMore && pageNum < max_pages) {
+                    const nextPage = pageNum + 1;
+
+                    const hasNext = await page.evaluate((nextNum) => {
+                        const selector = `a[href*="page=${nextNum}"]`;
+                        if (document.querySelector(selector)) return true;
+                        const anchors = Array.from(document.querySelectorAll('a'));
+                        return anchors.some(
+                            (a) => a.textContent.trim() === String(nextNum),
+                        );
+                    }, nextPage);
+
+                    if (hasNext) {
+                        const nextUrl = buildNextPageUrl(request.url, nextPage);
+                        await crawler.addRequests([
+                            {
+                                url: nextUrl,
+                                userData: { label: 'LIST', pageNum: nextPage },
+                            },
+                        ]);
+                        ctxLog.info('Queued next listing page', { nextPage, nextUrl });
+                    } else {
+                        ctxLog.info('No visible next page link, stopping pagination', {
+                            pageNum,
+                        });
+                    }
+                }
+            } else if (label === 'DETAIL') {
+                if (!baseJob) return;
+                if (savedCount >= results_wanted) return;
+                if (savedUrls.has(baseJob.url) && savedCount >= results_wanted) return;
+
+                stats.detailPagesProcessed++;
+
+                await dismissPopups(page);
+                await page
+                    .waitForSelector('h1, [data-at*="job-description"], article', {
+                        timeout: 15000,
+                    })
+                    .catch(() => null);
+
+                const detailData = await extractJobDetailFromPage(page);
+
+                const merged = {
+                    ...baseJob,
+                    ...Object.fromEntries(
+                        Object.entries(detailData).filter(([, v]) => v != null),
+                    ),
+                };
+
+                if (!merged.date_posted && (merged.raw_date || detailData.raw_date)) {
+                    const parsed = parsePostedRelative(
+                        merged.raw_date || detailData.raw_date,
+                    );
+                    if (parsed) merged.date_posted = parsed;
+                }
+                delete merged.raw_date;
+
+                const finalJob = {
+                    ...merged,
+                    keyword_search: keyword || null,
+                    location_search: location || null,
+                    extracted_at: new Date().toISOString(),
+                };
+
+                await Actor.pushData(finalJob);
+                savedCount++;
+                stats.jobsSaved++;
+
+                ctxLog.info(`Saved job ${savedCount}/${results_wanted} (with detail)`, {
+                    title: finalJob.title,
+                    url: finalJob.url,
+                });
+
+                await sleep(200 + Math.floor(Math.random() * 300));
+            }
+        },
+
+        // We do NOT throw in failedRequestHandler; just log so crawler can finish.
+        failedRequestHandler: async ({ request, error, log: ctxLog }) => {
+            const { label = 'LIST' } = request.userData ?? {};
+            if (label === 'LIST') stats.listPagesFailed++;
+            else stats.detailPagesFailed++;
+
+            ctxLog.warning('Request permanently failed', {
+                url: request.url,
+                label,
+                message: error?.message,
+            });
+        },
+    });
+
+    log.info('Crawler created, starting run', { startUrl: startUrlToUse });
+
+    await crawler.run([
+        {
+            url: startUrlToUse,
+            userData: { label: 'LIST', pageNum: 1 },
+        },
+    ]);
 
     log.info('Scraping completed', {
         jobsSaved: savedCount,
