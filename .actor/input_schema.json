@@ -1,66 +1,73 @@
 {
-  "title": "Caterer Job Scraper - Production v2.0",
-  "description": "Production-grade scraper using impit (HTTP-only) with advanced stealth. Provide keyword/location OR a direct search URL. Features: fast HTTP fetching with retries, UK residential proxies, job detail scraping, and intelligent error handling.",
+  "title": "Caterer Job Scraper",
+  "description": "Scrape hospitality and catering jobs from Caterer.com. Provide either keyword/location OR a Caterer.com search URL (startUrl, url, or startUrls). Actor paginates and optionally scrapes detail pages.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
-      "title": "Start URL (Optional)",
+      "title": "Start URL",
       "type": "string",
-      "description": "Direct Caterer.com search URL. If provided, overrides keyword/location parameters.",
-      "editor": "textfield",
-      "example": "https://www.caterer.com/jobs/search?keywords=chef&location=london"
+      "description": "Start scraping from a specific Caterer.com search URL. If provided, this will be used instead of Keyword/Location.",
+      "editor": "textfield"
     },
     "keyword": {
-      "title": "Job Keyword",
+      "title": "Keyword (if not using Start URL)",
       "type": "string",
-      "description": "Job title, role, or skill keywords (e.g., 'Chef', 'Sous Chef', 'Restaurant Manager', 'Bartender')",
-      "editor": "textfield",
-      "example": "chef"
+      "description": "Job search keyword(s), e.g., 'Head Chef', 'Restaurant Manager', 'Sous Chef', 'Bartender'.",
+      "editor": "textfield"
     },
     "location": {
-      "title": "Location",
+      "title": "Location (if not using Start URL)",
       "type": "string",
-      "description": "City, region, or postcode (e.g., 'London', 'Manchester', 'Edinburgh'). Leave empty for all UK locations.",
-      "editor": "textfield",
-      "example": "london"
+      "description": "Location to search for jobs (e.g., 'London', 'Manchester', 'Birmingham'). Leave empty for all locations.",
+      "editor": "textfield"
+    },
+    "postedWithin": {
+      "title": "Jobs posted within",
+      "type": "string",
+      "description": "Only keep jobs posted within this time window.",
+      "enum": [
+        "any",
+        "24h",
+        "7d",
+        "30d"
+      ],
+      "enumTitles": [
+        "Any time",
+        "Last 24 hours",
+        "Last 7 days",
+        "Last 30 days"
+      ],
+      "default": "any"
     },
     "collectDetails": {
-      "title": "Collect Job Details",
+      "title": "Collect job details",
       "type": "boolean",
-      "description": "Fetch full job descriptions from individual job pages. Includes: descriptionHtml, descriptionText, jobType, applyUrl. (Slower but more complete data)",
+      "description": "If enabled, scraper opens job detail pages for full description and additional information.",
       "editor": "checkbox",
       "default": true
     },
     "results_wanted": {
-      "title": "Results Wanted",
+      "title": "Maximum number of jobs",
       "type": "integer",
-      "description": "Maximum number of jobs to collect (1-1000). Actor stops when this limit is reached.",
+      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
       "minimum": 1,
-      "maximum": 1000,
-      "default": 50,
+      "default": 100,
       "editor": "number"
     },
     "max_pages": {
-      "title": "Max Pages",
+      "title": "Maximum number of pages",
       "type": "integer",
-      "description": "Maximum search result pages to process (safety limit). Stops if no jobs found on a page.",
+      "description": "A safety cap on the number of search result pages to visit.",
       "minimum": 1,
-      "maximum": 50,
-      "default": 20,
-      "editor": "number"
+      "editor": "number",
+      "default": 20
     },
-    
     "proxyConfiguration": {
-      "title": "Proxy Configuration",
+      "title": "Proxy configuration",
       "type": "object",
-      "description": "⚠️ RESIDENTIAL proxies highly recommended for UK sites. Default: GB RESIDENTIAL IPs for best results.",
-      "editor": "proxy",
-      "default": {
-        "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"],
-        "apifyProxyCountry": "GB"
-      }
+      "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
+      "editor": "proxy"
     }
   },
   "required": [],

@@ -1,56 +1,11 @@
 {
     "actorOutputSchemaVersion": 1,
-    "title": "Caterer Job Scraper Output",
-    "description": "Each record represents a job listing from Caterer.com with comprehensive metadata",
+    "title": "Output schema",
     "properties": {
         "overview": {
             "type": "string",
             "title": "Overview",
             "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
-        }
-    },
-    "views": {
-        "overview": {
-            "title": "Job Listings Overview",
-            "transformation": {
-                "fields": [
-                    "title",
-                    "company",
-                    "location",
-                    "salary",
-                    "url",
-                    "postedAt"
-                ]
-            },
-            "display": {
-                "component": "table",
-                "properties": {
-                    "title": {
-                        "label": "Job Title",
-                        "format": "text"
-                    },
-                    "company": {
-                        "label": "Company",
-                        "format": "text"
-                    },
-                    "location": {
-                        "label": "Location",
-                        "format": "text"
-                    },
-                    "salary": {
-                        "label": "Salary",
-                        "format": "text"
-                    },
-                    "url": {
-                        "label": "Job URL",
-                        "format": "link"
-                    },
-                    "postedAt": {
-                        "label": "Posted",
-                        "format": "text"
-                    }
-                }
-            }
         }
     }
 }
