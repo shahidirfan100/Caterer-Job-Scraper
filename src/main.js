@@ -1,6 +1,7 @@
 import { Actor, Dataset, log } from 'apify';
 import { BasicCrawler, RequestQueue } from 'crawlee';
-import { fetch as impitFetch } from 'impit';
+import impitPkg from 'impit';
+const { fetch: impitFetch } = impitPkg;
 import * as cheerio from 'cheerio';
 
 /**
