@@ -1,30 +1,25 @@
 # Caterer Job Scraper - Hospitality & Catering Jobs 🚀
 
-> **Production-grade job scraper using impit + Playwright** - Extract comprehensive job listings from Caterer.com with advanced stealth measures, dual-strategy fetching (HTTP-first, Playwright fallback), and intelligent data extraction. The UK's leading hospitality and catering recruitment data source.
+> **Production-grade HTTP-only job scraper using impit** - Extract comprehensive job listings from Caterer.com with advanced stealth measures and intelligent data extraction. The UK's leading hospitality and catering recruitment data source.
 
 ## 🌟 What This Actor Does
 
-The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com using a **dual-strategy approach**:
-1. **Primary**: Fast HTTP fetching with **impit** (intelligent HTTP client with auto-retry and stealth)
-2. **Fallback**: Full **Playwright** browser rendering for JavaScript-heavy pages
+The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com using a fast, HTTP-first approach powered by **impit** (intelligent HTTP client with automatic retries and stealth).
 
 Built for production use with:
 - ✅ **impit** for robust HTTP fetching with automatic retries
-- ✅ **header-generator** for realistic browser fingerprinting
 - ✅ UK residential proxies with aggressive session rotation
 - ✅ Human-like behavior simulation (random delays, realistic headers)
 - ✅ Comprehensive error handling and exponential backoff
-- ✅ Dual-strategy: HTTP-first for speed, Playwright for reliability
+- ✅ HTTP-first: fast, reliable scraping without a browser
 
 ### ✨ Key Features
 
-- **🎭 Playwright Rendering**: Full browser rendering for JavaScript-heavy pages
-- **🥷 Stealth Measures**: Advanced anti-detection (webdriver bypass, fingerprinting, random delays)
+- **🥷 Stealth Measures**: Anti-detection techniques, randomized delays, and realistic request headers
 - **🌍 Residential Proxies**: UK-based residential IPs with aggressive session rotation
 - **📊 Comprehensive Data**: Job titles, companies, locations, salaries, descriptions, and dates
 - **🔄 Smart Pagination**: Automatic multi-page crawling with dynamic content detection
 - **🎯 Flexible Search**: Search by keywords, locations, or specific URLs
-- **📸 Debug Screenshots**: Automatic screenshot capture on blocks or errors
 - **⚡ Fast & Reliable**: Optimized selectors, exponential backoff, and error recovery
 
 ## 🎯 Perfect For
@@ -197,9 +192,8 @@ Here's what your dataset might look like after running the actor:
 This scraper is optimized for maximum speed and reliability when scraping Caterer.com:
 
 ### 🚀 **High-Performance Stack**
-- **Crawlee + CheerioCrawler**: Fast, memory-efficient crawling with built-in session management
-- **gotScraping**: Advanced HTTP client with automatic retries and stealth features
-- **header-generator**: Realistic browser headers to avoid detection
+ - **Crawlee BasicCrawler + cheerio**: Fast, memory-efficient crawling using HTTP-first requests and server-side parsing
+ - **impit**: HTTP client used for fetching pages with built-in retries and error handling
 - **Apify Proxy**: Residential + Datacenter proxies with UK targeting for optimal Caterer.com access
 
 ### 🛡️ **Anti-Blocking Features**
@@ -210,9 +204,9 @@ This scraper is optimized for maximum speed and reliability when scraping Catere
 - **Proxy Rotation**: Automatic proxy switching with residential proxy preference
 
 ### 📊 **Optimized Concurrency**
-- **Auto-scaling Pool**: 1-6 concurrent requests with intelligent scaling
-- **Session Pool**: 150 max sessions with 12 requests per session
-- **Request Limits**: 120s timeout with 8 max retries per request
+- **Default concurrency**: 3 parallel requests (configured in backend)
+- **Session Pool**: session rotation with default max usage and error-score retirement
+- **Request Limits**: default request timeout 30s and 4 retries (configured in backend)
 
 ### 🎯 **Best Performance Settings**
 ```json

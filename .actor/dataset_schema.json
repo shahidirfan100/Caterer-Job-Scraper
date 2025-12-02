@@ -78,7 +78,7 @@
     },
     "transport": {
       "type": "string",
-      "description": "Fetch method used: 'http' or 'playwright'"
+      "description": "Fetch method used: 'http'"
     },
     "scrapedAt": {
       "type": "string",

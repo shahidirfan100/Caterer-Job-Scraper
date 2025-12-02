@@ -1,6 +1,6 @@
 {
   "title": "Caterer Job Scraper - Production v2.0",
-  "description": "Production-grade scraper using impit + Playwright with advanced stealth. Provide keyword/location OR a direct search URL. Features: HTTP-first strategy, UK residential proxies, job detail scraping, and intelligent error handling.",
+  "description": "Production-grade scraper using impit (HTTP-only) with advanced stealth. Provide keyword/location OR a direct search URL. Features: fast HTTP fetching with retries, UK residential proxies, job detail scraping, and intelligent error handling.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -50,24 +50,7 @@
       "default": 20,
       "editor": "number"
     },
-    "maxConcurrency": {
-      "title": "Max Concurrency",
-      "type": "integer",
-      "description": "Number of parallel requests (1-5). Lower values = fewer blocks but slower. Recommended: 2-3 for RESIDENTIAL proxies.",
-      "minimum": 1,
-      "maximum": 5,
-      "default": 2,
-      "editor": "number"
-    },
-    "strategy": {
-      "title": "Fetch Strategy",
-      "type": "string",
-      "description": "HTTP-first: Fast HTTP requests with Playwright fallback (recommended). Playwright-only: Always use full browser rendering (slower, more reliable).",
-      "editor": "select",
-      "enum": ["http_first", "playwright_only"],
-      "enumTitles": ["HTTP First (Recommended - Fast)", "Playwright Only (Slower, More Reliable)"],
-      "default": "http_first"
-    },
+    
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",

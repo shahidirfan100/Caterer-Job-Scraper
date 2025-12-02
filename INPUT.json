@@ -4,8 +4,6 @@
   "results_wanted": 20,
   "max_pages": 3,
   "collectDetails": true,
-  "maxConcurrency": 2,
-  "strategy": "http_first",
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"],

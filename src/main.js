@@ -1,6 +1,6 @@
 import { Actor, Dataset, log } from 'apify';
-import { PlaywrightCrawler, RequestQueue } from 'crawlee';
-import { impit } from 'impit';
+import { BasicCrawler, RequestQueue } from 'crawlee';
+import { fetch as impitFetch } from 'impit';
 import * as cheerio from 'cheerio';
 
 /**
@@ -414,23 +414,19 @@ await Actor.main(async () => {
         startUrl: inputStartUrl = '',
         results_wanted = 50,
         max_pages = 20,
-        maxConcurrency = 3,
         proxyConfiguration: proxyInput,
-        strategy = 'http_first', // http_first | playwright_only
     } = input;
 
     const targetResults = toNumberOrDefault(results_wanted, 50);
     const maxPages = toNumberOrDefault(max_pages, 20);
     const startUrl = guessStartUrl({ keyword, location, startUrl: inputStartUrl });
 
-    log.info('Starting Caterer.com scraper (Playwright listing + HTML/JSON parsers)', {
+    log.info('Starting Caterer.com scraper (HTTP-only listing + HTML/JSON parsers)', {
         keyword,
         location,
         startUrl,
         results_wanted: targetResults,
         max_pages: maxPages,
-        maxConcurrency,
-        strategy,
     });
 
     // Configure proxy with residential IPs for better success rate
@@ -465,52 +461,65 @@ await Actor.main(async () => {
     const fetchViaHttp = async (url, retries = 3) => {
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                const opts = {
-                    url,
+                // Use impit's fetch API which automatically sends browser-like headers
+                let fetchOptions = {
                     headers: {
                         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'accept-language': 'en-GB,en;q=0.9',
                         'referer': 'https://www.caterer.com/',
-                        'upgrade-insecure-requests': '1',
-                    },
-                    timeout: 30000,
-                    retry: {
-                        limit: 0, // We handle retries manually
                     },
                 };
 
+                // Add proxy if configured
                 if (proxyConfiguration) {
                     try {
                         const proxyUrl = await proxyConfiguration.newUrl();
                         if (proxyUrl) {
-                            opts.proxyUrl = proxyUrl;
+                            // Extract proxy details for fetch API
+                            const proxyUrlObj = new URL(proxyUrl);
+                            fetchOptions.proxy = {
+                                host: proxyUrlObj.hostname,
+                                port: parseInt(proxyUrlObj.port),
+                                auth: proxyUrlObj.username ? {
+                                    username: proxyUrlObj.username,
+                                    password: proxyUrlObj.password,
+                                } : undefined,
+                            };
                         }
                     } catch (err) {
-                        log.warning('Unable to set proxy for HTTP fetch', { message: err?.message });
+                        log.warning('Unable to configure proxy for HTTP fetch', { message: err?.message });
                     }
                 }
 
-                const response = await impit(opts);
+                const response = await impitFetch(url, fetchOptions);
                 
-                if (response.statusCode === 200 && response.body) {
-                    log.debug('HTTP fetch successful', { 
-                        url, 
-                        attempt, 
-                        statusCode: response.statusCode,
-                        bodyLength: response.body.length 
-                    });
-                    return response;
-                }
-
-                if ([403, 429, 503].includes(response.statusCode)) {
-                    log.warning(`HTTP blocked with ${response.statusCode}, attempt ${attempt}/${retries}`);
-                    if (attempt < retries) {
-                        await randomDelay(2000 * attempt, 4000 * attempt); // Exponential backoff
-                        continue;
+                if (!response.ok) {
+                    const status = response.status;
+                    if ([403, 429, 503].includes(status)) {
+                        log.warning(`HTTP blocked with ${status}, attempt ${attempt}/${retries}`);
+                        if (attempt < retries) {
+                            await randomDelay(2000 * attempt, 4000 * attempt); // Exponential backoff
+                            continue;
+                        }
                     }
+                    throw new Error(`HTTP error! status: ${status}`);
                 }
 
-                return response;
+                const html = await response.text();
+                
+                log.debug('HTTP fetch successful', { 
+                    url, 
+                    attempt, 
+                    status: response.status,
+                    bodyLength: html.length 
+                });
+                
+                // Return in a format compatible with existing code
+                return {
+                    statusCode: response.status,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    body: html,
+                };
             } catch (err) {
                 log.warning(`HTTP fetch error, attempt ${attempt}/${retries}`, { 
                     url, 
@@ -525,79 +534,24 @@ await Actor.main(async () => {
         }
     };
 
-    const crawler = new PlaywrightCrawler({
+    // Backend defaults: these are hardcoded in the backend (not in input schema)
+    const DEFAULT_MAX_CONCURRENCY = 3; // change here if you need different concurrency
+    const DEFAULT_MAX_RETRIES = 4;
+
+    const crawler = new BasicCrawler({
         requestQueue,
         proxyConfiguration,
-        maxConcurrency: Math.max(1, maxConcurrency), // At least 1 concurrent request
-        headless: true,
-        navigationTimeoutSecs: 35,
-        maxRequestRetries: 5,
+        maxConcurrency: DEFAULT_MAX_CONCURRENCY,
+        maxRequestRetries: DEFAULT_MAX_RETRIES,
         useSessionPool: true,
-        persistCookiesPerSession: true,
         sessionPoolOptions: {
             maxPoolSize: 50,
             sessionOptions: {
-                maxUsageCount: 10, // Rotate session after 10 uses
-                maxErrorScore: 3, // Retire session after 3 errors
+                maxUsageCount: 10,
+                maxErrorScore: 3,
             },
         },
-        launchContext: {
-            launchOptions: {
-                args: [
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--disable-web-security',
-                    '--disable-setuid-sandbox',
-                    '--no-sandbox',
-                ],
-                ignoreHTTPSErrors: true,
-            },
-        },
-        preNavigationHooks: [
-            async ({ page, request, session }, gotoOptions) => {
-                // Block unnecessary resources for faster scraping
-                await page.route('**/*', (route) => {
-                    const type = route.request().resourceType();
-                    if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                        return route.abort();
-                    }
-                    return route.continue();
-                });
-
-                await page.setExtraHTTPHeaders({
-                    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'accept-language': 'en-GB,en;q=0.9',
-                    'referer': 'https://www.caterer.com/',
-                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                });
-
-                // Additional stealth measures
-                await page.addInitScript(() => {
-                    // Override navigator.webdriver
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => false,
-                    });
-
-                    // Mock permissions
-                    const originalQuery = window.navigator.permissions.query;
-                    window.navigator.permissions.query = (parameters) => (
-                        parameters.name === 'notifications' ?
-                            Promise.resolve({ state: Notification.permission }) :
-                            originalQuery(parameters)
-                    );
-
-                    // Add chrome runtime
-                    window.chrome = {
-                        runtime: {},
-                    };
-                });
-
-                gotoOptions.waitUntil = 'domcontentloaded';
-                gotoOptions.timeout = 30000;
-            },
-        ],
-        requestHandler: async ({ page, request, log: crawlerLog, session }) => {
+        requestHandler: async ({ request, log: crawlerLog, session }) => {
             const { label, pageNum } = request.userData;
             if (label !== 'LIST') return;
 
@@ -614,67 +568,23 @@ await Actor.main(async () => {
             let html = '';
             let status = null;
             let contentType = '';
-            let usedPlaywright = false;
-
-            if (strategy === 'http_first') {
-                try {
-                    const res = await fetchViaHttp(request.url);
-                    status = res.statusCode || null;
-                    contentType = res.headers['content-type'] || '';
-                    html = res.body?.toString?.('utf8') ?? '';
-                    if (status === 200 && html) {
-                        crawlerLog.info('Fetched via HTTP client', { status, contentType });
-                    } else {
-                        crawlerLog.warning('HTTP fetch blocked or empty, will fall back to Playwright', {
-                            status,
-                            contentType,
-                        });
-                    }
-                } catch (err) {
-                    crawlerLog.warning('HTTP fetch failed, falling back to Playwright', {
-                        url: request.url,
-                        message: err?.message,
-                    });
+            // HTTP-only fetch using impit's fetch API
+            try {
+                const res = await fetchViaHttp(request.url);
+                status = res.statusCode || null;
+                contentType = res.headers['content-type'] || '';
+                html = res.body || '';
+                if (status === 200 && html) {
+                    crawlerLog.info('Fetched via impit HTTP client', { status, contentType });
+                } else {
+                    crawlerLog.warning('HTTP fetch blocked or empty', { status, contentType });
                 }
+            } catch (err) {
+                crawlerLog.warning('HTTP fetch failed', { url: request.url, message: err?.message });
+                throw err; // let BasicCrawler retry according to maxRequestRetries
             }
 
-            if (!html) {
-                let response;
-                usedPlaywright = true;
-                try {
-                    response = await page.goto(request.url, {
-                        waitUntil: 'domcontentloaded',
-                        timeout: 30000,
-                    });
-                } catch (err) {
-                    crawlerLog.warning('page.goto failed, retrying once with networkidle', {
-                        url: request.url,
-                        message: err?.message,
-                    });
-                    try {
-                        response = await page.goto(request.url, {
-                            waitUntil: 'networkidle',
-                            timeout: 35000,
-                        });
-                    } catch (err2) {
-                        crawlerLog.warning('Second goto failed', { url: request.url, message: err2?.message });
-                        throw err2;
-                    }
-                }
-
-                status = response?.status() || 0;
-                if (status === 403 || status === 429) {
-                    crawlerLog.warning('Blocked response, retiring session', { url: request.url, status });
-                    if (session) session.retire();
-                    throw new Error(`Blocked with status ${status}`);
-                }
-
-                await page.waitForTimeout(1000);
-                html = await page.content();
-                contentType = response?.headers()['content-type'] || '';
-            }
-
-            const isJsonLike = contentType.includes('application/json') || html.trim().startsWith('{');
+            const isJsonLike = (contentType || '').includes('application/json') || html.trim().startsWith('{');
             const collected = [];
 
             if (isJsonLike) {
@@ -741,7 +651,7 @@ await Actor.main(async () => {
                         searchKeyword: keyword || null,
                         searchLocation: location || null,
                         pageNum,
-                        transport: usedPlaywright ? 'playwright' : 'http',
+                        transport: 'http',
                         scrapedAt: new Date().toISOString(),
                     })),
                 );
