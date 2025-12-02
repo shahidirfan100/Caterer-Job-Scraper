@@ -409,7 +409,10 @@ const fetchJobDetails = async (jobUrl, fetchViaHttp) => {
 
         const response = await fetchViaHttp(jobUrl, 2);
         if (!response || response.statusCode !== 200 || !response.body) {
-            log.warning('Failed to fetch job details', { jobUrl, status: response?.statusCode });
+            log.warning('Failed to fetch job details (non-200 or empty body)', {
+                jobUrl,
+                status: response?.statusCode,
+            });
             return null;
         }
 
@@ -476,7 +479,11 @@ const fetchJobDetails = async (jobUrl, fetchViaHttp) => {
             applyUrl,
         };
     } catch (err) {
-        log.error('Error fetching job details', { jobUrl, message: err?.message });
+        // Non-fatal: details are optional, listing is still saved
+        log.warning('Job details fetch failed (skipping, listing is still saved)', {
+            jobUrl,
+            message: (err?.message || String(err)).slice(0, 300),
+        });
         return null;
     }
 };
@@ -494,19 +501,20 @@ await Actor.main(async () => {
         results_wanted = 50,
         max_pages = 20,
         proxyConfiguration: proxyInput,
-        collectDetails = false,
+        collectDetails = false, // default OFF for stability
     } = input;
 
     const targetResults = toNumberOrDefault(results_wanted, 50);
     const maxPages = toNumberOrDefault(max_pages, 20);
     const startUrl = guessStartUrl({ keyword, location, startUrl: inputStartUrl });
 
-    log.info('Starting Caterer.com scraper (HTTP-only listing + HTML/JSON parsers)', {
+    log.info('Starting Caterer.com scraper (HTTP + Impit + JSON/HTML parsers)', {
         keyword,
         location,
         startUrl,
         results_wanted: targetResults,
         max_pages: maxPages,
+        collectDetails,
     });
 
     const proxyConfiguration = await Actor.createProxyConfiguration(
@@ -550,12 +558,12 @@ await Actor.main(async () => {
                         proxyUrl = await proxyConfiguration.newUrl();
                     } catch (err) {
                         log.warning('Unable to get proxy URL from proxyConfiguration', {
-                            message: err?.message,
+                            message: (err?.message || String(err)).slice(0, 200),
                         });
                     }
                 }
 
-                // Create a fresh Impit instance for this request (allows rotating proxy URLs)
+                // Fresh Impit instance per request to rotate proxy URL
                 const impit = new Impit({
                     browser: 'chrome',
                     proxyUrl: proxyUrl || undefined,
@@ -597,7 +605,7 @@ await Actor.main(async () => {
             } catch (err) {
                 log.warning(`HTTP fetch error, attempt ${attempt}/${retries}`, {
                     url,
-                    message: err?.message,
+                    message: (err?.message || String(err)).slice(0, 200),
                 });
                 if (attempt < retries) {
                     await randomDelay(1500 * attempt, 3000 * attempt);
@@ -654,7 +662,7 @@ await Actor.main(async () => {
             } catch (err) {
                 crawlerLog.warning('HTTP fetch failed', {
                     url: request.url,
-                    message: err?.message,
+                    message: (err?.message || String(err)).slice(0, 200),
                 });
                 throw err;
             }
@@ -663,13 +671,18 @@ await Actor.main(async () => {
                 (contentType || '').includes('application/json') || html.trim().startsWith('{');
             const collected = [];
 
+            // 1) JSON API-style responses
             if (isJsonLike) {
                 collected.push(...tryParseJsonApi(html, request.url));
             }
 
+            // 2) Inline JSON state (__NEXT_DATA__ etc.)
             collected.push(...extractFromInlineState(html, request.url));
+
+            // 3) JSON-LD structured data
             collected.push(...extractJsonLdJobs(html, request.url));
 
+            // 4) HTML DOM fallback
             const $ = cheerio.load(html);
             collected.push(...extractJobsFromHtml($, request.url));
 
@@ -710,9 +723,11 @@ await Actor.main(async () => {
                                 finalJob.detailsFetched = true;
                             }
                         } catch (err) {
-                            crawlerLog.debug('Failed to fetch job details', {
+                            // Should not really throw due to catch inside fetchJobDetails,
+                            // but we keep this as a safeguard.
+                            crawlerLog.warning('Failed to fetch job details (outer)', {
                                 url: job.url,
-                                message: err?.message,
+                                message: (err?.message || String(err)).slice(0, 200),
                             });
                         }
                     }
@@ -733,7 +748,7 @@ await Actor.main(async () => {
                         withDetails: collectDetails,
                     });
                 } else {
-                    crawlerLog.warning('No jobs extracted on page', {
+                    crawlerLog.warning('No jobs extracted on page after filtering', {
                         url: request.url,
                         pageNum,
                     });
