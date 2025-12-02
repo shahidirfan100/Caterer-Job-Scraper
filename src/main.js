@@ -49,6 +49,13 @@ const buildHeaders = (refererUrl) => ({
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
     referer: refererUrl,
     'upgrade-insecure-requests': '1',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
+    'sec-ch-ua': '"Chromium";v="120", "Not.A/Brand";v="24", "Google Chrome";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
 });
 
 /**
@@ -213,8 +220,7 @@ const extractJobsFromHtml = ($, requestUrl) => {
         let salary = null;
         let postedAt = null;
 
-        const isMoneyLine = (line) =>
-            /£|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
+        const isMoneyLine = (line) => /[\u00A3$]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
         const isPostedLine = (line) => /\b(ago|Today|Yesterday)\b/i.test(line);
 
         for (let i = titleIdx + 1; i < lines.length; i++) {
@@ -316,7 +322,7 @@ await Actor.main(async () => {
         startUrl: inputStartUrl = '',
         results_wanted = 50,
         max_pages = 20,
-        maxConcurrency = 6,
+        maxConcurrency = 3,
         collectDetails = false,
         strategy = 'api_html', // api_html | html_only
         proxyConfiguration: proxyInput,
@@ -359,11 +365,13 @@ await Actor.main(async () => {
         requestQueue,
         proxyConfiguration,
         maxConcurrency,
-        maxRequestRetries: 2,
+        minConcurrency: 1,
+        maxRequestRetries: 3,
         requestHandlerTimeoutSecs: 45,
         useSessionPool: true,
+        useHttp2: false, // avoid HTTP/2 issues (NGHTTP2_INTERNAL_ERROR / 403 on some edges)
         additionalMimeTypes: ['application/json'],
-        requestHandler: async ({ request, body, $, log: crawlerLog, response }) => {
+        requestHandler: async ({ request, body, $, log: crawlerLog, response, session }) => {
             const { label, pageNum } = request.userData;
             if (label !== 'LIST') return;
 
@@ -380,6 +388,15 @@ await Actor.main(async () => {
             pagesProcessed += 1;
             const html = body?.toString?.('utf8') ?? '';
             const contentType = response?.headers?.['content-type'] || '';
+            const statusCode = response?.statusCode;
+            if (statusCode === 403 || statusCode === 429) {
+                crawlerLog.warning('Blocked response detected, retiring session', {
+                    url: request.url,
+                    statusCode,
+                });
+                if (session) session.retire();
+                throw new Error(`Blocked with status ${statusCode}`);
+            }
             const isJsonResponse = contentType.includes('application/json') || html.trim().startsWith('{');
 
             const collected = [];
