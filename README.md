@@ -322,4 +322,4 @@ hospitality jobs UK, catering jobs, chef positions, restaurant manager jobs, hos
 
 **Data Source**: Caterer.com - UK's premier hospitality and catering recruitment platform  
 **Last Updated**: January 2025  
-**Version**: 2.0
+**Version**: 2.0.0
