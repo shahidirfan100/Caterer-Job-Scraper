@@ -1,10 +1,9 @@
 import { Actor, Dataset, log } from 'apify';
-import { CheerioCrawler, RequestQueue } from 'crawlee';
-import { chromium } from 'playwright';
+import { PlaywrightCrawler, RequestQueue } from 'crawlee';
 import * as cheerio from 'cheerio';
 
 /**
- * Utility helpers
+ * Helpers
  */
 const cleanText = (val) => (val ? val.replace(/\s+/g, ' ').trim() || null : null);
 
@@ -32,19 +31,17 @@ const guessStartUrl = ({ keyword, location, startUrl }) => {
     const params = new URLSearchParams();
     if (keyword) params.set('keywords', keyword.trim());
     if (location) params.set('location', location.trim());
-    const url = `${base}?${params.toString()}`;
-    return url;
+    return `${base}?${params.toString()}`;
 };
 
 const buildNextPageUrl = (currentUrl, nextPageNum) => {
     const url = new URL(currentUrl);
-    // Caterer uses ?page=2 on listing URLs
     url.searchParams.set('page', String(nextPageNum));
     return url.toString();
 };
 
 const buildHeaders = (refererUrl) => ({
-    accept: 'application/json, text/html;q=0.9, */*;q=0.8',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'accept-language': 'en-GB,en;q=0.9',
     'user-agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
@@ -60,11 +57,11 @@ const buildHeaders = (refererUrl) => ({
 });
 
 /**
- * Try JSON API responses first (response body is JSON or content-type is JSON).
+ * JSON/HTML extraction helpers
  */
-const tryParseJsonApi = (body, requestUrl) => {
+const tryParseJsonApi = (htmlString, requestUrl) => {
     try {
-        const json = typeof body === 'string' ? JSON.parse(body) : JSON.parse(body.toString());
+        const json = JSON.parse(htmlString);
         const records =
             (Array.isArray(json?.results) && json.results) ||
             (Array.isArray(json?.data?.results) && json.data.results) ||
@@ -124,9 +121,6 @@ const tryParseJsonApi = (body, requestUrl) => {
     }
 };
 
-/**
- * Extract JSON-LD job postings embedded in HTML.
- */
 const extractJsonLdJobs = (html, requestUrl) => {
     const $ = cheerio.load(html);
     const jobs = [];
@@ -179,16 +173,13 @@ const extractJsonLdJobs = (html, requestUrl) => {
                 });
             }
         } catch {
-            // ignore bad JSON blocks
+            // ignore bad blocks
         }
     });
 
     return jobs;
 };
 
-/**
- * Extract jobs from server-rendered HTML listing with Cheerio.
- */
 const extractJobsFromHtml = ($, requestUrl) => {
     const jobs = [];
 
@@ -221,7 +212,8 @@ const extractJobsFromHtml = ($, requestUrl) => {
         let salary = null;
         let postedAt = null;
 
-        const isMoneyLine = (line) => /[\u00A3$]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
+        const isMoneyLine = (line) =>
+            /[\u00A3$]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
         const isPostedLine = (line) => /\b(ago|Today|Yesterday)\b/i.test(line);
 
         for (let i = titleIdx + 1; i < lines.length; i++) {
@@ -293,9 +285,6 @@ const extractJobsFromHtml = ($, requestUrl) => {
     return jobs;
 };
 
-/**
- * Attempt to discover inline state blobs that carry jobs (e.g., __NEXT_DATA__).
- */
 const extractFromInlineState = (html, requestUrl) => {
     const matches = html.match(/__NEXT_DATA__\"?\s*>\s*({.+?})\s*</s);
     if (!matches) return [];
@@ -312,56 +301,6 @@ const extractFromInlineState = (html, requestUrl) => {
 };
 
 /**
- * Playwright fallback to fetch HTML when HTTP/2 or HTTP/1.1 requests are blocked.
- */
-const fetchWithPlaywright = async ({ url, proxyConfiguration }) => {
-    const launchOptions = {
-        headless: true,
-        args: ['--disable-dev-shm-usage'],
-    };
-
-    if (proxyConfiguration) {
-        try {
-            const proxyUrl = await proxyConfiguration.newUrl();
-            if (proxyUrl) {
-                const u = new URL(proxyUrl);
-                launchOptions.proxy = {
-                    server: `${u.protocol}//${u.host}`,
-                    username: u.username || undefined,
-                    password: u.password || undefined,
-                };
-            }
-        } catch (err) {
-            log.warning('Failed to attach proxy to Playwright fallback', { message: err?.message });
-        }
-    }
-
-    const browser = await chromium.launch(launchOptions);
-    const page = await browser.newPage({
-        viewport: { width: 1280, height: 800 },
-    });
-
-    await page.route('**/*', (route) => {
-        const type = route.request().resourceType();
-        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
-        return route.continue();
-    });
-
-    let html = '';
-    let statusCode = null;
-    try {
-        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        statusCode = response?.status() || null;
-        await page.waitForTimeout(1000);
-        html = await page.content();
-    } finally {
-        await browser.close();
-    }
-
-    return { html, statusCode };
-};
-
-/**
  * MAIN
  */
 await Actor.main(async () => {
@@ -374,9 +313,6 @@ await Actor.main(async () => {
         results_wanted = 50,
         max_pages = 20,
         maxConcurrency = 3,
-        collectDetails = false,
-        strategy = 'api_html', // api_html | html_only
-        usePlaywrightFallback = true,
         proxyConfiguration: proxyInput,
     } = input;
 
@@ -384,16 +320,13 @@ await Actor.main(async () => {
     const maxPages = toNumberOrDefault(max_pages, 20);
     const startUrl = guessStartUrl({ keyword, location, startUrl: inputStartUrl });
 
-    log.info('Starting Caterer.com scraper (API-first with HTML fallback)', {
+    log.info('Starting Caterer.com scraper (Playwright listing + HTML/JSON parsers)', {
         keyword,
         location,
         startUrl,
         results_wanted: targetResults,
         max_pages: maxPages,
         maxConcurrency,
-        collectDetails,
-        strategy,
-        usePlaywrightFallback,
     });
 
     const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {});
@@ -414,20 +347,35 @@ await Actor.main(async () => {
     let jobsSaved = 0;
     let pagesProcessed = 0;
 
-    const crawler = new CheerioCrawler({
+    const crawler = new PlaywrightCrawler({
         requestQueue,
         proxyConfiguration,
         maxConcurrency,
-        minConcurrency: 1,
+        headless: true,
+        navigationTimeoutSecs: 30,
         maxRequestRetries: 3,
-        requestHandlerTimeoutSecs: 45,
         useSessionPool: true,
-        additionalMimeTypes: ['application/json'],
-        requestHandler: async ({ request, body, $, log: crawlerLog, response, session }) => {
+        persistCookiesPerSession: true,
+        launchContext: {
+            launchOptions: {
+                args: ['--disable-dev-shm-usage'],
+            },
+        },
+        preNavigationHooks: [
+            async ({ page, request, session }, gotoOptions) => {
+                await page.route('**/*', (route) => {
+                    const type = route.request().resourceType();
+                    if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                    return route.continue();
+                });
+                await page.setExtraHTTPHeaders(buildHeaders(request.url));
+                gotoOptions.waitUntil = 'domcontentloaded';
+            },
+        ],
+        requestHandler: async ({ page, request, log: crawlerLog, session }) => {
             const { label, pageNum } = request.userData;
             if (label !== 'LIST') return;
 
-            // Hard stop once we hit target
             if (jobsSaved >= targetResults) {
                 crawlerLog.info('Target results reached, skipping page', {
                     url: request.url,
@@ -438,48 +386,30 @@ await Actor.main(async () => {
             }
 
             pagesProcessed += 1;
-            const contentType = response?.headers?.['content-type'] || '';
-            let statusCode = response?.statusCode;
-            let html = body?.toString?.('utf8') ?? '';
-            let cheerioDoc = $;
+            const response = await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            const status = response?.status() || 0;
 
-            if ((statusCode === 403 || statusCode === 429 || !html) && usePlaywrightFallback) {
-                crawlerLog.warning('Blocked or empty response, attempting Playwright fallback', {
-                    url: request.url,
-                    statusCode,
-                });
-                const fallback = await fetchWithPlaywright({ url: request.url, proxyConfiguration });
-                statusCode = fallback.statusCode ?? statusCode;
-                html = fallback.html || html;
-                cheerioDoc = cheerio.load(html);
-            }
-
-            if (statusCode === 403 || statusCode === 429) {
-                crawlerLog.warning('Blocked response detected, retiring session', {
-                    url: request.url,
-                    statusCode,
-                });
+            if (status === 403 || status === 429) {
+                crawlerLog.warning('Blocked response, retiring session', { url: request.url, status });
                 if (session) session.retire();
-                throw new Error(`Blocked with status ${statusCode}`);
+                throw new Error(`Blocked with status ${status}`);
             }
 
-            const isJsonResponse = contentType.includes('application/json') || html.trim().startsWith('{');
-
+            await page.waitForTimeout(1000);
+            const html = await page.content();
+            const contentType = response?.headers()['content-type'] || '';
+            const isJsonLike = contentType.includes('application/json') || html.trim().startsWith('{');
             const collected = [];
 
-            if (strategy === 'api_html' && isJsonResponse) {
+            if (isJsonLike) {
                 collected.push(...tryParseJsonApi(html, request.url));
             }
 
-            // JSON-LD first to leverage structured data
             collected.push(...extractJsonLdJobs(html, request.url));
 
-            // HTML parsing fallback
-            if (cheerioDoc) {
-                collected.push(...extractJobsFromHtml(cheerioDoc, request.url));
-            }
+            const $ = cheerio.load(html);
+            collected.push(...extractJobsFromHtml($, request.url));
 
-            // Inline state detection
             collected.push(...extractFromInlineState(html, request.url));
 
             const deduped = [];
@@ -501,7 +431,6 @@ await Actor.main(async () => {
                         ...job,
                         searchKeyword: keyword || null,
                         searchLocation: location || null,
-                        strategy,
                         pageNum,
                     })),
                 );
@@ -517,11 +446,9 @@ await Actor.main(async () => {
                 crawlerLog.warning('No jobs extracted on page', {
                     url: request.url,
                     pageNum,
-                    contentType,
                 });
             }
 
-            // Pagination guard
             if (jobsSaved >= targetResults) {
                 crawlerLog.info('Target results reached, stopping pagination', {
                     jobsSaved,
