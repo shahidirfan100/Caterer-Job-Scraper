@@ -1,5 +1,6 @@
 import { Actor, Dataset, log } from 'apify';
 import { CheerioCrawler, RequestQueue } from 'crawlee';
+import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
 
 /**
@@ -311,6 +312,56 @@ const extractFromInlineState = (html, requestUrl) => {
 };
 
 /**
+ * Playwright fallback to fetch HTML when HTTP/2 or HTTP/1.1 requests are blocked.
+ */
+const fetchWithPlaywright = async ({ url, proxyConfiguration }) => {
+    const launchOptions = {
+        headless: true,
+        args: ['--disable-dev-shm-usage'],
+    };
+
+    if (proxyConfiguration) {
+        try {
+            const proxyUrl = await proxyConfiguration.newUrl();
+            if (proxyUrl) {
+                const u = new URL(proxyUrl);
+                launchOptions.proxy = {
+                    server: `${u.protocol}//${u.host}`,
+                    username: u.username || undefined,
+                    password: u.password || undefined,
+                };
+            }
+        } catch (err) {
+            log.warning('Failed to attach proxy to Playwright fallback', { message: err?.message });
+        }
+    }
+
+    const browser = await chromium.launch(launchOptions);
+    const page = await browser.newPage({
+        viewport: { width: 1280, height: 800 },
+    });
+
+    await page.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+        return route.continue();
+    });
+
+    let html = '';
+    let statusCode = null;
+    try {
+        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        statusCode = response?.status() || null;
+        await page.waitForTimeout(1000);
+        html = await page.content();
+    } finally {
+        await browser.close();
+    }
+
+    return { html, statusCode };
+};
+
+/**
  * MAIN
  */
 await Actor.main(async () => {
@@ -325,6 +376,7 @@ await Actor.main(async () => {
         maxConcurrency = 3,
         collectDetails = false,
         strategy = 'api_html', // api_html | html_only
+        usePlaywrightFallback = true,
         proxyConfiguration: proxyInput,
     } = input;
 
@@ -341,6 +393,7 @@ await Actor.main(async () => {
         maxConcurrency,
         collectDetails,
         strategy,
+        usePlaywrightFallback,
     });
 
     const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {});
@@ -369,7 +422,6 @@ await Actor.main(async () => {
         maxRequestRetries: 3,
         requestHandlerTimeoutSecs: 45,
         useSessionPool: true,
-        useHttp2: false, // avoid HTTP/2 issues (NGHTTP2_INTERNAL_ERROR / 403 on some edges)
         additionalMimeTypes: ['application/json'],
         requestHandler: async ({ request, body, $, log: crawlerLog, response, session }) => {
             const { label, pageNum } = request.userData;
@@ -386,9 +438,22 @@ await Actor.main(async () => {
             }
 
             pagesProcessed += 1;
-            const html = body?.toString?.('utf8') ?? '';
             const contentType = response?.headers?.['content-type'] || '';
-            const statusCode = response?.statusCode;
+            let statusCode = response?.statusCode;
+            let html = body?.toString?.('utf8') ?? '';
+            let cheerioDoc = $;
+
+            if ((statusCode === 403 || statusCode === 429 || !html) && usePlaywrightFallback) {
+                crawlerLog.warning('Blocked or empty response, attempting Playwright fallback', {
+                    url: request.url,
+                    statusCode,
+                });
+                const fallback = await fetchWithPlaywright({ url: request.url, proxyConfiguration });
+                statusCode = fallback.statusCode ?? statusCode;
+                html = fallback.html || html;
+                cheerioDoc = cheerio.load(html);
+            }
+
             if (statusCode === 403 || statusCode === 429) {
                 crawlerLog.warning('Blocked response detected, retiring session', {
                     url: request.url,
@@ -397,6 +462,7 @@ await Actor.main(async () => {
                 if (session) session.retire();
                 throw new Error(`Blocked with status ${statusCode}`);
             }
+
             const isJsonResponse = contentType.includes('application/json') || html.trim().startsWith('{');
 
             const collected = [];
@@ -409,8 +475,8 @@ await Actor.main(async () => {
             collected.push(...extractJsonLdJobs(html, request.url));
 
             // HTML parsing fallback
-            if ($) {
-                collected.push(...extractJobsFromHtml($, request.url));
+            if (cheerioDoc) {
+                collected.push(...extractJobsFromHtml(cheerioDoc, request.url));
             }
 
             // Inline state detection
