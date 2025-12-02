@@ -1,33 +1,17 @@
 {
-  "name": "caterer-jobs-actor",
-  "version": "3.0.0",
-  "description": "Production-grade Caterer.com job scraper using Playwright with comprehensive stealth measures.",
+  "name": "caterer-job-scraper",
+  "version": "1.0.0",
+  "description": "Caterer Job Scraper",
   "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
   "dependencies": {
-    "apify": "3.5.0",
-    "crawlee": "3.15.1",
+    "apify": "^3.4.5",
+    "crawlee": "^3.14.1",
     "cheerio": "^1.0.0-rc.12",
     "got-scraping": "^4.1.2",
-    "playwright": "1.54.1"
-  },
-  "devDependencies": {
-    "@apify/eslint-config": "^1.0.0",
-    "eslint": "^9.29.0",
-    "eslint-config-prettier": "^10.1.5",
-    "prettier": "^3.5.3"
-  },
-  "scripts": {
-    "start": "node src/main.js",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "lint": "eslint",
-    "lint:fix": "eslint --fix",
-    "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1",
-    "postinstall": "npx crawlee install-playwright-browsers"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "author": "It's not you it's me",
-  "license": "ISC"
+    "impit": "^0.9.3",
+    "header-generator": "^2.1.27"
+  }
 }
