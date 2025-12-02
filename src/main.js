@@ -58,7 +58,15 @@ const randomDelay = (min = 1000, max = 3000) => {
     return new Promise(resolve => setTimeout(resolve, delay));
 };
 
+const buildHeaders = (url) => ({
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'accept-language': 'en-GB,en;q=0.9',
+    'referer': url || 'https://www.caterer.com/',
+    'upgrade-insecure-requests': '1',
+});
+
 /**
+ 
  * JSON/HTML extraction helpers
  */
 const tryParseJsonApi = (htmlString, requestUrl) => {
@@ -94,12 +102,11 @@ const tryParseJsonApi = (htmlString, requestUrl) => {
                 const salary = item.salary || item.salaryText || item.compensation;
                 const url = item.url || item.link || item.jobUrl || item.applyUrl;
                 const description = item.description || item.summary || item.teaser;
-                const postedAt = item.datePosted || item.postedAt || item.posted || item.postedDate;
+                const postedAt = item.datePosted || item.datePublished;
                 const jobId =
+                    item.identifier?.value ||
+                    item.identifier ||
                     item.id ||
-                    item.jobId ||
-                    item.jobReference ||
-                    item.reference ||
                     getJobIdFromUrl(url);
 
                 if (!title || !url) return null;
@@ -118,71 +125,95 @@ const tryParseJsonApi = (htmlString, requestUrl) => {
                 };
             })
             .filter(Boolean);
-    } catch {
+    } catch (err) {
+        log.debug('Failed to parse JSON API response', { url: requestUrl, message: err?.message });
         return [];
     }
 };
 
 const extractJsonLdJobs = (html, requestUrl) => {
-    const $ = cheerio.load(html);
-    const jobs = [];
+    try {
+        const $ = cheerio.load(html);
+        const jobs = [];
 
-    $('script[type="application/ld+json"]').each((_, el) => {
-        const raw = $(el).contents().text();
-        if (!raw) return;
-        try {
-            const parsed = JSON.parse(raw.trim());
-            const items = Array.isArray(parsed) ? parsed : [parsed];
-            for (const item of items) {
-                if (!item || (item['@type'] !== 'JobPosting' && item['@type'] !== 'Job')) continue;
-                const title = item.title || item.name;
-                const url = item.url || item.directApplyUrl || item.applicationContact?.url;
-                const company =
-                    item.hiringOrganization?.name ||
-                    item.employer?.name ||
-                    item.organization?.name;
-                const location =
-                    item.jobLocation?.address?.addressLocality ||
-                    item.jobLocation?.address?.addressRegion ||
-                    item.jobLocation?.address?.streetAddress ||
-                    item.jobLocation?.address?.addressCountry;
-                const salary =
-                    item.baseSalary?.value?.value ||
-                    item.baseSalary?.value ||
-                    item.baseSalary ||
-                    item.salary;
-                const postedAt = item.datePosted || item.datePublished;
-                const description = item.description;
-                const jobId =
-                    item.identifier?.value ||
-                    item.identifier ||
-                    item.id ||
-                    getJobIdFromUrl(url);
+        $('script[type="application/ld+json"]').each((_, el) => {
+            let jsonText = $(el).contents().toString().trim();
+            if (!jsonText) return;
 
-                if (!title || !url) continue;
+            try {
+                const data = JSON.parse(jsonText);
 
-                jobs.push({
-                    title: cleanText(title),
-                    company: cleanText(company),
-                    location: cleanText(location),
-                    salary: cleanText(salary),
-                    description: cleanText(description),
-                    postedAt: cleanText(postedAt),
-                    url,
-                    jobId: cleanText(jobId),
-                    source: 'json_ld',
-                    listingPageUrl: requestUrl,
-                });
+                const candidates = Array.isArray(data) ? data : [data];
+                for (const block of candidates) {
+                    const graphItems = Array.isArray(block['@graph']) ? block['@graph'] : [block];
+
+                    for (const item of graphItems) {
+                        if (!item || typeof item !== 'object') continue;
+                        const type = item['@type'];
+                        if (type !== 'JobPosting' && type !== 'JobPostingDetails') continue;
+
+                        const title =
+                            item.title ||
+                            item.positionTitle ||
+                            item.name;
+                        const company =
+                            item.hiringOrganization?.name ||
+                            item.hiringOrganization ||
+                            item.employer ||
+                            item.companyName;
+                        const location =
+                            item.jobLocation?.address?.addressLocality ||
+                            item.jobLocation?.address?.addressRegion ||
+                            item.jobLocation?.address?.streetAddress ||
+                            item.jobLocation?.address?.addressCountry;
+                        const salary =
+                            item.baseSalary?.value?.value ||
+                            item.baseSalary?.value ||
+                            item.baseSalary ||
+                            item.salary;
+                        const postedAt = item.datePosted || item.datePublished;
+                        const description = item.description;
+                        const url =
+                            item.url ||
+                            item.applyUrl ||
+                            item.hiringOrganization?.sameAs ||
+                            item.mainEntityOfPage?.['@id'] ||
+                            getJobIdFromUrl(item.identifier?.value || item.identifier);
+
+                        const jobId =
+                            item.identifier?.value ||
+                            item.identifier ||
+                            getJobIdFromUrl(url);
+
+                        if (!title || !url) continue;
+
+                        jobs.push({
+                            title: cleanText(title),
+                            company: cleanText(company),
+                            location: cleanText(location),
+                            salary: cleanText(salary),
+                            description: cleanText(description),
+                            postedAt: cleanText(postedAt),
+                            url: normalizeUrl(url),
+                            jobId: cleanText(jobId),
+                            source: 'json_ld',
+                            listingPageUrl: requestUrl,
+                        });
+                    }
+                }
+            } catch (err) {
+                log.debug('Failed to parse JSON-LD block', { url: requestUrl, message: err?.message });
             }
-        } catch {
-            // ignore bad blocks
-        }
-    });
+        });
 
-    return jobs;
+        return jobs;
+    } catch (err) {
+        log.debug('Error while extracting JSON-LD', { url: requestUrl, message: err?.message });
+        return [];
+    }
 };
 
-const extractJobsFromHtml = ($, requestUrl) => {
+const extractJobsFromHtml = ($, listingPageUrl) => {
     const jobs = [];
 
     // Primary selector for job listings
@@ -214,104 +245,65 @@ const extractJobsFromHtml = ($, requestUrl) => {
             card.find('[class*="employer"]').first().text(),
             card.find('p').first().text(), // Often first paragraph after title
         ];
-        
-        for (const compText of companySelectors) {
-            const cleaned = cleanText(compText);
-            if (cleaned && cleaned.length > 2 && cleaned.length < 100) {
+        for (const text of companySelectors) {
+            const cleaned = cleanText(text);
+            if (cleaned && cleaned.length > 2 && !cleaned.toLowerCase().includes(cleanText(title)?.toLowerCase() || '')) {
                 company = cleaned;
                 break;
             }
         }
 
-        // Try to extract location
+        // Try to extract location and salary from lines of text
+        const textLines = [];
+        card.find('*').each((_, el) => {
+            const t = cleanText($(el).text());
+            if (t && !textLines.includes(t)) {
+                textLines.push(t);
+            }
+        });
+
         let location = null;
-        const locationSelectors = [
-            card.find('span[class*="location"]').first().text(),
-            card.find('div[class*="location"]').first().text(),
-            card.find('[class*="place"]').first().text(),
-        ];
-
-        for (const locText of locationSelectors) {
-            const cleaned = cleanText(locText);
-            if (cleaned) {
-                location = cleaned;
-                break;
-            }
-        }
-
-        // Fallback: parse from all text
-        if (!location || !company) {
-            const allText = card.text();
-            const lines = allText.split('\n').map(l => cleanText(l)).filter(Boolean);
-            
-            // Deduplicate consecutive lines
-            const uniqueLines = [];
-            for (const line of lines) {
-                if (!uniqueLines.length || uniqueLines[uniqueLines.length - 1] !== line) {
-                    uniqueLines.push(line);
-                }
-            }
-
-            const isMoneyLine = (line) =>
-                /[\u00A3$€]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b|\bp\/h\b|\bp\.a\./i.test(line);
-            const isPostedLine = (line) => /\b(ago|Today|Yesterday|hours?|days?|weeks?|months?)\s+ago\b/i.test(line);
-            const isLocationLine = (line) => 
-                /[A-Z]{1,2}\d[\dA-Z]?\s*\d[A-Z]{2}/.test(line) || // UK postcode
-                /\b(London|Manchester|Birmingham|Leeds|Liverpool|Scotland|Wales|England|UK)\b/i.test(line);
-
-            const titleIdx = uniqueLines.findIndex(l => l === title);
-            
-            // Extract company (usually first line after title)
-            if (!company && titleIdx !== -1) {
-                for (let i = titleIdx + 1; i < uniqueLines.length; i++) {
-                    const line = uniqueLines[i];
-                    if (isMoneyLine(line) || isPostedLine(line) || isLocationLine(line)) continue;
-                    if (line.length > 2 && line.length < 100) {
-                        company = line;
-                        break;
-                    }
-                }
-            }
-
-            // Extract location
-            if (!location) {
-                for (const line of uniqueLines) {
-                    if (isLocationLine(line) && !isMoneyLine(line) && !isPostedLine(line)) {
-                        location = line;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Try to extract salary
         let salary = null;
-        const salaryText = card.text();
-        const salaryMatch = salaryText.match(/[\u00A3$€][\d,]+(?:\s*-\s*[\u00A3$€]?[\d,]+)?(?:\s+per\s+(?:annum|hour|year|week|day))?|Up\s+to\s+[\u00A3$€][\d,]+/i);
-        if (salaryMatch) {
-            salary = cleanText(salaryMatch[0]);
-        }
-
-        // Try to extract posted date
         let postedAt = null;
-        const postedMatch = card.text().match(/(\d+\s+(?:hours?|days?|weeks?|months?)\s+ago|Today|Yesterday)/i);
-        if (postedMatch) {
-            postedAt = cleanText(postedMatch[0]);
+
+        const lines = textLines.filter((line) => {
+            if (line.toLowerCase().includes(cleanText(title)?.toLowerCase() || '')) return false;
+            if (company && line.toLowerCase().includes(company.toLowerCase())) return false;
+            return true;
+        });
+
+        // Deduplicate consecutive lines
+        const uniqueLines = [];
+        for (const line of lines) {
+            if (!uniqueLines.length || uniqueLines[uniqueLines.length - 1] !== line) {
+                uniqueLines.push(line);
+            }
         }
 
-        const jobId = getJobIdFromUrl(url);
+        const isMoneyLine = (line) =>
+            /[\u00A3$€]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b|\bp\/h\b|\bp\.a\./i.test(line);
+        const isPostedLine = (line) => /\b(ago|Today|Yesterday|hours?|days?|weeks?|months?)\s+ago\b/i.test(line);
+        const isLocationLine = (line) => 
+            /[A-Z]{1,2}\d[\dA-Z]?\s*\d[A-Z]{2}/.test(line) || // UK postcode
+            /\b(London|Manchester|Birmingham|Leeds|Liverpool|Scotland|Wales|England|UK)\b/i.test(line);
+
+        for (const line of uniqueLines) {
+            if (!salary && isMoneyLine(line)) salary = line;
+            else if (!postedAt && isPostedLine(line)) postedAt = line;
+            else if (!location && isLocationLine(line)) location = line;
+        }
 
         jobs.push({
             title,
             company,
             location,
             salary,
-            description: null, // Will be populated if collectDetails is enabled
             postedAt,
+            description: null,
             url,
-            jobId,
+            jobId: getJobIdFromUrl(url),
             source: 'html',
-            listingPageUrl: requestUrl,
+            listingPageUrl,
         });
     });
 
@@ -319,23 +311,89 @@ const extractJobsFromHtml = ($, requestUrl) => {
 };
 
 const extractFromInlineState = (html, requestUrl) => {
-    const matches = html.match(/__NEXT_DATA__\"?\s*>\s*({.+?})\s*</s);
-    if (!matches) return [];
-    try {
-        const json = JSON.parse(matches[1]);
-        const jobs =
-            (json?.props?.pageProps?.jobs && Object.values(json.props.pageProps.jobs)) ||
-            (Array.isArray(json?.props?.pageProps?.results) && json.props.pageProps.results) ||
-            [];
-        return tryParseJsonApi(JSON.stringify(jobs), requestUrl);
-    } catch {
-        return [];
+    const jobs = [];
+
+    const patterns = [
+        /__NEXT_DATA__\s*=\s*({.*?});<\/script/s,
+        /window\.__INITIAL_STATE__\s*=\s*({.*?});/s,
+        /window\.__APP_STATE__\s*=\s*({.*?});/s,
+    ];
+
+    for (const pattern of patterns) {
+        const match = html.match(pattern);
+        if (!match) continue;
+
+        try {
+            const jsonText = match[1];
+            const data = JSON.parse(jsonText);
+
+            const findJobsInObject = (obj) => {
+                if (!obj || typeof obj !== 'object') return;
+                for (const key of Object.keys(obj)) {
+                    const val = obj[key];
+                    if (Array.isArray(val)) {
+                        if (val.length && typeof val[0] === 'object' && (val[0].jobTitle || val[0].title || val[0].position)) {
+                            for (const item of val) {
+                                const title =
+                                    item.title ||
+                                    item.jobTitle ||
+                                    item.name ||
+                                    item.position;
+                                const company =
+                                    item.company ||
+                                    item.companyName ||
+                                    item.employer ||
+                                    item.hiringOrganization?.name;
+                                const location = 
+                                    item.location ||
+                                    item.locationName ||
+                                    item.city ||
+                                    item.region ||
+                                    item.address;
+                                const salary = item.salary || item.salaryText || item.compensation;
+                                const postedAt = item.datePosted || item.datePublished;
+                                const url = item.url || item.link || item.jobUrl || item.applyUrl;
+                                const jobId =
+                                    item.identifier?.value ||
+                                    item.identifier ||
+                                    item.id ||
+                                    getJobIdFromUrl(url);
+
+                                if (!title || !url) continue;
+
+                                jobs.push({
+                                    title: cleanText(title),
+                                    company: cleanText(company),
+                                    location: cleanText(location),
+                                    salary: cleanText(salary),
+                                    description: cleanText(item.description || item.summary || item.teaser),
+                                    postedAt: cleanText(postedAt),
+                                    url: normalizeUrl(url),
+                                    jobId: cleanText(jobId),
+                                    source: 'inline_state',
+                                    listingPageUrl: requestUrl,
+                                });
+                            }
+                        } else {
+                            for (const v of val) {
+                                if (typeof v === 'object') findJobsInObject(v);
+                            }
+                        }
+                    } else if (typeof val === 'object') {
+                        findJobsInObject(val);
+                    }
+                }
+            };
+
+            findJobsInObject(data);
+        } catch (err) {
+            log.debug('Failed to parse inline state JSON', { url: requestUrl, message: err?.message });
+        }
     }
+
+    return jobs;
 };
 
-/**
- * Fetch and extract job details from detail page
- */
 const fetchJobDetails = async (jobUrl, fetchViaHttp) => {
     try {
         await randomDelay(500, 1500); // Polite delay
@@ -353,36 +411,49 @@ const fetchJobDetails = async (jobUrl, fetchViaHttp) => {
         let descriptionHtml = null;
         let descriptionText = null;
 
-        // Try various selectors for job description
-        const descSelectors = [
+        const descriptionSelectors = [
             '[class*="job-description"]',
-            '[class*="jobDescription"]',
-            '[id*="job-description"]',
-            '[class*="description"]',
-            'article [class*="content"]',
-            '.job-details',
-            '#job-details',
+            '[data-test="job-description"]',
+            '.job-description',
+            '.description',
+            '#job-description',
+            'section[role="main"]',
         ];
 
-        for (const selector of descSelectors) {
-            const elem = $(selector).first();
-            if (elem.length && elem.text().trim().length > 50) {
-                descriptionHtml = elem.html();
-                descriptionText = cleanText(elem.text());
+        for (const sel of descriptionSelectors) {
+            const el = $(sel).first();
+            if (el.length) {
+                descriptionHtml = el.html();
+                descriptionText = cleanText(el.text());
                 break;
             }
         }
 
-        // Extract additional metadata
-        let jobType = null;
-        const jobTypeMatch = $('body').text().match(/\b(Permanent|Temporary|Contract|Part[- ]?time|Full[- ]?time)\b/i);
-        if (jobTypeMatch) {
-            jobType = cleanText(jobTypeMatch[0]);
+        if (!descriptionHtml) {
+            const main = $('main').first();
+            if (main.length) {
+                descriptionHtml = main.html();
+                descriptionText = cleanText(main.text());
+            }
         }
 
-        // Try to extract application URL
+        let jobType = null;
+        const typeSelectors = [
+            '[class*="job-type"]',
+            '[data-test="job-type"]',
+            '.job-meta',
+            '.job-facts',
+        ];
+        for (const sel of typeSelectors) {
+            const text = cleanText($(sel).first().text());
+            if (text && text.length < 200) {
+                jobType = text;
+                break;
+            }
+        }
+
         let applyUrl = null;
-        const applyButton = $('a[href*="apply"], button[onclick*="apply"]').first();
+        const applyButton = $('a[href*="apply"], button[data-test*="apply"]').first();
         if (applyButton.length) {
             const href = applyButton.attr('href');
             if (href) {
@@ -461,6 +532,8 @@ await Actor.main(async () => {
     const fetchViaHttp = async (url, retries = 3) => {
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
+                // Small random delay per attempt for politeness/stealth
+                await randomDelay(300, 900);
                 // Use impit's fetch API which automatically sends browser-like headers
                 let fetchOptions = {
                     headers: {
@@ -470,21 +543,12 @@ await Actor.main(async () => {
                     },
                 };
 
-                // Add proxy if configured
+                // Add proxy if configured (use impit's proxyUrl option)
                 if (proxyConfiguration) {
                     try {
                         const proxyUrl = await proxyConfiguration.newUrl();
                         if (proxyUrl) {
-                            // Extract proxy details for fetch API
-                            const proxyUrlObj = new URL(proxyUrl);
-                            fetchOptions.proxy = {
-                                host: proxyUrlObj.hostname,
-                                port: parseInt(proxyUrlObj.port),
-                                auth: proxyUrlObj.username ? {
-                                    username: proxyUrlObj.username,
-                                    password: proxyUrlObj.password,
-                                } : undefined,
-                            };
+                            fetchOptions.proxyUrl = proxyUrl;
                         }
                     } catch (err) {
                         log.warning('Unable to configure proxy for HTTP fetch', { message: err?.message });
@@ -540,18 +604,17 @@ await Actor.main(async () => {
 
     const crawler = new BasicCrawler({
         requestQueue,
-        proxyConfiguration,
         maxConcurrency: DEFAULT_MAX_CONCURRENCY,
         maxRequestRetries: DEFAULT_MAX_RETRIES,
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 50,
             sessionOptions: {
-                maxUsageCount: 10,
+                maxUsageCount: 50,
                 maxErrorScore: 3,
             },
         },
-        requestHandler: async ({ request, log: crawlerLog, session }) => {
+        async requestHandler({ request, log: crawlerLog, session }) {
             const { label, pageNum } = request.userData;
             if (label !== 'LIST') return;
 
@@ -568,14 +631,14 @@ await Actor.main(async () => {
             let html = '';
             let status = null;
             let contentType = '';
-            // HTTP-only fetch using impit's fetch API
+            // HTTP-only fetch using impit
             try {
                 const res = await fetchViaHttp(request.url);
                 status = res.statusCode || null;
                 contentType = res.headers['content-type'] || '';
-                html = res.body || '';
+                html = res.body?.toString?.('utf8') ?? '';
                 if (status === 200 && html) {
-                    crawlerLog.info('Fetched via impit HTTP client', { status, contentType });
+                    crawlerLog.info('Fetched via HTTP client', { status, contentType });
                 } else {
                     crawlerLog.warning('HTTP fetch blocked or empty', { status, contentType });
                 }
@@ -587,16 +650,20 @@ await Actor.main(async () => {
             const isJsonLike = (contentType || '').includes('application/json') || html.trim().startsWith('{');
             const collected = [];
 
+            // 1) JSON API style responses (if content-type is JSON)
             if (isJsonLike) {
                 collected.push(...tryParseJsonApi(html, request.url));
             }
 
+            // 2) Inline JSON state (e.g. __NEXT_DATA__)
+            collected.push(...extractFromInlineState(html, request.url));
+
+            // 3) JSON-LD script tags
             collected.push(...extractJsonLdJobs(html, request.url));
 
+            // 4) HTML DOM parsing as a fallback
             const $ = cheerio.load(html);
             collected.push(...extractJobsFromHtml($, request.url));
-
-            collected.push(...extractFromInlineState(html, request.url));
 
             const deduped = [];
             for (const job of collected) {
@@ -615,55 +682,50 @@ await Actor.main(async () => {
                 deduped.push(job);
             }
 
-            const remaining = targetResults - jobsSaved;
-            let toSave = deduped.slice(0, remaining);
+            if (deduped.length) {
+                const toSave = [];
 
-            // Fetch job details if collectDetails is enabled
-            if (input.collectDetails && toSave.length) {
-                crawlerLog.info('Fetching job details for listings', { count: toSave.length });
-                
-                const detailsPromises = toSave.map(async (job) => {
-                    const details = await fetchJobDetails(job.url, fetchViaHttp);
-                    if (details) {
-                        return {
-                            ...job,
-                            descriptionHtml: details.descriptionHtml,
-                            descriptionText: details.descriptionText || job.description,
-                            jobType: details.jobType,
-                            applyUrl: details.applyUrl,
-                        };
+                for (const job of deduped) {
+                    if (jobsSaved >= targetResults) break;
+
+                    const finalJob = { ...job };
+
+                    if (input.collectDetails) {
+                        try {
+                            const details = await fetchJobDetails(job.url, fetchViaHttp);
+                            if (details) {
+                                finalJob.descriptionHtml = details.descriptionHtml || finalJob.description;
+                                finalJob.description = details.descriptionText || finalJob.description;
+                                finalJob.jobType = details.jobType || finalJob.jobType;
+                                finalJob.applyUrl = details.applyUrl || finalJob.applyUrl;
+                                finalJob.detailsFetched = true;
+                            }
+                        } catch (err) {
+                            crawlerLog.debug('Failed to fetch job details', { url: job.url, message: err?.message });
+                        }
                     }
-                    return job;
-                });
 
-                try {
-                    toSave = await Promise.all(detailsPromises);
-                    crawlerLog.info('Job details fetched successfully');
-                } catch (err) {
-                    crawlerLog.error('Error fetching job details batch', { message: err?.message });
+                    toSave.push(finalJob);
+                    jobsSaved += 1;
                 }
-            }
 
-            if (toSave.length) {
-                await Dataset.pushData(
-                    toSave.map((job) => ({
-                        ...job,
-                        searchKeyword: keyword || null,
-                        searchLocation: location || null,
+                if (toSave.length) {
+                    await Dataset.pushData(toSave);
+                    crawlerLog.info('Saved jobs from page', {
+                        url: request.url,
                         pageNum,
-                        transport: 'http',
-                        scrapedAt: new Date().toISOString(),
-                    })),
-                );
-                jobsSaved += toSave.length;
-                crawlerLog.info('Saved jobs from page', {
-                    pageNum,
-                    saved: toSave.length,
-                    jobsSaved,
-                    targetResults,
-                    sourceMix: Array.from(new Set(toSave.map((j) => j.source))),
-                    withDetails: input.collectDetails || false,
-                });
+                        jobsOnPage: deduped.length,
+                        jobsSavedSoFar: jobsSaved,
+                        targetResults,
+                        sourceMix: Array.from(new Set(toSave.map((j) => j.source))),
+                        withDetails: input.collectDetails || false,
+                    });
+                } else {
+                    crawlerLog.warning('No jobs extracted on page', {
+                        url: request.url,
+                        pageNum,
+                    });
+                }
             } else {
                 crawlerLog.warning('No jobs extracted on page', {
                     url: request.url,
@@ -683,7 +745,15 @@ await Actor.main(async () => {
                 return;
             }
 
-            // Check if we got any jobs from this page - stop if empty
+            // Check if we got any jobs from this page - log strongly on first page, stop on later pages
+            if (deduped.length === 0 && pageNum === 1) {
+                crawlerLog.error('No jobs found on first page, possible layout change or blocking', {
+                    url: request.url,
+                    status,
+                    contentType,
+                    htmlSnippet: html.slice(0, 500),
+                });
+            }
             if (deduped.length === 0 && pageNum > 1) {
                 crawlerLog.warning('No jobs found on page, assuming end of results', { pageNum });
                 return;
@@ -701,12 +771,7 @@ await Actor.main(async () => {
                     label: 'LIST',
                     pageNum: nextPageNum,
                 },
-                headers: {
-                    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'accept-language': 'en-GB,en;q=0.9',
-                    'referer': request.url,
-                    'upgrade-insecure-requests': '1',
-                },
+                headers: buildHeaders(request.url),
                 useExtendedUniqueKey: true,
             });
 
