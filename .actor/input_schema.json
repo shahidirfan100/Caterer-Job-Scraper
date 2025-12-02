@@ -1,73 +1,83 @@
 {
-  "title": "Caterer Job Scraper",
-  "description": "Scrape hospitality and catering jobs from Caterer.com. Provide either keyword/location OR a Caterer.com search URL (startUrl, url, or startUrls). Actor paginates and optionally scrapes detail pages.",
+  "title": "Caterer Job Scraper - Production v2.0",
+  "description": "Production-grade scraper using impit + Playwright with advanced stealth. Provide keyword/location OR a direct search URL. Features: HTTP-first strategy, UK residential proxies, job detail scraping, and intelligent error handling.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
-      "title": "Start URL",
+      "title": "Start URL (Optional)",
       "type": "string",
-      "description": "Start scraping from a specific Caterer.com search URL. If provided, this will be used instead of Keyword/Location.",
-      "editor": "textfield"
+      "description": "Direct Caterer.com search URL. If provided, overrides keyword/location parameters.",
+      "editor": "textfield",
+      "example": "https://www.caterer.com/jobs/search?keywords=chef&location=london"
     },
     "keyword": {
-      "title": "Keyword (if not using Start URL)",
+      "title": "Job Keyword",
       "type": "string",
-      "description": "Job search keyword(s), e.g., 'Head Chef', 'Restaurant Manager', 'Sous Chef', 'Bartender'.",
-      "editor": "textfield"
+      "description": "Job title, role, or skill keywords (e.g., 'Chef', 'Sous Chef', 'Restaurant Manager', 'Bartender')",
+      "editor": "textfield",
+      "example": "chef"
     },
     "location": {
-      "title": "Location (if not using Start URL)",
+      "title": "Location",
       "type": "string",
-      "description": "Location to search for jobs (e.g., 'London', 'Manchester', 'Birmingham'). Leave empty for all locations.",
-      "editor": "textfield"
-    },
-    "postedWithin": {
-      "title": "Jobs posted within",
-      "type": "string",
-      "description": "Only keep jobs posted within this time window.",
-      "enum": [
-        "any",
-        "24h",
-        "7d",
-        "30d"
-      ],
-      "enumTitles": [
-        "Any time",
-        "Last 24 hours",
-        "Last 7 days",
-        "Last 30 days"
-      ],
-      "default": "any"
+      "description": "City, region, or postcode (e.g., 'London', 'Manchester', 'Edinburgh'). Leave empty for all UK locations.",
+      "editor": "textfield",
+      "example": "london"
     },
     "collectDetails": {
-      "title": "Collect job details",
+      "title": "Collect Job Details",
       "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description and additional information.",
+      "description": "Fetch full job descriptions from individual job pages. Includes: descriptionHtml, descriptionText, jobType, applyUrl. (Slower but more complete data)",
       "editor": "checkbox",
       "default": true
     },
     "results_wanted": {
-      "title": "Maximum number of jobs",
+      "title": "Results Wanted",
       "type": "integer",
-      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
+      "description": "Maximum number of jobs to collect (1-1000). Actor stops when this limit is reached.",
       "minimum": 1,
-      "default": 100,
+      "maximum": 1000,
+      "default": 50,
       "editor": "number"
     },
     "max_pages": {
-      "title": "Maximum number of pages",
+      "title": "Max Pages",
       "type": "integer",
-      "description": "A safety cap on the number of search result pages to visit.",
+      "description": "Maximum search result pages to process (safety limit). Stops if no jobs found on a page.",
       "minimum": 1,
-      "editor": "number",
-      "default": 20
+      "maximum": 50,
+      "default": 20,
+      "editor": "number"
+    },
+    "maxConcurrency": {
+      "title": "Max Concurrency",
+      "type": "integer",
+      "description": "Number of parallel requests (1-5). Lower values = fewer blocks but slower. Recommended: 2-3 for RESIDENTIAL proxies.",
+      "minimum": 1,
+      "maximum": 5,
+      "default": 2,
+      "editor": "number"
+    },
+    "strategy": {
+      "title": "Fetch Strategy",
+      "type": "string",
+      "description": "HTTP-first: Fast HTTP requests with Playwright fallback (recommended). Playwright-only: Always use full browser rendering (slower, more reliable).",
+      "editor": "select",
+      "enum": ["http_first", "playwright_only"],
+      "enumTitles": ["HTTP First (Recommended - Fast)", "Playwright Only (Slower, More Reliable)"],
+      "default": "http_first"
     },
     "proxyConfiguration": {
-      "title": "Proxy configuration",
+      "title": "Proxy Configuration",
       "type": "object",
-      "description": "Use Apify Proxy (datacenter recommended for Caterer.com).",
-      "editor": "proxy"
+      "description": "⚠️ RESIDENTIAL proxies highly recommended for UK sites. Default: GB RESIDENTIAL IPs for best results.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"],
+        "apifyProxyCountry": "GB"
+      }
     }
   },
   "required": [],

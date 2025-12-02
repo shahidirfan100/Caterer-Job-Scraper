@@ -1,10 +1,20 @@
 # Caterer Job Scraper - Hospitality & Catering Jobs 🚀
 
-> **Production-grade job scraper using Playwright** - Extract comprehensive job listings from Caterer.com with advanced stealth measures and JavaScript rendering. The UK's leading hospitality and catering recruitment data source.
+> **Production-grade job scraper using impit + Playwright** - Extract comprehensive job listings from Caterer.com with advanced stealth measures, dual-strategy fetching (HTTP-first, Playwright fallback), and intelligent data extraction. The UK's leading hospitality and catering recruitment data source.
 
 ## 🌟 What This Actor Does
 
-The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com using **Playwright** for full JavaScript rendering and comprehensive anti-detection measures. Built for production use with residential proxies, browser fingerprinting, and human-like behavior simulation.
+The Caterer Job Scraper automatically extracts detailed job listings from Caterer.com using a **dual-strategy approach**:
+1. **Primary**: Fast HTTP fetching with **impit** (intelligent HTTP client with auto-retry and stealth)
+2. **Fallback**: Full **Playwright** browser rendering for JavaScript-heavy pages
+
+Built for production use with:
+- ✅ **impit** for robust HTTP fetching with automatic retries
+- ✅ **header-generator** for realistic browser fingerprinting
+- ✅ UK residential proxies with aggressive session rotation
+- ✅ Human-like behavior simulation (random delays, realistic headers)
+- ✅ Comprehensive error handling and exponential backoff
+- ✅ Dual-strategy: HTTP-first for speed, Playwright for reliability
 
 ### ✨ Key Features
 

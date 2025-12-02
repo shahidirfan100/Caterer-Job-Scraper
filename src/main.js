@@ -1,6 +1,6 @@
 import { Actor, Dataset, log } from 'apify';
 import { PlaywrightCrawler, RequestQueue } from 'crawlee';
-import { gotScraping } from 'got-scraping';
+import { impit } from 'impit';
 import * as cheerio from 'cheerio';
 
 /**
@@ -25,6 +25,18 @@ const getJobIdFromUrl = (url) => {
     }
 };
 
+const normalizeUrl = (url, baseUrl = 'https://www.caterer.com') => {
+    try {
+        if (!url) return null;
+        if (url.startsWith('http')) return url;
+        if (url.startsWith('//')) return `https:${url}`;
+        if (url.startsWith('/')) return `${baseUrl}${url}`;
+        return `${baseUrl}/${url}`;
+    } catch {
+        return null;
+    }
+};
+
 const guessStartUrl = ({ keyword, location, startUrl }) => {
     if (startUrl && startUrl.trim()) return startUrl.trim();
 
@@ -41,21 +53,10 @@ const buildNextPageUrl = (currentUrl, nextPageNum) => {
     return url.toString();
 };
 
-const buildHeaders = (refererUrl) => ({
-    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7',
-    'accept-language': 'en-GB,en;q=0.9',
-    'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-    referer: refererUrl,
-    'upgrade-insecure-requests': '1',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'none',
-    'sec-fetch-user': '?1',
-    'sec-ch-ua': '"Chromium";v="120", "Not.A/Brand";v="24", "Google Chrome";v="120"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-});
+const randomDelay = (min = 1000, max = 3000) => {
+    const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+    return new Promise(resolve => setTimeout(resolve, delay));
+};
 
 /**
  * JSON/HTML extraction helpers
@@ -184,100 +185,131 @@ const extractJsonLdJobs = (html, requestUrl) => {
 const extractJobsFromHtml = ($, requestUrl) => {
     const jobs = [];
 
+    // Primary selector for job listings
     $('h2 a[href*="/job/"]').each((_, anchor) => {
         const $a = $(anchor);
-        const url = $a.attr('href');
+        let url = $a.attr('href');
         const title = cleanText($a.text());
         if (!url || !title) return;
 
-        const card =
-            $a.closest('article')?.first() ||
-            $a.closest('li')?.first() ||
-            $a.closest('[class*="job"]')?.first() ||
-            $a.parent();
+        // Normalize URL
+        url = normalizeUrl(url);
+        if (!url) return;
 
-        const linesRaw = card
-            ? card.text().split('\n').map((l) => l.trim()).filter(Boolean)
-            : [];
+        // Find the job card container
+        const card = $a.closest('article').first().length 
+            ? $a.closest('article').first()
+            : $a.closest('li').first().length 
+            ? $a.closest('li').first()
+            : $a.closest('[class*="job"]').first().length
+            ? $a.closest('[class*="job"]').first()
+            : $a.closest('div').first();
 
-        const lines = [];
-        for (const line of linesRaw) {
-            if (!lines.length || lines[lines.length - 1] !== line) {
-                lines.push(line);
-            }
-        }
-
-        const titleIdx = lines.findIndex((l) => l === title);
+        // Try to extract company name
         let company = null;
+        // Look for company in specific selectors
+        const companySelectors = [
+            card.find('span[class*="company"]').first().text(),
+            card.find('div[class*="company"]').first().text(),
+            card.find('[class*="employer"]').first().text(),
+            card.find('p').first().text(), // Often first paragraph after title
+        ];
+        
+        for (const compText of companySelectors) {
+            const cleaned = cleanText(compText);
+            if (cleaned && cleaned.length > 2 && cleaned.length < 100) {
+                company = cleaned;
+                break;
+            }
+        }
+
+        // Try to extract location
         let location = null;
+        const locationSelectors = [
+            card.find('span[class*="location"]').first().text(),
+            card.find('div[class*="location"]').first().text(),
+            card.find('[class*="place"]').first().text(),
+        ];
+
+        for (const locText of locationSelectors) {
+            const cleaned = cleanText(locText);
+            if (cleaned) {
+                location = cleaned;
+                break;
+            }
+        }
+
+        // Fallback: parse from all text
+        if (!location || !company) {
+            const allText = card.text();
+            const lines = allText.split('\n').map(l => cleanText(l)).filter(Boolean);
+            
+            // Deduplicate consecutive lines
+            const uniqueLines = [];
+            for (const line of lines) {
+                if (!uniqueLines.length || uniqueLines[uniqueLines.length - 1] !== line) {
+                    uniqueLines.push(line);
+                }
+            }
+
+            const isMoneyLine = (line) =>
+                /[\u00A3$€]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b|\bp\/h\b|\bp\.a\./i.test(line);
+            const isPostedLine = (line) => /\b(ago|Today|Yesterday|hours?|days?|weeks?|months?)\s+ago\b/i.test(line);
+            const isLocationLine = (line) => 
+                /[A-Z]{1,2}\d[\dA-Z]?\s*\d[A-Z]{2}/.test(line) || // UK postcode
+                /\b(London|Manchester|Birmingham|Leeds|Liverpool|Scotland|Wales|England|UK)\b/i.test(line);
+
+            const titleIdx = uniqueLines.findIndex(l => l === title);
+            
+            // Extract company (usually first line after title)
+            if (!company && titleIdx !== -1) {
+                for (let i = titleIdx + 1; i < uniqueLines.length; i++) {
+                    const line = uniqueLines[i];
+                    if (isMoneyLine(line) || isPostedLine(line) || isLocationLine(line)) continue;
+                    if (line.length > 2 && line.length < 100) {
+                        company = line;
+                        break;
+                    }
+                }
+            }
+
+            // Extract location
+            if (!location) {
+                for (const line of uniqueLines) {
+                    if (isLocationLine(line) && !isMoneyLine(line) && !isPostedLine(line)) {
+                        location = line;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Try to extract salary
         let salary = null;
+        const salaryText = card.text();
+        const salaryMatch = salaryText.match(/[\u00A3$€][\d,]+(?:\s*-\s*[\u00A3$€]?[\d,]+)?(?:\s+per\s+(?:annum|hour|year|week|day))?|Up\s+to\s+[\u00A3$€][\d,]+/i);
+        if (salaryMatch) {
+            salary = cleanText(salaryMatch[0]);
+        }
+
+        // Try to extract posted date
         let postedAt = null;
-
-        const isMoneyLine = (line) =>
-            /[\u00A3$]|\bper annum\b|\bper hour\b|\bper year\b|\bUp To\b/i.test(line);
-        const isPostedLine = (line) => /\b(ago|Today|Yesterday)\b/i.test(line);
-
-        for (let i = titleIdx + 1; i < lines.length; i++) {
-            const line = lines[i];
-            if (isMoneyLine(line) || isPostedLine(line)) continue;
-            company = line;
-            break;
+        const postedMatch = card.text().match(/(\d+\s+(?:hours?|days?|weeks?|months?)\s+ago|Today|Yesterday)/i);
+        if (postedMatch) {
+            postedAt = cleanText(postedMatch[0]);
         }
 
-        const companyIdx = company ? lines.indexOf(company, titleIdx + 1) : -1;
-        for (let i = companyIdx + 1; i < lines.length; i++) {
-            const line = lines[i];
-            if (isMoneyLine(line) || isPostedLine(line)) continue;
-            if (
-                /[A-Z]{1,2}\d[\dA-Z]? ?\d[A-Z]{2}/.test(line) ||
-                line.includes(',') ||
-                /\b(UK|London|Manchester|Birmingham|Scotland|Wales|England)\b/i.test(line)
-            ) {
-                location = line;
-                break;
-            }
-        }
-
-        const locIdx = location ? lines.indexOf(location, (companyIdx + 1) || 0) : companyIdx;
-        for (let i = locIdx + 1; i < lines.length; i++) {
-            const line = lines[i];
-            if (isMoneyLine(line)) {
-                salary = line;
-                break;
-            }
-        }
-
-        for (let i = lines.length - 1; i >= 0; i--) {
-            if (isPostedLine(lines[i])) {
-                postedAt = lines[i];
-                break;
-            }
-        }
-
-        const descLines = [];
-        const salaryIdx = salary ? lines.indexOf(salary) : -1;
-        const stopTokens = ['more', 'NEW', 'FEATURED', 'NEWFEATURED'];
-
-        if (salaryIdx !== -1) {
-            for (let i = salaryIdx + 1; i < lines.length; i++) {
-                const line = lines[i];
-                if (stopTokens.includes(line.toUpperCase()) || isPostedLine(line)) break;
-                if (!isMoneyLine(line)) descLines.push(line);
-            }
-        }
-
-        const description = descLines.length ? descLines.join(' ') : null;
         const jobId = getJobIdFromUrl(url);
 
         jobs.push({
             title,
-            company: cleanText(company),
-            location: cleanText(location),
-            salary: cleanText(salary),
-            description: cleanText(description),
-            postedAt: cleanText(postedAt),
+            company,
+            location,
+            salary,
+            description: null, // Will be populated if collectDetails is enabled
+            postedAt,
             url,
-            jobId: cleanText(jobId),
+            jobId,
             source: 'html',
             listingPageUrl: requestUrl,
         });
@@ -298,6 +330,75 @@ const extractFromInlineState = (html, requestUrl) => {
         return tryParseJsonApi(JSON.stringify(jobs), requestUrl);
     } catch {
         return [];
+    }
+};
+
+/**
+ * Fetch and extract job details from detail page
+ */
+const fetchJobDetails = async (jobUrl, fetchViaHttp) => {
+    try {
+        await randomDelay(500, 1500); // Polite delay
+        
+        const response = await fetchViaHttp(jobUrl, 2);
+        if (!response || response.statusCode !== 200 || !response.body) {
+            log.warning('Failed to fetch job details', { jobUrl, status: response?.statusCode });
+            return null;
+        }
+
+        const html = response.body;
+        const $ = cheerio.load(html);
+
+        // Extract full job description
+        let descriptionHtml = null;
+        let descriptionText = null;
+
+        // Try various selectors for job description
+        const descSelectors = [
+            '[class*="job-description"]',
+            '[class*="jobDescription"]',
+            '[id*="job-description"]',
+            '[class*="description"]',
+            'article [class*="content"]',
+            '.job-details',
+            '#job-details',
+        ];
+
+        for (const selector of descSelectors) {
+            const elem = $(selector).first();
+            if (elem.length && elem.text().trim().length > 50) {
+                descriptionHtml = elem.html();
+                descriptionText = cleanText(elem.text());
+                break;
+            }
+        }
+
+        // Extract additional metadata
+        let jobType = null;
+        const jobTypeMatch = $('body').text().match(/\b(Permanent|Temporary|Contract|Part[- ]?time|Full[- ]?time)\b/i);
+        if (jobTypeMatch) {
+            jobType = cleanText(jobTypeMatch[0]);
+        }
+
+        // Try to extract application URL
+        let applyUrl = null;
+        const applyButton = $('a[href*="apply"], button[onclick*="apply"]').first();
+        if (applyButton.length) {
+            const href = applyButton.attr('href');
+            if (href) {
+                applyUrl = normalizeUrl(href);
+            }
+        }
+
+        return {
+            descriptionHtml,
+            descriptionText,
+            jobType,
+            applyUrl,
+        };
+    } catch (err) {
+        log.error('Error fetching job details', { jobUrl, message: err?.message });
+        return null;
     }
 };
 
@@ -332,8 +433,18 @@ await Actor.main(async () => {
         strategy,
     });
 
-    const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {});
-    log.info('Proxy configured', { usingCustom: !!proxyInput });
+    // Configure proxy with residential IPs for better success rate
+    const proxyConfiguration = await Actor.createProxyConfiguration(
+        proxyInput || {
+            groups: ['RESIDENTIAL'],
+            countryCode: 'GB', // Use UK IPs for better geo-targeting
+        }
+    );
+    log.info('Proxy configured', { 
+        usingCustom: !!proxyInput,
+        groups: proxyInput?.groups || ['RESIDENTIAL'],
+        countryCode: proxyInput?.countryCode || 'GB',
+    });
 
     const requestQueue = await RequestQueue.open();
     await requestQueue.addRequest({
@@ -351,59 +462,139 @@ await Actor.main(async () => {
     let jobsSaved = 0;
     let pagesProcessed = 0;
 
-    const fetchViaHttp = async (url) => {
-        const headers = buildHeaders(url);
-        const opts = {
-            url,
-            headers,
-            timeout: { request: 25000 },
-            http2: false,
-            throwHttpErrors: false,
-        };
-
-        if (proxyConfiguration) {
+    const fetchViaHttp = async (url, retries = 3) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                const proxyUrl = await proxyConfiguration.newUrl();
-                if (proxyUrl) {
-                    opts.proxyUrl = proxyUrl;
+                const opts = {
+                    url,
+                    headers: {
+                        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'accept-language': 'en-GB,en;q=0.9',
+                        'referer': 'https://www.caterer.com/',
+                        'upgrade-insecure-requests': '1',
+                    },
+                    timeout: 30000,
+                    retry: {
+                        limit: 0, // We handle retries manually
+                    },
+                };
+
+                if (proxyConfiguration) {
+                    try {
+                        const proxyUrl = await proxyConfiguration.newUrl();
+                        if (proxyUrl) {
+                            opts.proxyUrl = proxyUrl;
+                        }
+                    } catch (err) {
+                        log.warning('Unable to set proxy for HTTP fetch', { message: err?.message });
+                    }
                 }
+
+                const response = await impit(opts);
+                
+                if (response.statusCode === 200 && response.body) {
+                    log.debug('HTTP fetch successful', { 
+                        url, 
+                        attempt, 
+                        statusCode: response.statusCode,
+                        bodyLength: response.body.length 
+                    });
+                    return response;
+                }
+
+                if ([403, 429, 503].includes(response.statusCode)) {
+                    log.warning(`HTTP blocked with ${response.statusCode}, attempt ${attempt}/${retries}`);
+                    if (attempt < retries) {
+                        await randomDelay(2000 * attempt, 4000 * attempt); // Exponential backoff
+                        continue;
+                    }
+                }
+
+                return response;
             } catch (err) {
-                log.warning('Unable to set proxy for HTTP fetch', { message: err?.message });
+                log.warning(`HTTP fetch error, attempt ${attempt}/${retries}`, { 
+                    url, 
+                    message: err?.message 
+                });
+                if (attempt < retries) {
+                    await randomDelay(1500 * attempt, 3000 * attempt);
+                    continue;
+                }
+                throw err;
             }
         }
-
-        const res = await gotScraping(opts);
-        return res;
     };
 
     const crawler = new PlaywrightCrawler({
         requestQueue,
         proxyConfiguration,
-        maxConcurrency,
+        maxConcurrency: Math.max(1, maxConcurrency), // At least 1 concurrent request
         headless: true,
-        navigationTimeoutSecs: 30,
-        maxRequestRetries: 4,
+        navigationTimeoutSecs: 35,
+        maxRequestRetries: 5,
         useSessionPool: true,
         persistCookiesPerSession: true,
+        sessionPoolOptions: {
+            maxPoolSize: 50,
+            sessionOptions: {
+                maxUsageCount: 10, // Rotate session after 10 uses
+                maxErrorScore: 3, // Retire session after 3 errors
+            },
+        },
         launchContext: {
             launchOptions: {
                 args: [
                     '--disable-dev-shm-usage',
-                    '--disable-http2', // force HTTP/1.1 to avoid proxy/http2 protocol errors
-                    '--disable-features=NetworkService,NetworkServiceInProcess',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-web-security',
+                    '--disable-setuid-sandbox',
+                    '--no-sandbox',
                 ],
                 ignoreHTTPSErrors: true,
             },
         },
         preNavigationHooks: [
             async ({ page, request, session }, gotoOptions) => {
+                // Block unnecessary resources for faster scraping
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
-                    if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                    if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+                        return route.abort();
+                    }
                     return route.continue();
                 });
-                await page.setExtraHTTPHeaders(buildHeaders(request.url));
+
+                await page.setExtraHTTPHeaders({
+                    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'accept-language': 'en-GB,en;q=0.9',
+                    'referer': 'https://www.caterer.com/',
+                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                });
+
+                // Additional stealth measures
+                await page.addInitScript(() => {
+                    // Override navigator.webdriver
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => false,
+                    });
+
+                    // Mock permissions
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            originalQuery(parameters)
+                    );
+
+                    // Add chrome runtime
+                    window.chrome = {
+                        runtime: {},
+                    };
+                });
+
                 gotoOptions.waitUntil = 'domcontentloaded';
+                gotoOptions.timeout = 30000;
             },
         ],
         requestHandler: async ({ page, request, log: crawlerLog, session }) => {
@@ -502,24 +693,58 @@ await Actor.main(async () => {
                 const uniqueKey = job.jobId || job.url;
                 if (!uniqueKey) continue;
                 if (seenJobIds.has(uniqueKey) || seenUrls.has(job.url)) continue;
+                
+                // Validate job has minimum required fields
+                if (!job.title || !job.url) {
+                    crawlerLog.debug('Skipping job with missing required fields', { job });
+                    continue;
+                }
+                
                 seenJobIds.add(uniqueKey);
                 seenUrls.add(job.url);
                 deduped.push(job);
             }
 
             const remaining = targetResults - jobsSaved;
-            const toSave = deduped.slice(0, remaining);
+            let toSave = deduped.slice(0, remaining);
+
+            // Fetch job details if collectDetails is enabled
+            if (input.collectDetails && toSave.length) {
+                crawlerLog.info('Fetching job details for listings', { count: toSave.length });
+                
+                const detailsPromises = toSave.map(async (job) => {
+                    const details = await fetchJobDetails(job.url, fetchViaHttp);
+                    if (details) {
+                        return {
+                            ...job,
+                            descriptionHtml: details.descriptionHtml,
+                            descriptionText: details.descriptionText || job.description,
+                            jobType: details.jobType,
+                            applyUrl: details.applyUrl,
+                        };
+                    }
+                    return job;
+                });
+
+                try {
+                    toSave = await Promise.all(detailsPromises);
+                    crawlerLog.info('Job details fetched successfully');
+                } catch (err) {
+                    crawlerLog.error('Error fetching job details batch', { message: err?.message });
+                }
+            }
 
             if (toSave.length) {
                 await Dataset.pushData(
                     toSave.map((job) => ({
                         ...job,
-                    searchKeyword: keyword || null,
-                    searchLocation: location || null,
-                    pageNum,
-                    transport: usedPlaywright ? 'playwright' : 'http',
-                })),
-            );
+                        searchKeyword: keyword || null,
+                        searchLocation: location || null,
+                        pageNum,
+                        transport: usedPlaywright ? 'playwright' : 'http',
+                        scrapedAt: new Date().toISOString(),
+                    })),
+                );
                 jobsSaved += toSave.length;
                 crawlerLog.info('Saved jobs from page', {
                     pageNum,
@@ -527,6 +752,7 @@ await Actor.main(async () => {
                     jobsSaved,
                     targetResults,
                     sourceMix: Array.from(new Set(toSave.map((j) => j.source))),
+                    withDetails: input.collectDetails || false,
                 });
             } else {
                 crawlerLog.warning('No jobs extracted on page', {
@@ -547,6 +773,15 @@ await Actor.main(async () => {
                 return;
             }
 
+            // Check if we got any jobs from this page - stop if empty
+            if (deduped.length === 0 && pageNum > 1) {
+                crawlerLog.warning('No jobs found on page, assuming end of results', { pageNum });
+                return;
+            }
+
+            // Add polite delay before queuing next page
+            await randomDelay(1000, 2500);
+
             const nextPageNum = pageNum + 1;
             const nextUrl = buildNextPageUrl(request.url, nextPageNum);
 
@@ -556,7 +791,12 @@ await Actor.main(async () => {
                     label: 'LIST',
                     pageNum: nextPageNum,
                 },
-                headers: buildHeaders(request.url),
+                headers: {
+                    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'accept-language': 'en-GB,en;q=0.9',
+                    'referer': request.url,
+                    'upgrade-insecure-requests': '1',
+                },
                 useExtendedUniqueKey: true,
             });
 

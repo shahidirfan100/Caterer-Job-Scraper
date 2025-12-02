@@ -1,17 +1,101 @@
 {
   "actorSpecification": 1,
-  "fields": {},
+  "fields": {
+    "title": {
+      "type": "string",
+      "description": "Job position title"
+    },
+    "company": {
+      "type": "string",
+      "nullable": true,
+      "description": "Hiring organization name"
+    },
+    "location": {
+      "type": "string",
+      "nullable": true,
+      "description": "Job location (city, region, postcode)"
+    },
+    "salary": {
+      "type": "string",
+      "nullable": true,
+      "description": "Salary information when available"
+    },
+    "jobType": {
+      "type": "string",
+      "nullable": true,
+      "description": "Employment type (Permanent, Temporary, Contract, Part-time, Full-time)"
+    },
+    "postedAt": {
+      "type": "string",
+      "nullable": true,
+      "description": "When the job was posted (e.g., '3 days ago', 'Yesterday')"
+    },
+    "url": {
+      "type": "string",
+      "description": "Direct URL to the job listing"
+    },
+    "jobId": {
+      "type": "string",
+      "nullable": true,
+      "description": "Unique job identifier extracted from URL"
+    },
+    "descriptionText": {
+      "type": "string",
+      "nullable": true,
+      "description": "Plain text job description (only when collectDetails=true)"
+    },
+    "descriptionHtml": {
+      "type": "string",
+      "nullable": true,
+      "description": "Full HTML job description (only when collectDetails=true)"
+    },
+    "applyUrl": {
+      "type": "string",
+      "nullable": true,
+      "description": "Direct application URL if available"
+    },
+    "source": {
+      "type": "string",
+      "description": "Data extraction method: 'html', 'json_ld', 'api', 'inline_state'"
+    },
+    "listingPageUrl": {
+      "type": "string",
+      "description": "Search results page where job was found"
+    },
+    "searchKeyword": {
+      "type": "string",
+      "nullable": true,
+      "description": "Input keyword used for search"
+    },
+    "searchLocation": {
+      "type": "string",
+      "nullable": true,
+      "description": "Input location used for search"
+    },
+    "pageNum": {
+      "type": "integer",
+      "description": "Search results page number where job was found"
+    },
+    "transport": {
+      "type": "string",
+      "description": "Fetch method used: 'http' or 'playwright'"
+    },
+    "scrapedAt": {
+      "type": "string",
+      "description": "ISO timestamp when job was scraped"
+    }
+  },
   "views": {
     "overview": {
-      "title": "Overview",
+      "title": "Job Listings Overview",
       "transformation": {
         "fields": [
           "title",
           "company",
           "location",
           "salary",
-          "job_type",
-          "date_posted",
+          "jobType",
+          "postedAt",
           "url"
         ]
       },
@@ -34,19 +118,38 @@
             "label": "Salary",
             "format": "text"
           },
-          "job_type": {
-            "label": "Job Type",
+          "jobType": {
+            "label": "Type",
             "format": "text"
           },
-          "date_posted": {
+          "postedAt": {
             "label": "Posted",
             "format": "text"
           },
           "url": {
-            "label": "URL",
+            "label": "Job URL",
             "format": "link"
           }
         }
+      }
+    },
+    "detailed": {
+      "title": "Detailed View (with Descriptions)",
+      "transformation": {
+        "fields": [
+          "title",
+          "company",
+          "location",
+          "salary",
+          "jobType",
+          "descriptionText",
+          "applyUrl",
+          "url",
+          "scrapedAt"
+        ]
+      },
+      "display": {
+        "component": "table"
       }
     }
   }

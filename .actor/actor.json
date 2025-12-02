@@ -1,13 +1,15 @@
 {
   "actorSpecification": 1,
   "name": "caterer-job-scraper",
-  "version": "1.0.0",
+  "title": "Caterer Job Scraper - Hospitality & Catering Jobs",
+  "description": "Production-grade scraper for Caterer.com using impit + Playwright. Extracts job titles, companies, locations, salaries, and full descriptions with advanced stealth measures.",
+  "version": "2.0.0",
   "buildTag": "latest",
   "dockerfile": "./Dockerfile",
   "readme": "../README.md",
   "input": "./input_schema.json",
   "output": "./output_schema.json",
-  "nodeJsVersion": "22",
+  "nodeJsVersion": "20",
   "storages": {
     "dataset": "./dataset_schema.json"
   }

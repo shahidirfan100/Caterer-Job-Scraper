@@ -1,17 +1,21 @@
 {
   "name": "caterer-job-scraper",
-  "version": "1.0.0",
-  "description": "Caterer Job Scraper",
+  "version": "2.0.0",
+  "description": "Production-ready Caterer Job Scraper with impit, stealth features, and advanced error handling",
   "type": "module",
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "test": "node src/main.js"
   },
+  "author": "Apify",
+  "license": "Apache-2.0",
   "dependencies": {
     "apify": "^3.4.5",
     "crawlee": "^3.14.1",
     "cheerio": "^1.0.0-rc.12",
-    "got-scraping": "^4.1.2",
-    "impit": "^0.9.3",
-    "header-generator": "^2.1.27"
+    "impit": "^0.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
