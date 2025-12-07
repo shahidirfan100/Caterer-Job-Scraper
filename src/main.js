@@ -1,4 +1,7 @@
 // src/main.js
+// Caterer.com Job Scraper - Production Ready
+// Uses HTTP scraping with DOM extraction + Playwright fallback for cookies
+
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { chromium } from 'playwright';
@@ -7,6 +10,9 @@ import * as cheerio from 'cheerio';
 
 const BASE_URL = 'https://www.caterer.com';
 
+/**
+ * Build search URL from keyword/location
+ */
 const buildSearchUrl = (keyword, location, page = 1) => {
     const url = new URL('/jobs/search', BASE_URL);
     if (keyword) url.searchParams.set('keywords', keyword);
@@ -15,8 +21,25 @@ const buildSearchUrl = (keyword, location, page = 1) => {
     return url.href;
 };
 
+/**
+ * Build pagination URL (preserves path, adds/updates page param)
+ */
+const buildPaginatedUrl = (baseUrl, page) => {
+    const url = new URL(baseUrl);
+    url.searchParams.set('page', String(page));
+    return url.href;
+};
+
+/**
+ * Simple delay helper
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Random fingerprint for browser simulation
+ */
 const randomFingerprint = () => {
-    const mobile = Math.random() < 0.35;
+    const mobile = Math.random() < 0.3;
     if (mobile) {
         return {
             ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
@@ -29,13 +52,15 @@ const randomFingerprint = () => {
     };
 };
 
-const dismissPopupsPlaywright = async (page) => {
+/**
+ * Dismiss cookie popups in Playwright
+ */
+const dismissPopups = async (page) => {
     const selectors = [
         'button:has-text("Accept all")',
         'button:has-text("Accept All")',
         '[id*="accept"][type="button"]',
         '[data-testid*="accept"]',
-        '.js-accept-consent',
     ];
     for (const selector of selectors) {
         try {
@@ -50,7 +75,10 @@ const dismissPopupsPlaywright = async (page) => {
     }
 };
 
-const looksBlockedHtml = (html) => {
+/**
+ * Check if HTML looks like a block page
+ */
+const looksBlocked = (html) => {
     const lower = html.toLowerCase();
     return ['captcha', 'access denied', 'verify you are a human', 'unusual traffic'].some((s) =>
         lower.includes(s),
@@ -58,68 +86,23 @@ const looksBlockedHtml = (html) => {
 };
 
 /**
- * Extract RecommenderWidget_listing_list JSON from HTML using regex.
- * (This is the widget that contains "These jobs were popular with other job seekers"
- * and also has proper salary, location, companyName, etc.)
+ * Extract salary from text
  */
-const extractRecommenderState = (html) => {
-    const match = html.match(
-        /__PRELOADED_STATE__\.RecommenderWidget_listing_list\s*=\s*(\{[\s\S]*?\});/,
-    );
-    if (!match) return null;
-    try {
-        return JSON.parse(match[1]);
-    } catch {
-        return null;
-    }
-};
-
-const extractJobsFromJsonState = (html, pageUrl) => {
-    const state = extractRecommenderState(html);
-    if (!state?.props?.jobAdsData?.items?.length) return [];
-
-    const urlObj = new URL(pageUrl);
-    return state.props.jobAdsData.items.map((item) => {
-        const fullUrl = new URL(item.url, urlObj.origin).href;
-
-        return {
-            source: 'caterer.com',
-            job_id: item.id ?? null,
-            title: item.title ?? null,
-            company: item.companyName ?? null,
-            location: item.location ?? null,
-            salary: item.salary ?? null,
-            date_posted: item.datePosted ?? null,
-            url: fullUrl,
-        };
-    });
-};
-
-/**
- * Utility: given a container text, extract a clean salary string like:
- * "£28000.00 - £30000.00 per annum" or "£15.00 - £18.00 per hour".
- */
-const extractCleanSalaryFromText = (text) => {
+const extractSalary = (text) => {
     if (!text) return null;
     const compact = text.replace(/\s+/g, ' ').trim();
-    // Prefer "£... per ..." pattern
     const perMatch = compact.match(/(£[^£]+?per (?:hour|annum|year|week|day))/i);
     if (perMatch) return perMatch[1].trim();
-
-    // Fallback: first "£... " chunk
     const simpleMatch = compact.match(/(£[^£]+?)(?:\s{2,}|$)/);
     if (simpleMatch) return simpleMatch[1].trim();
-
     return null;
 };
 
 /**
- * DOM fallback for listing jobs – with style/script stripped and cleaned fields.
+ * Extract jobs from listing page HTML using DOM parsing
  */
 const extractJobsFromDom = (html, pageUrl) => {
     const $ = cheerio.load(html);
-
-    // Remove style/script/noscript so they don't pollute text()
     $('style,script,noscript').remove();
 
     const urlObj = new URL(pageUrl);
@@ -132,55 +115,37 @@ const extractJobsFromDom = (html, pageUrl) => {
         const jobUrl = new URL(href, urlObj.origin).href;
         if (seen.has(jobUrl)) return;
 
-        // Clean title: remove nested style/script from this <a> only
-        const $aClean = $(el).clone();
-        $aClean.find('style,script,noscript').remove();
-        const title = $aClean.text().replace(/\s+/g, ' ').trim();
+        const $a = $(el).clone();
+        $a.find('style,script,noscript').remove();
+        const title = $a.text().replace(/\s+/g, ' ').trim();
         if (!title || title.length < 2) return;
 
-        // Container around the job card
+        // Find job card container
         const container =
-            $(el).closest('article').length
-                ? $(el).closest('article')
-                : $(el).closest('li').length
-                    ? $(el).closest('li')
-                    : $(el).closest('div').length
-                        ? $(el).closest('div')
-                        : $(el).parent();
+            $(el).closest('article').length ? $(el).closest('article') :
+                $(el).closest('li').length ? $(el).closest('li') :
+                    $(el).closest('div').length ? $(el).closest('div') :
+                        $(el).parent();
 
-        const $containerClean = container.clone();
-        $containerClean.find('style,script,noscript').remove();
+        const $container = container.clone();
+        $container.find('style,script,noscript').remove();
+        const fullText = $container.text().replace(/\s+/g, ' ').trim();
 
-        const fullText = $containerClean.text().replace(/\s+/g, ' ').trim();
-
-        // Company: often in img alt or a short label near the title
-        let company = $containerClean.find('img[alt]').attr('alt') || null;
+        // Extract company from img alt
+        let company = $container.find('img[alt]').attr('alt') || null;
         if (!company || company.length < 2 || company.length > 80) {
-            // fallback: first short non-salary chunk that isn't the title
-            const parts = fullText.split(/(?=[A-Z])/).map((p) => p.trim());
-            const candidate = parts.find(
-                (p) =>
-                    p &&
-                    p !== title &&
-                    !p.includes('£') &&
-                    !/ago$/i.test(p) &&
-                    p.length <= 80,
-            );
-            if (candidate) company = candidate;
+            company = null;
         }
 
-        const cleanSalary = extractCleanSalaryFromText(fullText);
+        const salary = extractSalary(fullText);
 
-        // Location: text between company and salary in the container text
+        // Extract location between company and salary
         let location = null;
-        if (company && cleanSalary) {
+        if (company && salary) {
             const idxCompany = fullText.indexOf(company);
-            const idxSalary = fullText.indexOf(cleanSalary);
+            const idxSalary = fullText.indexOf(salary);
             if (idxCompany !== -1 && idxSalary !== -1 && idxSalary > idxCompany) {
-                location = fullText
-                    .slice(idxCompany + company.length, idxSalary)
-                    .replace(/\s+/g, ' ')
-                    .trim();
+                location = fullText.slice(idxCompany + company.length, idxSalary).replace(/\s+/g, ' ').trim();
             }
         }
 
@@ -188,9 +153,9 @@ const extractJobsFromDom = (html, pageUrl) => {
             source: 'caterer.com',
             job_id: null,
             title,
-            company: company || null,
-            location: location || null,
-            salary: cleanSalary || null,
+            company,
+            location,
+            salary,
             date_posted: null,
             url: jobUrl,
         });
@@ -202,105 +167,108 @@ const extractJobsFromDom = (html, pageUrl) => {
 };
 
 /**
- * Parse job detail HTML to get description (and optionally improved company/salary/date).
- * We do JSON-LD first, then a clean DOM fallback that strips style/script.
+ * Extract job details from detail page HTML
  */
 const extractJobDetail = (html) => {
     const result = {};
+    const $ = cheerio.load(html);
 
-    // JSON-LD pass
-    const $ld = cheerio.load(html);
-    $ld('script[type="application/ld+json"]').each((_, el) => {
+    // Try JSON-LD first
+    $('script[type="application/ld+json"]').each((_, el) => {
         try {
-            const json = $ld(el).text();
-            const data = JSON.parse(json || '{}');
+            const data = JSON.parse($(el).text() || '{}');
             const entries = Array.isArray(data) ? data : [data];
-
             for (const item of entries) {
                 if (item['@type'] !== 'JobPosting') continue;
-
                 if (item.description && !result.description_html) {
                     result.description_html = item.description;
-                    result.description_text = item.description
-                        .replace(/<[^>]*>/g, ' ')
-                        .replace(/\s+/g, ' ')
-                        .trim();
+                    result.description_text = item.description.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
                 }
                 if (item.hiringOrganization?.name && !result.company) {
                     result.company = item.hiringOrganization.name;
                 }
                 if (item.baseSalary && !result.salary) {
                     const val = item.baseSalary.value;
-                    if (typeof val === 'string') {
-                        result.salary = val;
-                    } else if (val?.value || val?.minValue || val?.maxValue) {
-                        const v = val.value ?? val.minValue ?? val.maxValue;
-                        result.salary = `${v} ${val.currency || ''}`.trim();
+                    if (typeof val === 'string') result.salary = val;
+                    else if (val?.value || val?.minValue) {
+                        result.salary = `${val.value ?? val.minValue} ${val.currency || ''}`.trim();
                     }
                 }
-                if (item.datePosted && !result.date_posted) {
-                    result.date_posted = item.datePosted;
-                }
-                if (item.employmentType && !result.job_type) {
-                    result.job_type = item.employmentType;
-                }
+                if (item.datePosted && !result.date_posted) result.date_posted = item.datePosted;
+                if (item.employmentType && !result.job_type) result.job_type = item.employmentType;
             }
-        } catch {
-            // ignore
-        }
+        } catch { }
     });
 
-    // Clean DOM fallback (strip style/script)
-    const $ = cheerio.load(html);
+    // DOM fallback for description
     $('style,script,noscript').remove();
-
     if (!result.description_html) {
-        const descEl =
-            $('[data-at="job-description"]').first() ||
-            $('[data-at*="job-description"]').first() ||
-            $('#job-description').first() ||
-            $('.job-description').first() ||
-            $('main article').first() ||
-            $('main section').first();
-
+        const descEl = $('[data-at="job-description"]').first().length ? $('[data-at="job-description"]').first() :
+            $('#job-description').first().length ? $('#job-description').first() :
+                $('.job-description').first().length ? $('.job-description').first() :
+                    $('main article').first();
         if (descEl && descEl.length) {
             result.description_html = descEl.html();
             result.description_text = descEl.text().replace(/\s+/g, ' ').trim();
         }
     }
 
-    // Conservative salary/location/title overrides from DOM if still missing
-    if (!result.salary) {
-        const text = $('body').text().replace(/\s+/g, ' ');
-        const cleanSalary = extractCleanSalaryFromText(text);
-        if (cleanSalary && cleanSalary.length <= 80) {
-            result.salary = cleanSalary;
-        }
-    }
-
-    if (!result.company) {
-        const companyFromImg = $('img[alt]').first().attr('alt');
-        if (companyFromImg && companyFromImg.length <= 80) {
-            result.company = companyFromImg;
-        }
-    }
-
-    if (!result.title) {
-        const h1 = $('h1').first().text().replace(/\s+/g, ' ').trim();
-        if (h1 && h1.length <= 120) {
-            result.title = h1;
-        }
-    }
+    // Fallback extractions
+    if (!result.salary) result.salary = extractSalary($('body').text());
+    if (!result.company) result.company = $('img[alt]').first().attr('alt') || null;
+    if (!result.title) result.title = $('h1').first().text().replace(/\s+/g, ' ').trim() || null;
 
     return result;
 };
 
 /**
- * Playwright handshake: one real browser visit to get cookies, UA, and page-1 HTML.
+ * HTTP fetch with retry logic
  */
-const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
+const httpFetch = async (url, userAgent, cookieHeader, proxyUrl, retries = 3) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const res = await gotScraping({
+                url,
+                proxyUrl: proxyUrl || undefined,
+                timeout: { request: 25000 },
+                http2: false,
+                headers: {
+                    'User-Agent': userAgent,
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-GB,en;q=0.9',
+                    Connection: 'keep-alive',
+                    Referer: BASE_URL + '/',
+                    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+                },
+            });
+
+            const { statusCode, body } = res;
+            if (statusCode === 403 || looksBlocked(body || '')) {
+                if (attempt < retries) {
+                    log.warning(`Blocked (${statusCode}), retry ${attempt}/${retries}`, { url });
+                    await sleep(2000 * attempt);
+                    continue;
+                }
+                throw new Error(`Blocked (status: ${statusCode})`);
+            }
+            return body || '';
+        } catch (err) {
+            if (attempt < retries && !String(err.message).includes('Blocked')) {
+                log.warning(`HTTP error, retry ${attempt}/${retries}`, { url, error: err.message });
+                await sleep(1500 * attempt);
+                continue;
+            }
+            throw err;
+        }
+    }
+};
+
+/**
+ * Playwright handshake - get cookies for HTTP requests
+ */
+const playwrightHandshake = async (startUrl, proxyConfig) => {
     const fp = randomFingerprint();
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : null;
+    const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : null;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -311,11 +279,7 @@ const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--lang=en-GB,en-US',
-                    '--disable-http2',
-                    '--disable-features=UseChromeHttpsFirstMode',
-                    '--disable-features=UseDnsHttpsSvcb',
+                    '--lang=en-GB',
                 ],
             });
 
@@ -324,209 +288,87 @@ const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
                 viewport: fp.viewport,
                 ignoreHTTPSErrors: true,
                 locale: 'en-GB',
-                extraHTTPHeaders: {
-                    Accept:
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-                    Connection: 'keep-alive',
-                },
             });
 
             const page = await context.newPage();
-
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-GB', 'en-US', 'en'],
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3],
-                });
-                // eslint-disable-next-line no-undef
-                window.chrome = { runtime: {} };
             });
 
+            // Block heavy resources
             await page.route('**/*', (route) => {
-                const req = route.request();
-                const type = req.resourceType();
-                const url = req.url();
-                if (['image', 'media', 'font'].includes(type)) {
-                    return route.abort();
-                }
-                if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(url)) {
-                    return route.abort();
-                }
+                const type = route.request().resourceType();
+                if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
                 return route.continue();
             });
 
-            const response = await page.goto(startUrl, {
-                waitUntil: 'domcontentloaded',
-                timeout: 20000,
-            });
+            const response = await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await dismissPopups(page);
 
-            await dismissPopupsPlaywright(page);
-
-            const status = response ? response.status() : null;
+            const status = response?.status() ?? null;
             const html = await page.content();
 
-            if (status === 403 || looksBlockedHtml(html)) {
-                throw new Error(`Blocked in handshake (status: ${status ?? 'N/A'})`);
+            if (status === 403 || looksBlocked(html)) {
+                throw new Error(`Blocked (status: ${status})`);
             }
 
             const cookies = await context.cookies(BASE_URL);
             const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-
             await browser.close();
 
-            log.info('Playwright handshake succeeded', {
-                status,
-                haveCookies: !!cookieHeader,
-            });
-
-            return {
-                userAgent: fp.ua,
-                cookieHeader,
-                proxyUrl,
-                initialHtml: html,
-            };
+            log.info('Playwright handshake OK', { status, cookies: cookies.length });
+            return { userAgent: fp.ua, cookieHeader, proxyUrl, initialHtml: html };
         } catch (err) {
-            log.warning('Playwright handshake failed', {
-                attempt,
-                error: err.message,
-            });
+            log.warning(`Handshake failed attempt ${attempt}`, { error: err.message });
             if (attempt === 2) {
-                log.warning(
-                    'Falling back to HTTP-only scraping without browser cookies. Blocking risk may increase.',
-                );
-                const fallbackFp = randomFingerprint();
-                return {
-                    userAgent: fallbackFp.ua,
-                    cookieHeader: '',
-                    proxyUrl: null,
-                    initialHtml: null,
-                };
+                log.warning('Using HTTP-only mode (no cookies)');
+                return { userAgent: fp.ua, cookieHeader: '', proxyUrl: null, initialHtml: null };
             }
         }
     }
 };
 
 /**
- * HTTP fetch helper using got-scraping with browser-like headers + proxy.
+ * Enrich jobs with detail page data
  */
-const httpFetchHtml = async (url, userAgent, cookieHeader, proxyUrl, retries = 2) => {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            const res = await gotScraping({
-                url,
-                proxyUrl: proxyUrl || undefined,
-                timeout: { request: 20000 },
-                http2: false,
-                headers: {
-                    'User-Agent': userAgent,
-                    Accept:
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-                    Connection: 'keep-alive',
-                    Referer: BASE_URL + '/',
-                    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-                },
-            });
-
-            const { statusCode, body } = res;
-            const html = body || '';
-
-            if (statusCode === 403 || looksBlockedHtml(html)) {
-                if (attempt < retries) {
-                    log.warning(`Blocked (${statusCode}), retrying ${attempt}/${retries}`, { url });
-                    await new Promise((r) => setTimeout(r, 1500 * attempt));
-                    continue;
-                }
-                throw new Error(`Blocked on HTTP (status: ${statusCode})`);
-            }
-
-            return html;
-        } catch (err) {
-            if (attempt < retries && !String(err.message).includes('Blocked')) {
-                log.warning(`HTTP error, retrying ${attempt}/${retries}`, { url, error: err.message });
-                await new Promise((r) => setTimeout(r, 1000 * attempt));
-                continue;
-            }
-            throw err;
-        }
-    }
-};
-
-/**
- * Enrich a set of jobs with detail data (description, company, salary, etc).
- * Uses limited concurrency for stealth & performance.
- */
-const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, maxConcurrency = 3) => {
-    const enriched = [];
-    let index = 0;
+const enrichWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, concurrency = 3) => {
+    const results = [];
+    let idx = 0;
 
     const worker = async () => {
-        while (true) {
-            const i = index++;
-            if (i >= jobs.length) break;
-            const baseJob = jobs[i];
+        while (idx < jobs.length) {
+            const i = idx++;
+            const job = jobs[i];
 
-            // Random delay between detail fetches for stealth
-            if (i > 0) {
-                const delay = 400 + Math.floor(Math.random() * 600);
-                await new Promise((r) => setTimeout(r, delay));
-            }
+            // Stealth delay
+            if (i > 0) await sleep(500 + Math.random() * 500);
 
             try {
-                const html = await httpFetchHtml(baseJob.url, userAgent, cookieHeader, proxyUrl);
+                const html = await httpFetch(job.url, userAgent, cookieHeader, proxyUrl);
                 const detail = extractJobDetail(html);
-
-                // Only override fields if detail has clean values
-                const job = {
-                    ...baseJob,
-                    title:
-                        (detail.title && detail.title.length <= 120 && !detail.title.includes('{')) ||
-                            !baseJob.title
-                            ? detail.title || baseJob.title
-                            : baseJob.title,
-                    company:
-                        (detail.company && detail.company.length <= 80) || !baseJob.company
-                            ? detail.company || baseJob.company
-                            : baseJob.company,
-                    salary:
-                        (detail.salary && detail.salary.length <= 120) || !baseJob.salary
-                            ? detail.salary || baseJob.salary
-                            : baseJob.salary,
-                    date_posted: detail.date_posted || baseJob.date_posted || null,
+                results.push({
+                    ...job,
+                    title: detail.title || job.title,
+                    company: detail.company || job.company,
+                    salary: detail.salary || job.salary,
+                    date_posted: detail.date_posted || job.date_posted,
                     job_type: detail.job_type || null,
                     description_html: detail.description_html || null,
                     description_text: detail.description_text || null,
-                };
-
-                enriched.push(job);
+                });
             } catch (err) {
-                log.warning('Detail fetch failed, keeping list-only data', {
-                    url: baseJob.url,
-                    error: err.message,
-                });
-                enriched.push({
-                    ...baseJob,
-                    description_html: null,
-                    description_text: null,
-                });
+                log.warning('Detail fetch failed', { url: job.url, error: err.message });
+                results.push({ ...job, description_html: null, description_text: null });
             }
         }
     };
 
-    const workers = [];
-    const workersCount = Math.min(maxConcurrency, jobs.length || 1);
-    for (let i = 0; i < workersCount; i++) {
-        workers.push(worker());
-    }
+    const workers = Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker());
     await Promise.all(workers);
-
-    return enriched;
+    return results;
 };
 
+// ============ MAIN ============
 await Actor.main(async () => {
     const input = (await Actor.getInput()) ?? {};
     const {
@@ -536,186 +378,106 @@ await Actor.main(async () => {
         results_wanted = 20,
         max_pages = 5,
         max_detail_concurrency = 3,
-        proxyConfiguration: proxyFromInput,
+        proxyConfiguration: proxyInput,
     } = input;
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('Starting Caterer.com HYBRID job scraper (clean fields + descriptions)', {
-        keyword,
-        location,
-        startUrl: startUrlToUse,
-        results_wanted,
-        max_pages,
-        max_detail_concurrency,
+    log.info('Starting Caterer.com job scraper', {
+        keyword, location, startUrl: startUrlToUse, results_wanted, max_pages,
     });
 
-    // Proxy configuration
-    const hasProxyCredentials =
-        Boolean(proxyFromInput) || process.env.APIFY_PROXY_PASSWORD || process.env.APIFY_TOKEN;
-
-    let proxyConfiguration = null;
-    if (hasProxyCredentials) {
+    // Setup proxy
+    let proxyConfig = null;
+    if (proxyInput || process.env.APIFY_PROXY_PASSWORD) {
         try {
-            proxyConfiguration = await Actor.createProxyConfiguration(
-                proxyFromInput ?? {
-                    groups: ['RESIDENTIAL'],
-                    countryCode: 'GB',
-                },
+            proxyConfig = await Actor.createProxyConfiguration(
+                proxyInput ?? { groups: ['RESIDENTIAL'], countryCode: 'GB' }
             );
-            log.info('Proxy configured', { usingCustom: Boolean(proxyFromInput) });
-        } catch (proxyError) {
-            log.warning('Proxy setup failed, continuing without proxy', {
-                error: proxyError.message,
-            });
+            log.info('Proxy configured');
+        } catch (err) {
+            log.warning('Proxy setup failed', { error: err.message });
         }
-    } else {
-        log.info('No Apify proxy credentials detected, running without proxy');
     }
 
-    // 1) Handshake
-    const { userAgent, cookieHeader, proxyUrl, initialHtml } = await doPlaywrightHandshake(
-        startUrlToUse,
-        proxyConfiguration,
-    );
-
-    const stats = {
-        pagesFetched: 0,
-        pagesFailed: 0,
-        jobsFromJson: 0,
-        jobsFromDomFallback: 0,
-        jobsSaved: 0,
-        pagesBlockedOrCaptcha: 0,
-    };
+    // Playwright handshake for cookies
+    const { userAgent, cookieHeader, proxyUrl, initialHtml } = await playwrightHandshake(startUrlToUse, proxyConfig);
 
     const savedUrls = new Set();
     let savedCount = 0;
+    const stats = { pagesFetched: 0, jobsExtracted: 0, jobsSaved: 0 };
 
-    const pagesToVisit = Math.max(1, Math.min(max_pages, 20)); // safety cap
-    let initialHtmlUsed = false;
+    const pagesToVisit = Math.min(max_pages, 20);
+    let initialUsed = false;
 
     for (let pageNum = 1; pageNum <= pagesToVisit; pageNum++) {
         if (savedCount >= results_wanted) break;
 
-        const url = pageNum === 1 ? startUrlToUse : buildSearchUrl(keyword, location, pageNum);
-        log.info(`Processing listing page ${pageNum}/${pagesToVisit}`, { url });
+        const url = pageNum === 1 ? startUrlToUse : buildPaginatedUrl(startUrlToUse, pageNum);
+        log.info(`Processing page ${pageNum}/${pagesToVisit}`, { url });
 
+        // Fetch HTML
         let html;
         try {
-            if (pageNum === 1 && initialHtml && !initialHtmlUsed) {
+            if (pageNum === 1 && initialHtml && !initialUsed) {
                 html = initialHtml;
-                initialHtmlUsed = true;
-                log.info('Using HTML from Playwright handshake for page 1');
+                initialUsed = true;
             } else {
-                html = await httpFetchHtml(url, userAgent, cookieHeader, proxyUrl);
+                html = await httpFetch(url, userAgent, cookieHeader, proxyUrl);
             }
+            stats.pagesFetched++;
         } catch (err) {
-            stats.pagesFailed++;
-            if (String(err.message || '').includes('Blocked on HTTP')) {
-                stats.pagesBlockedOrCaptcha++;
-                log.warning('Blocked while fetching listing page, stopping pagination', {
-                    url,
-                    error: err.message,
-                });
-                break;
-            }
-            log.warning('Failed to fetch listing page', {
-                url,
-                pageNum,
-                error: err.message,
-            });
+            log.warning('Page fetch failed', { url, error: err.message });
+            if (String(err.message).includes('Blocked')) break;
             continue;
         }
 
-        stats.pagesFetched++;
-
-        // Extract jobs from JSON or DOM
-        let jobs = extractJobsFromJsonState(html, url);
-        if (jobs.length) {
-            stats.jobsFromJson += jobs.length;
-            log.info(`Extracted ${jobs.length} jobs from JSON state`, {
-                url,
-                pageNum,
-            });
-        } else {
-            const domJobs = extractJobsFromDom(html, url);
-            jobs = domJobs;
-            stats.jobsFromDomFallback += domJobs.length;
-            log.info(`Extracted ${domJobs.length} jobs from DOM fallback`, {
-                url,
-                pageNum,
-            });
-        }
+        // Extract jobs from DOM
+        const jobs = extractJobsFromDom(html, url);
+        stats.jobsExtracted += jobs.length;
+        log.info(`Extracted ${jobs.length} jobs from page ${pageNum}`);
 
         if (!jobs.length) {
-            log.info('No jobs found on page; stopping pagination.', { url, pageNum });
+            log.info('No jobs found, stopping pagination');
             break;
         }
 
-        // Filter + cap jobs we actually need from this page
-        const remainingNeeded = results_wanted - savedCount;
-        const pageJobsToProcess = [];
+        // Filter and cap
+        const remaining = results_wanted - savedCount;
+        const toProcess = [];
         for (const job of jobs) {
-            if (pageJobsToProcess.length >= remainingNeeded) break;
+            if (toProcess.length >= remaining) break;
             if (!job.url || savedUrls.has(job.url)) continue;
-            pageJobsToProcess.push(job);
-            savedUrls.add(job.url); // reserve URL early to avoid duplicates across pages
+            savedUrls.add(job.url);
+            toProcess.push(job);
         }
 
-        if (!pageJobsToProcess.length) {
-            log.info('No new jobs from this page (all duplicates or already enough).', {
-                url,
-                pageNum,
-            });
-            continue;
-        }
+        if (!toProcess.length) continue;
 
-        // Enrich with descriptions in parallel via HTTP
-        log.info(`Fetching details for ${pageJobsToProcess.length} jobs`, {
-            pageNum,
-            concurrency: max_detail_concurrency,
-        });
+        // Enrich with details
+        log.info(`Fetching details for ${toProcess.length} jobs`);
+        const enriched = await enrichWithDetails(toProcess, userAgent, cookieHeader, proxyUrl, max_detail_concurrency);
 
-        const enrichedJobs = await enrichJobsWithDetails(
-            pageJobsToProcess,
-            userAgent,
-            cookieHeader,
-            proxyUrl,
-            max_detail_concurrency,
-        );
-
-        for (const job of enrichedJobs) {
+        // Save to dataset
+        for (const job of enriched) {
             if (savedCount >= results_wanted) break;
-
-            const finalJob = {
+            await Dataset.pushData({
                 ...job,
                 keyword_search: keyword || null,
                 location_search: location || null,
                 extracted_at: new Date().toISOString(),
-            };
-
-            await Dataset.pushData(finalJob);
+            });
             savedCount++;
             stats.jobsSaved++;
-
-            log.info(`Saved job ${savedCount}/${results_wanted}`, {
-                title: finalJob.title,
-                url: finalJob.url,
-            });
+            log.info(`Saved job ${savedCount}/${results_wanted}: ${job.title}`);
         }
 
-        // Small jitter between pages
+        // Delay between pages
         if (pageNum < pagesToVisit && savedCount < results_wanted) {
-            const waitMs = 300 + Math.floor(Math.random() * 400);
-            await Actor.sleep(waitMs);
+            await sleep(400 + Math.random() * 400);
         }
     }
 
-    log.info('Scraping completed', {
-        jobsSaved: savedCount,
-        target: results_wanted,
-        stats,
-    });
-
+    log.info('Scraping completed', stats);
     await Actor.setValue('STATS', stats);
 });
