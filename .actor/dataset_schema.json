@@ -48,6 +48,83 @@
           }
         }
       }
+    },
+    "detailed": {
+      "title": "Full Details",
+      "transformation": {
+        "fields": [
+          "title",
+          "company",
+          "location",
+          "salary",
+          "job_type",
+          "date_posted",
+          "description_text",
+          "url",
+          "job_id",
+          "source",
+          "keyword_search",
+          "location_search",
+          "extracted_at"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "title": {
+            "label": "Job Title",
+            "format": "text"
+          },
+          "company": {
+            "label": "Company",
+            "format": "text"
+          },
+          "location": {
+            "label": "Location",
+            "format": "text"
+          },
+          "salary": {
+            "label": "Salary",
+            "format": "text"
+          },
+          "job_type": {
+            "label": "Job Type",
+            "format": "text"
+          },
+          "date_posted": {
+            "label": "Posted",
+            "format": "text"
+          },
+          "description_text": {
+            "label": "Description",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          },
+          "job_id": {
+            "label": "Job ID",
+            "format": "text"
+          },
+          "source": {
+            "label": "Source",
+            "format": "text"
+          },
+          "keyword_search": {
+            "label": "Keyword",
+            "format": "text"
+          },
+          "location_search": {
+            "label": "Location Search",
+            "format": "text"
+          },
+          "extracted_at": {
+            "label": "Extracted At",
+            "format": "text"
+          }
+        }
+      }
     }
   }
 }

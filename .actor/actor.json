@@ -1,13 +1,12 @@
 {
   "actorSpecification": 1,
   "name": "caterer-job-scraper",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "buildTag": "latest",
-  "dockerfile": "./Dockerfile",
+  "dockerfile": "../Dockerfile",
   "readme": "../README.md",
   "input": "./input_schema.json",
   "output": "./output_schema.json",
-  "nodeJsVersion": "22",
   "storages": {
     "dataset": "./dataset_schema.json"
   }

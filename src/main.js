@@ -41,7 +41,7 @@ const dismissPopupsPlaywright = async (page) => {
         try {
             const btn = page.locator(selector).first();
             if (await btn.isVisible({ timeout: 1000 })) {
-                await btn.click({ delay: 50 }).catch(() => {});
+                await btn.click({ delay: 50 }).catch(() => { });
                 break;
             }
         } catch {
@@ -143,10 +143,10 @@ const extractJobsFromDom = (html, pageUrl) => {
             $(el).closest('article').length
                 ? $(el).closest('article')
                 : $(el).closest('li').length
-                ? $(el).closest('li')
-                : $(el).closest('div').length
-                ? $(el).closest('div')
-                : $(el).parent();
+                    ? $(el).closest('li')
+                    : $(el).closest('div').length
+                        ? $(el).closest('div')
+                        : $(el).parent();
 
         const $containerClean = container.clone();
         $containerClean.find('style,script,noscript').remove();
@@ -413,31 +413,47 @@ const doPlaywrightHandshake = async (startUrl, proxyConfiguration) => {
 /**
  * HTTP fetch helper using got-scraping with browser-like headers + proxy.
  */
-const httpFetchHtml = async (url, userAgent, cookieHeader, proxyUrl) => {
-    const res = await gotScraping({
-        url,
-        proxyUrl: proxyUrl || undefined,
-        timeout: { request: 15000 },
-        http2: false,
-        headers: {
-            'User-Agent': userAgent,
-            Accept:
-                'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-            Connection: 'keep-alive',
-            Referer: BASE_URL + '/',
-            ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        },
-    });
+const httpFetchHtml = async (url, userAgent, cookieHeader, proxyUrl, retries = 2) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const res = await gotScraping({
+                url,
+                proxyUrl: proxyUrl || undefined,
+                timeout: { request: 20000 },
+                http2: false,
+                headers: {
+                    'User-Agent': userAgent,
+                    Accept:
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+                    Connection: 'keep-alive',
+                    Referer: BASE_URL + '/',
+                    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+                },
+            });
 
-    const { statusCode, body } = res;
-    const html = body || '';
+            const { statusCode, body } = res;
+            const html = body || '';
 
-    if (statusCode === 403 || looksBlockedHtml(html)) {
-        throw new Error(`Blocked on HTTP (status: ${statusCode})`);
+            if (statusCode === 403 || looksBlockedHtml(html)) {
+                if (attempt < retries) {
+                    log.warning(`Blocked (${statusCode}), retrying ${attempt}/${retries}`, { url });
+                    await new Promise((r) => setTimeout(r, 1500 * attempt));
+                    continue;
+                }
+                throw new Error(`Blocked on HTTP (status: ${statusCode})`);
+            }
+
+            return html;
+        } catch (err) {
+            if (attempt < retries && !String(err.message).includes('Blocked')) {
+                log.warning(`HTTP error, retrying ${attempt}/${retries}`, { url, error: err.message });
+                await new Promise((r) => setTimeout(r, 1000 * attempt));
+                continue;
+            }
+            throw err;
+        }
     }
-
-    return html;
 };
 
 /**
@@ -454,6 +470,12 @@ const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, ma
             if (i >= jobs.length) break;
             const baseJob = jobs[i];
 
+            // Random delay between detail fetches for stealth
+            if (i > 0) {
+                const delay = 400 + Math.floor(Math.random() * 600);
+                await new Promise((r) => setTimeout(r, delay));
+            }
+
             try {
                 const html = await httpFetchHtml(baseJob.url, userAgent, cookieHeader, proxyUrl);
                 const detail = extractJobDetail(html);
@@ -463,7 +485,7 @@ const enrichJobsWithDetails = async (jobs, userAgent, cookieHeader, proxyUrl, ma
                     ...baseJob,
                     title:
                         (detail.title && detail.title.length <= 120 && !detail.title.includes('{')) ||
-                        !baseJob.title
+                            !baseJob.title
                             ? detail.title || baseJob.title
                             : baseJob.title,
                     company:
