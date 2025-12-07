@@ -3,7 +3,7 @@
 // Uses real browser for all page fetches to bypass anti-bot measures
 
 import { Actor, log } from 'apify';
-import { Dataset, PlaywrightCrawler, Configuration } from 'crawlee';
+import { Dataset, PlaywrightCrawler } from 'crawlee';
 import * as cheerio from 'cheerio';
 
 const BASE_URL = 'https://www.caterer.com';
@@ -198,9 +198,6 @@ await Actor.main(async () => {
     let savedCount = 0;
     const allJobs = [];
     const stats = { pagesFetched: 0, jobsExtracted: 0, detailsFetched: 0, jobsSaved: 0 };
-
-    // Configure Crawlee to not use default storage
-    Configuration.getGlobalConfiguration().set('persistStorage', false);
 
     // ============ LISTING CRAWLER ============
     const listingCrawler = new PlaywrightCrawler({
