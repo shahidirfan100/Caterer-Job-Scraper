@@ -1,10 +1,10 @@
 // src/main.js
 // Caterer.com Hybrid Scraper - Camoufox + got-scraping
-// Uses Playwright with Camoufox for anti-blocking handshake and pagination
+// Uses Playwright with Camoufox for anti-blocking handshake
 // Uses got-scraping for fast detail page fetching, with Playwright fallback
 
 import { Actor, log } from 'apify';
-import { Dataset, PlaywrightCrawler } from 'crawlee';
+import { Dataset } from 'crawlee';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { firefox } from 'playwright';
 import { gotScraping } from 'got-scraping';
@@ -20,15 +20,6 @@ const buildSearchUrl = (keyword, location, page = 1) => {
     if (keyword) url.searchParams.set('keywords', keyword);
     if (location) url.searchParams.set('location', location);
     if (page > 1) url.searchParams.set('page', String(page));
-    return url.href;
-};
-
-/**
- * Build pagination URL
- */
-const buildPaginatedUrl = (baseUrl, page) => {
-    const url = new URL(baseUrl);
-    url.searchParams.set('page', String(page));
     return url.href;
 };
 
@@ -173,22 +164,25 @@ const formatCookies = (cookies) => {
 };
 
 /**
- * Fetch detail page with got-scraping (fast path)
+ * Fetch page with got-scraping (fast path)
  */
-const fetchDetailWithGot = async (url, cookies, proxyUrl, userAgent) => {
+const fetchWithGot = async (url, cookies, proxyUrl, userAgent) => {
     const headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-GB,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Referer': BASE_URL,
-        'Cookie': cookies,
         'User-Agent': userAgent,
     };
+
+    if (cookies) {
+        headers['Cookie'] = cookies;
+    }
 
     const options = {
         url,
         headers,
-        timeout: { request: 30000 },
+        timeout: { request: 20000 },
         retry: { limit: 0 },
         throwHttpErrors: false,
     };
@@ -210,13 +204,12 @@ await Actor.main(async () => {
         startUrl = '',
         results_wanted = 50,
         max_pages = 10,
-        max_detail_concurrency = 5,
         proxyConfiguration: proxyInput,
     } = input;
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('🚀 Starting Caterer.com Hybrid Scraper (Camoufox + got-scraping)', {
+    log.info('🚀 Starting Caterer.com Hybrid Scraper', {
         keyword, location, startUrl: startUrlToUse, results_wanted, max_pages,
     });
 
@@ -235,9 +228,8 @@ await Actor.main(async () => {
         }
     }
 
-    // State for collecting jobs
+    // State
     const savedUrls = new Set();
-    let savedCount = 0;
     const allJobs = [];
     let sessionCookies = '';
     let sessionUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0';
@@ -250,115 +242,193 @@ await Actor.main(async () => {
         jobsSaved: 0
     };
 
-    // URLs that failed with got-scraping and need Playwright fallback
-    const failedDetailUrls = [];
+    // ============ PHASE 1: Camoufox handshake - get session cookies ============
+    log.info('🔐 Phase 1: Establishing session with Camoufox...');
 
-    // ============ LISTING CRAWLER (Camoufox) ============
-    const listingCrawler = new PlaywrightCrawler({
-        proxyConfiguration: proxyConfig,
-        maxConcurrency: 1, // Sequential for stealth
-        navigationTimeoutSecs: 60,
-        requestHandlerTimeoutSecs: 120,
-        maxRequestRetries: 3,
-        useSessionPool: true,
-        sessionPoolOptions: {
-            maxPoolSize: 5,
-            sessionOptions: {
-                maxUsageCount: 3,
-            },
-        },
-        launchContext: {
-            launcher: firefox,
-            launchOptions: await camoufoxLaunchOptions({
-                headless: true,
-                proxy: proxyUrl ? { server: proxyUrl } : undefined,
-                geoip: true,
-            }),
-        },
-        preNavigationHooks: [
-            async ({ page }) => {
-                // Block heavy resources
-                await page.route('**/*', (route) => {
-                    const type = route.request().resourceType();
-                    if (['image', 'media', 'font'].includes(type)) return route.abort();
-                    return route.continue();
-                });
-            },
-        ],
-        requestHandler: async ({ page, request }) => {
-            log.info(`📄 [Camoufox] Processing listing: ${request.url.slice(0, 80)}`);
+    let browser = null;
+    let context = null;
 
-            // Wait for content
-            await page.waitForLoadState('domcontentloaded');
-            await sleep(1000 + Math.random() * 1000);
+    try {
+        const launchOpts = await camoufoxLaunchOptions({
+            headless: true,
+            geoip: true,
+        });
 
-            // Dismiss cookie popups
-            for (const sel of ['button:has-text("Accept all")', '[id*="accept"]']) {
-                try {
-                    const btn = page.locator(sel).first();
-                    if (await btn.isVisible({ timeout: 1000 })) {
-                        await btn.click().catch(() => { });
-                        await sleep(500);
-                        break;
-                    }
-                } catch { }
+        // Add proxy to launch options if available
+        if (proxyUrl) {
+            try {
+                const proxyUrlObj = new URL(proxyUrl);
+                launchOpts.proxy = {
+                    server: `${proxyUrlObj.protocol}//${proxyUrlObj.host}`,
+                    username: proxyUrlObj.username || undefined,
+                    password: proxyUrlObj.password || undefined,
+                };
+            } catch (e) {
+                log.warning('Failed to parse proxy URL for Playwright', { error: e.message });
             }
+        }
 
-            // Extract cookies for got-scraping
-            const cookies = await page.context().cookies();
-            if (cookies.length > 0) {
-                sessionCookies = formatCookies(cookies);
-            }
+        browser = await firefox.launch(launchOpts);
+        context = await browser.newContext();
+        const page = await context.newPage();
 
-            // Get user agent from page
-            const ua = await page.evaluate(() => navigator.userAgent);
-            if (ua) sessionUserAgent = ua;
+        // Block heavy resources
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+            return route.continue();
+        });
 
-            const html = await page.content();
-            const jobs = extractJobsFromDom(html, request.url);
+        // Navigate to first page to establish session
+        log.info(`📄 Opening first listing page: ${startUrlToUse.slice(0, 60)}...`);
+        await page.goto(startUrlToUse, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await sleep(1500 + Math.random() * 1000);
 
-            stats.pagesFetched++;
-            stats.jobsExtracted += jobs.length;
-            log.info(`✅ Extracted ${jobs.length} jobs from listing page`);
+        // Handle cookie consent
+        for (const sel of ['button:has-text("Accept all")', '[id*="accept"]', 'button:has-text("Accept")']) {
+            try {
+                const btn = page.locator(sel).first();
+                if (await btn.isVisible({ timeout: 1500 })) {
+                    await btn.click().catch(() => { });
+                    await sleep(500);
+                    break;
+                }
+            } catch { }
+        }
 
-            for (const job of jobs) {
-                if (allJobs.length >= results_wanted) break;
-                if (savedUrls.has(job.url)) continue;
-                savedUrls.add(job.url);
-                allJobs.push(job);
-            }
-        },
-        failedRequestHandler: async ({ request }, error) => {
-            log.warning(`❌ Listing failed: ${request.url.slice(0, 60)}`, { error: error.message });
-        },
-    });
+        // Extract cookies and user agent
+        const cookies = await context.cookies();
+        sessionCookies = formatCookies(cookies);
+        sessionUserAgent = await page.evaluate(() => navigator.userAgent);
 
-    // Build listing URLs
-    const listingUrls = [];
-    for (let page = 1; page <= Math.min(max_pages, 20); page++) {
-        const url = page === 1 ? startUrlToUse : buildPaginatedUrl(startUrlToUse, page);
-        listingUrls.push(url);
+        // Extract jobs from first page
+        const html = await page.content();
+        const jobs = extractJobsFromDom(html, startUrlToUse);
+        stats.pagesFetched++;
+        stats.jobsExtracted += jobs.length;
+
+        for (const job of jobs) {
+            if (allJobs.length >= results_wanted) break;
+            if (savedUrls.has(job.url)) continue;
+            savedUrls.add(job.url);
+            allJobs.push(job);
+        }
+
+        log.info(`✅ Page 1: Extracted ${jobs.length} jobs, total: ${allJobs.length}`);
+
+        await page.close();
+
+    } catch (err) {
+        log.error('❌ Camoufox handshake failed', { error: err.message });
     }
 
-    // Run listing crawler
-    await listingCrawler.run(listingUrls);
+    // ============ PHASE 2: Fast listing pagination with got-scraping ============
+    if (allJobs.length < results_wanted) {
+        log.info('⚡ Phase 2: Fast pagination with got-scraping...');
 
-    log.info(`📋 Collected ${allJobs.length} jobs, now fetching details with got-scraping...`);
+        for (let pageNum = 2; pageNum <= max_pages && allJobs.length < results_wanted; pageNum++) {
+            const pageUrl = buildSearchUrl(keyword, location, pageNum);
 
-    // ============ FAST DETAIL FETCHING (got-scraping) ============
-    if (allJobs.length > 0) {
-        const jobsToFetch = allJobs.slice(0, results_wanted);
+            try {
+                const { statusCode, body } = await fetchWithGot(pageUrl, sessionCookies, proxyUrl, sessionUserAgent);
 
-        // Process details in batches for controlled concurrency
-        const batchSize = max_detail_concurrency;
-        for (let i = 0; i < jobsToFetch.length; i += batchSize) {
-            const batch = jobsToFetch.slice(i, i + batchSize);
+                if (statusCode === 200 && body) {
+                    const jobs = extractJobsFromDom(body, pageUrl);
+                    stats.pagesFetched++;
+                    stats.jobsExtracted += jobs.length;
 
-            await Promise.all(batch.map(async (job, batchIndex) => {
-                const jobIndex = i + batchIndex;
+                    let addedCount = 0;
+                    for (const job of jobs) {
+                        if (allJobs.length >= results_wanted) break;
+                        if (savedUrls.has(job.url)) continue;
+                        savedUrls.add(job.url);
+                        allJobs.push(job);
+                        addedCount++;
+                    }
+
+                    log.info(`✅ Page ${pageNum}: ${jobs.length} jobs found, added ${addedCount}, total: ${allJobs.length}`);
+                    stats.gotSuccess++;
+
+                    // Small delay to be polite
+                    await sleep(300 + Math.random() * 400);
+                } else if (statusCode === 403) {
+                    log.warning(`🚫 Page ${pageNum}: Blocked (403), using Playwright fallback...`);
+                    stats.gotFailed++;
+
+                    // Fallback to Playwright for this page
+                    if (context) {
+                        try {
+                            const page = await context.newPage();
+                            await page.route('**/*', (route) => {
+                                const type = route.request().resourceType();
+                                if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                                return route.continue();
+                            });
+
+                            await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                            await sleep(1000);
+
+                            const html = await page.content();
+                            const jobs = extractJobsFromDom(html, pageUrl);
+                            stats.pagesFetched++;
+                            stats.jobsExtracted += jobs.length;
+                            stats.playwrightFallback++;
+
+                            let addedCount = 0;
+                            for (const job of jobs) {
+                                if (allJobs.length >= results_wanted) break;
+                                if (savedUrls.has(job.url)) continue;
+                                savedUrls.add(job.url);
+                                allJobs.push(job);
+                                addedCount++;
+                            }
+
+                            log.info(`✅ Page ${pageNum} (Playwright): ${jobs.length} jobs, added ${addedCount}, total: ${allJobs.length}`);
+
+                            // Refresh cookies
+                            const newCookies = await context.cookies();
+                            sessionCookies = formatCookies(newCookies);
+
+                            await page.close();
+                        } catch (fallbackErr) {
+                            log.warning(`❌ Playwright fallback failed for page ${pageNum}`, { error: fallbackErr.message });
+                        }
+                    }
+                } else {
+                    log.warning(`⚠️ Page ${pageNum}: Unexpected status ${statusCode}`);
+                    stats.gotFailed++;
+                }
+            } catch (err) {
+                log.warning(`❌ Page ${pageNum} failed`, { error: err.message });
+                stats.gotFailed++;
+            }
+        }
+    }
+
+    // Close browser if still open
+    if (browser) {
+        await browser.close().catch(() => { });
+    }
+
+    log.info(`📋 Collected ${allJobs.length} jobs, fetching details...`);
+
+    // ============ PHASE 3: Fast detail fetching with got-scraping ============
+    const jobsToProcess = allJobs.slice(0, results_wanted);
+    const failedDetailUrls = [];
+
+    if (jobsToProcess.length > 0) {
+        log.info('⚡ Phase 3: Fast detail fetching with got-scraping...');
+
+        const concurrency = 8; // High concurrency for speed
+
+        for (let i = 0; i < jobsToProcess.length; i += concurrency) {
+            const batch = jobsToProcess.slice(i, i + concurrency);
+
+            await Promise.all(batch.map(async (job, batchIdx) => {
+                const jobIndex = i + batchIdx;
 
                 try {
-                    const { statusCode, body } = await fetchDetailWithGot(
+                    const { statusCode, body } = await fetchWithGot(
                         job.url,
                         sessionCookies,
                         proxyUrl,
@@ -380,96 +450,87 @@ await Actor.main(async () => {
                         };
 
                         stats.gotSuccess++;
-                        log.debug(`⚡ [got] Fetched: ${job.url.slice(0, 60)}`);
                     } else {
-                        // Blocked or error - add to fallback queue
-                        log.debug(`🚫 [got] Blocked (${statusCode}): ${job.url.slice(0, 50)}`);
                         failedDetailUrls.push({ url: job.url, jobIndex });
                         stats.gotFailed++;
                     }
                 } catch (err) {
-                    log.debug(`❌ [got] Error: ${job.url.slice(0, 50)} - ${err.message}`);
                     failedDetailUrls.push({ url: job.url, jobIndex });
                     stats.gotFailed++;
                 }
             }));
 
             // Small delay between batches
-            if (i + batchSize < jobsToFetch.length) {
-                await sleep(200 + Math.random() * 300);
+            if (i + concurrency < jobsToProcess.length) {
+                await sleep(100 + Math.random() * 200);
             }
         }
 
-        log.info(`📊 got-scraping results: ${stats.gotSuccess} success, ${stats.gotFailed} need fallback`);
+        log.info(`📊 Detail fetch: ${stats.gotSuccess} fast, ${failedDetailUrls.length} need fallback`);
+    }
 
-        // ============ PLAYWRIGHT FALLBACK FOR FAILED DETAILS ============
-        if (failedDetailUrls.length > 0) {
-            log.info(`🔄 Retrying ${failedDetailUrls.length} failed details with Playwright...`);
+    // ============ PHASE 4: Playwright fallback for failed details ============
+    if (failedDetailUrls.length > 0) {
+        log.info(`🔄 Phase 4: Playwright fallback for ${failedDetailUrls.length} blocked details...`);
 
-            const fallbackCrawler = new PlaywrightCrawler({
-                proxyConfiguration: proxyConfig,
-                maxConcurrency: 2,
-                navigationTimeoutSecs: 45,
-                requestHandlerTimeoutSecs: 60,
-                maxRequestRetries: 2,
-                useSessionPool: true,
-                launchContext: {
-                    launcher: firefox,
-                    launchOptions: await camoufoxLaunchOptions({
-                        headless: true,
-                        proxy: proxyUrl ? { server: proxyUrl } : undefined,
-                        geoip: true,
-                    }),
-                },
-                preNavigationHooks: [
-                    async ({ page }) => {
-                        await page.route('**/*', (route) => {
-                            const type = route.request().resourceType();
-                            if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
-                            return route.continue();
-                        });
-                    },
-                ],
-                requestHandler: async ({ page, request }) => {
-                    await page.waitForLoadState('domcontentloaded');
-                    await sleep(500 + Math.random() * 500);
+        try {
+            const launchOpts = await camoufoxLaunchOptions({ headless: true, geoip: true });
+            if (proxyUrl) {
+                try {
+                    const proxyUrlObj = new URL(proxyUrl);
+                    launchOpts.proxy = {
+                        server: `${proxyUrlObj.protocol}//${proxyUrlObj.host}`,
+                        username: proxyUrlObj.username || undefined,
+                        password: proxyUrlObj.password || undefined,
+                    };
+                } catch (e) { }
+            }
+
+            const fallbackBrowser = await firefox.launch(launchOpts);
+            const fallbackContext = await fallbackBrowser.newContext();
+
+            for (const { url, jobIndex } of failedDetailUrls) {
+                try {
+                    const page = await fallbackContext.newPage();
+                    await page.route('**/*', (route) => {
+                        const type = route.request().resourceType();
+                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                        return route.continue();
+                    });
+
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+                    await sleep(500);
 
                     const html = await page.content();
                     const detail = extractJobDetail(html);
-                    const jobIndex = request.userData.jobIndex;
+
+                    allJobs[jobIndex] = {
+                        ...allJobs[jobIndex],
+                        title: detail.title || allJobs[jobIndex].title,
+                        company: detail.company || allJobs[jobIndex].company,
+                        salary: detail.salary || allJobs[jobIndex].salary,
+                        date_posted: detail.date_posted || null,
+                        job_type: detail.job_type || null,
+                        description_html: detail.description_html || null,
+                        description_text: detail.description_text || null,
+                    };
 
                     stats.playwrightFallback++;
+                    await page.close();
+                } catch (err) {
+                    log.debug(`❌ Fallback failed: ${url.slice(0, 50)}`);
+                }
+            }
 
-                    if (allJobs[jobIndex]) {
-                        allJobs[jobIndex] = {
-                            ...allJobs[jobIndex],
-                            title: detail.title || allJobs[jobIndex].title,
-                            company: detail.company || allJobs[jobIndex].company,
-                            salary: detail.salary || allJobs[jobIndex].salary,
-                            date_posted: detail.date_posted || null,
-                            job_type: detail.job_type || null,
-                            description_html: detail.description_html || null,
-                            description_text: detail.description_text || null,
-                        };
-                    }
-
-                    log.debug(`✅ [Playwright] Fallback success: ${request.url.slice(0, 50)}`);
-                },
-                failedRequestHandler: async ({ request }) => {
-                    log.debug(`❌ [Playwright] Fallback failed: ${request.url.slice(0, 50)}`);
-                },
-            });
-
-            const fallbackRequests = failedDetailUrls.map(item => ({
-                url: item.url,
-                userData: { jobIndex: item.jobIndex },
-            }));
-
-            await fallbackCrawler.run(fallbackRequests);
+            await fallbackBrowser.close();
+        } catch (err) {
+            log.warning('Playwright fallback browser failed', { error: err.message });
         }
     }
 
     // ============ SAVE RESULTS ============
+    log.info('💾 Saving results...');
+
     for (const job of allJobs.slice(0, results_wanted)) {
         await Dataset.pushData({
             ...job,
@@ -477,13 +538,13 @@ await Actor.main(async () => {
             location_search: location || null,
             extracted_at: new Date().toISOString(),
         });
-        savedCount++;
         stats.jobsSaved++;
     }
 
-    log.info('🎉 Hybrid scraping completed', {
+    log.info('🎉 Scraping completed!', {
         ...stats,
-        summary: `${stats.gotSuccess} fast + ${stats.playwrightFallback} fallback = ${stats.jobsSaved} saved`
+        summary: `Pages: ${stats.pagesFetched}, Jobs: ${stats.jobsSaved} (${stats.gotSuccess} fast, ${stats.playwrightFallback} fallback)`
     });
+
     await Actor.setValue('STATS', stats);
 });
