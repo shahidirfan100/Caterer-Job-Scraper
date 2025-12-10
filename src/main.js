@@ -195,6 +195,65 @@ const fetchWithGot = async (url, cookies, proxyUrl, userAgent) => {
     return { statusCode: response.statusCode, body: response.body };
 };
 
+/**
+ * Wait for job listings to appear on page
+ */
+const waitForJobListings = async (page, timeout = 15000) => {
+    try {
+        // Wait for any of these selectors that indicate jobs are loaded
+        await page.waitForSelector('a[href*="/job/"]', { timeout });
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+/**
+ * Dismiss cookie consent banners
+ */
+const dismissCookieBanner = async (page) => {
+    const selectors = [
+        'button:has-text("Accept all")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept")',
+        '[id*="accept"]',
+        '[class*="cookie"] button',
+        '[class*="consent"] button',
+    ];
+
+    for (const sel of selectors) {
+        try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 2000 })) {
+                await btn.click().catch(() => { });
+                await sleep(500);
+                return true;
+            }
+        } catch { }
+    }
+    return false;
+};
+
+/**
+ * Extract jobs from Playwright page (with proper waiting)
+ */
+const extractJobsFromPage = async (page, pageUrl) => {
+    // Wait for content to stabilize
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
+
+    // Wait for job links to appear
+    const hasJobs = await waitForJobListings(page, 10000);
+    if (!hasJobs) {
+        log.warning('No job listings found on page after waiting');
+    }
+
+    // Small delay for any final rendering
+    await sleep(500);
+
+    const html = await page.content();
+    return extractJobsFromDom(html, pageUrl);
+};
+
 // ============ MAIN ============
 await Actor.main(async () => {
     const input = (await Actor.getInput()) ?? {};
@@ -272,38 +331,30 @@ await Actor.main(async () => {
         context = await browser.newContext();
         const page = await context.newPage();
 
-        // Block heavy resources
+        // Block heavy resources but keep stylesheets for proper rendering
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+            if (['image', 'media', 'font'].includes(type)) return route.abort();
             return route.continue();
         });
 
         // Navigate to first page to establish session
         log.info(`📄 Opening first listing page: ${startUrlToUse.slice(0, 60)}...`);
-        await page.goto(startUrlToUse, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await sleep(1500 + Math.random() * 1000);
+        await page.goto(startUrlToUse, { waitUntil: 'load', timeout: 60000 });
 
-        // Handle cookie consent
-        for (const sel of ['button:has-text("Accept all")', '[id*="accept"]', 'button:has-text("Accept")']) {
-            try {
-                const btn = page.locator(sel).first();
-                if (await btn.isVisible({ timeout: 1500 })) {
-                    await btn.click().catch(() => { });
-                    await sleep(500);
-                    break;
-                }
-            } catch { }
-        }
+        // Handle cookie consent FIRST
+        await dismissCookieBanner(page);
+
+        // Wait for page to stabilize after dismissing cookie banner
+        await sleep(2000);
 
         // Extract cookies and user agent
         const cookies = await context.cookies();
         sessionCookies = formatCookies(cookies);
         sessionUserAgent = await page.evaluate(() => navigator.userAgent);
 
-        // Extract jobs from first page
-        const html = await page.content();
-        const jobs = extractJobsFromDom(html, startUrlToUse);
+        // Extract jobs from first page with proper waiting
+        const jobs = await extractJobsFromPage(page, startUrlToUse);
         stats.pagesFetched++;
         stats.jobsExtracted += jobs.length;
 
@@ -315,6 +366,26 @@ await Actor.main(async () => {
         }
 
         log.info(`✅ Page 1: Extracted ${jobs.length} jobs, total: ${allJobs.length}`);
+
+        // If first page got 0 jobs, try scrolling and waiting more
+        if (jobs.length === 0) {
+            log.warning('⚠️ No jobs on page 1, retrying with scroll...');
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await sleep(2000);
+
+            const retryJobs = await extractJobsFromPage(page, startUrlToUse);
+            for (const job of retryJobs) {
+                if (allJobs.length >= results_wanted) break;
+                if (savedUrls.has(job.url)) continue;
+                savedUrls.add(job.url);
+                allJobs.push(job);
+            }
+
+            if (retryJobs.length > 0) {
+                log.info(`✅ Page 1 (retry): Extracted ${retryJobs.length} jobs, total: ${allJobs.length}`);
+                stats.jobsExtracted += retryJobs.length;
+            }
+        }
 
         await page.close();
 
@@ -351,8 +422,8 @@ await Actor.main(async () => {
 
                     // Small delay to be polite
                     await sleep(300 + Math.random() * 400);
-                } else if (statusCode === 403) {
-                    log.warning(`🚫 Page ${pageNum}: Blocked (403), using Playwright fallback...`);
+                } else if (statusCode === 403 || statusCode === 0) {
+                    log.warning(`🚫 Page ${pageNum}: Blocked (${statusCode}), using Playwright fallback...`);
                     stats.gotFailed++;
 
                     // Fallback to Playwright for this page
@@ -361,15 +432,14 @@ await Actor.main(async () => {
                             const page = await context.newPage();
                             await page.route('**/*', (route) => {
                                 const type = route.request().resourceType();
-                                if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                                if (['image', 'media', 'font'].includes(type)) return route.abort();
                                 return route.continue();
                             });
 
-                            await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                            await sleep(1000);
+                            await page.goto(pageUrl, { waitUntil: 'load', timeout: 45000 });
+                            await dismissCookieBanner(page);
 
-                            const html = await page.content();
-                            const jobs = extractJobsFromDom(html, pageUrl);
+                            const jobs = await extractJobsFromPage(page, pageUrl);
                             stats.pagesFetched++;
                             stats.jobsExtracted += jobs.length;
                             stats.playwrightFallback++;
@@ -494,12 +564,12 @@ await Actor.main(async () => {
                     const page = await fallbackContext.newPage();
                     await page.route('**/*', (route) => {
                         const type = route.request().resourceType();
-                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                        if (['image', 'media', 'font'].includes(type)) return route.abort();
                         return route.continue();
                     });
 
-                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-                    await sleep(500);
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await sleep(1000);
 
                     const html = await page.content();
                     const detail = extractJobDetail(html);
