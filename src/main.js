@@ -1,9 +1,13 @@
 // src/main.js
-// Caterer.com Job Scraper - Full Playwright Implementation
-// Uses real browser for all page fetches to bypass anti-bot measures
+// Caterer.com Hybrid Scraper - Camoufox + got-scraping
+// Uses Playwright with Camoufox for anti-blocking handshake and pagination
+// Uses got-scraping for fast detail page fetching, with Playwright fallback
 
 import { Actor, log } from 'apify';
 import { Dataset, PlaywrightCrawler } from 'crawlee';
+import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
+import { firefox } from 'playwright';
+import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
 
 const BASE_URL = 'https://www.caterer.com';
@@ -108,7 +112,7 @@ const extractJobsFromDom = (html, pageUrl) => {
 };
 
 /**
- * Extract job details from detail page
+ * Extract job details from detail page HTML
  */
 const extractJobDetail = (html) => {
     const result = {};
@@ -161,6 +165,42 @@ const extractJobDetail = (html) => {
     return result;
 };
 
+/**
+ * Format cookies array to string for HTTP header
+ */
+const formatCookies = (cookies) => {
+    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+};
+
+/**
+ * Fetch detail page with got-scraping (fast path)
+ */
+const fetchDetailWithGot = async (url, cookies, proxyUrl, userAgent) => {
+    const headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': BASE_URL,
+        'Cookie': cookies,
+        'User-Agent': userAgent,
+    };
+
+    const options = {
+        url,
+        headers,
+        timeout: { request: 30000 },
+        retry: { limit: 0 },
+        throwHttpErrors: false,
+    };
+
+    if (proxyUrl) {
+        options.proxyUrl = proxyUrl;
+    }
+
+    const response = await gotScraping(options);
+    return { statusCode: response.statusCode, body: response.body };
+};
+
 // ============ MAIN ============
 await Actor.main(async () => {
     const input = (await Actor.getInput()) ?? {};
@@ -170,23 +210,25 @@ await Actor.main(async () => {
         startUrl = '',
         results_wanted = 50,
         max_pages = 10,
-        max_detail_concurrency = 2,
+        max_detail_concurrency = 5,
         proxyConfiguration: proxyInput,
     } = input;
 
     const startUrlToUse = startUrl?.trim() || buildSearchUrl(keyword, location, 1);
 
-    log.info('🚀 Starting Caterer.com Playwright Scraper', {
+    log.info('🚀 Starting Caterer.com Hybrid Scraper (Camoufox + got-scraping)', {
         keyword, location, startUrl: startUrlToUse, results_wanted, max_pages,
     });
 
     // Setup proxy
     let proxyConfig = null;
+    let proxyUrl = null;
     if (proxyInput || process.env.APIFY_PROXY_PASSWORD) {
         try {
             proxyConfig = await Actor.createProxyConfiguration(
                 proxyInput ?? { groups: ['RESIDENTIAL'], countryCode: 'GB' }
             );
+            proxyUrl = await proxyConfig.newUrl();
             log.info('✅ Proxy configured');
         } catch (err) {
             log.warning('⚠️ Proxy setup failed', { error: err.message });
@@ -197,9 +239,21 @@ await Actor.main(async () => {
     const savedUrls = new Set();
     let savedCount = 0;
     const allJobs = [];
-    const stats = { pagesFetched: 0, jobsExtracted: 0, detailsFetched: 0, jobsSaved: 0 };
+    let sessionCookies = '';
+    let sessionUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0';
+    const stats = {
+        pagesFetched: 0,
+        jobsExtracted: 0,
+        gotSuccess: 0,
+        gotFailed: 0,
+        playwrightFallback: 0,
+        jobsSaved: 0
+    };
 
-    // ============ LISTING CRAWLER ============
+    // URLs that failed with got-scraping and need Playwright fallback
+    const failedDetailUrls = [];
+
+    // ============ LISTING CRAWLER (Camoufox) ============
     const listingCrawler = new PlaywrightCrawler({
         proxyConfiguration: proxyConfig,
         maxConcurrency: 1, // Sequential for stealth
@@ -214,24 +268,15 @@ await Actor.main(async () => {
             },
         },
         launchContext: {
-            launchOptions: {
+            launcher: firefox,
+            launchOptions: await camoufoxLaunchOptions({
                 headless: true,
-                args: [
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--lang=en-GB',
-                ],
-            },
+                proxy: proxyUrl ? { server: proxyUrl } : undefined,
+                geoip: true,
+            }),
         },
         preNavigationHooks: [
             async ({ page }) => {
-                // Anti-detection
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en-US', 'en'] });
-                });
-
                 // Block heavy resources
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
@@ -241,7 +286,7 @@ await Actor.main(async () => {
             },
         ],
         requestHandler: async ({ page, request }) => {
-            log.info(`📄 Processing: ${request.url.slice(0, 80)}`);
+            log.info(`📄 [Camoufox] Processing listing: ${request.url.slice(0, 80)}`);
 
             // Wait for content
             await page.waitForLoadState('domcontentloaded');
@@ -259,12 +304,22 @@ await Actor.main(async () => {
                 } catch { }
             }
 
+            // Extract cookies for got-scraping
+            const cookies = await page.context().cookies();
+            if (cookies.length > 0) {
+                sessionCookies = formatCookies(cookies);
+            }
+
+            // Get user agent from page
+            const ua = await page.evaluate(() => navigator.userAgent);
+            if (ua) sessionUserAgent = ua;
+
             const html = await page.content();
             const jobs = extractJobsFromDom(html, request.url);
 
             stats.pagesFetched++;
             stats.jobsExtracted += jobs.length;
-            log.info(`✅ Extracted ${jobs.length} jobs`);
+            log.info(`✅ Extracted ${jobs.length} jobs from listing page`);
 
             for (const job of jobs) {
                 if (allJobs.length >= results_wanted) break;
@@ -274,7 +329,7 @@ await Actor.main(async () => {
             }
         },
         failedRequestHandler: async ({ request }, error) => {
-            log.warning(`❌ Failed: ${request.url.slice(0, 60)}`, { error: error.message });
+            log.warning(`❌ Listing failed: ${request.url.slice(0, 60)}`, { error: error.message });
         },
     });
 
@@ -288,73 +343,130 @@ await Actor.main(async () => {
     // Run listing crawler
     await listingCrawler.run(listingUrls);
 
-    log.info(`📋 Collected ${allJobs.length} jobs, now fetching details...`);
+    log.info(`📋 Collected ${allJobs.length} jobs, now fetching details with got-scraping...`);
 
-    // ============ DETAIL CRAWLER ============
+    // ============ FAST DETAIL FETCHING (got-scraping) ============
     if (allJobs.length > 0) {
-        const detailCrawler = new PlaywrightCrawler({
-            proxyConfiguration: proxyConfig,
-            maxConcurrency: max_detail_concurrency,
-            navigationTimeoutSecs: 45,
-            requestHandlerTimeoutSecs: 60,
-            maxRequestRetries: 2,
-            useSessionPool: true,
-            launchContext: {
-                launchOptions: {
-                    headless: true,
-                    args: [
-                        '--disable-blink-features=AutomationControlled',
-                        '--no-sandbox',
-                    ],
-                },
-            },
-            preNavigationHooks: [
-                async ({ page }) => {
-                    await page.addInitScript(() => {
-                        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                    });
-                    await page.route('**/*', (route) => {
-                        const type = route.request().resourceType();
-                        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
-                        return route.continue();
-                    });
-                },
-            ],
-            requestHandler: async ({ page, request }) => {
-                await page.waitForLoadState('domcontentloaded');
-                await sleep(500 + Math.random() * 500);
+        const jobsToFetch = allJobs.slice(0, results_wanted);
 
-                const html = await page.content();
-                const detail = extractJobDetail(html);
-                const jobIndex = request.userData.jobIndex;
+        // Process details in batches for controlled concurrency
+        const batchSize = max_detail_concurrency;
+        for (let i = 0; i < jobsToFetch.length; i += batchSize) {
+            const batch = jobsToFetch.slice(i, i + batchSize);
 
-                stats.detailsFetched++;
+            await Promise.all(batch.map(async (job, batchIndex) => {
+                const jobIndex = i + batchIndex;
 
-                // Update job with details
-                if (allJobs[jobIndex]) {
-                    allJobs[jobIndex] = {
-                        ...allJobs[jobIndex],
-                        title: detail.title || allJobs[jobIndex].title,
-                        company: detail.company || allJobs[jobIndex].company,
-                        salary: detail.salary || allJobs[jobIndex].salary,
-                        date_posted: detail.date_posted || null,
-                        job_type: detail.job_type || null,
-                        description_html: detail.description_html || null,
-                        description_text: detail.description_text || null,
-                    };
+                try {
+                    const { statusCode, body } = await fetchDetailWithGot(
+                        job.url,
+                        sessionCookies,
+                        proxyUrl,
+                        sessionUserAgent
+                    );
+
+                    if (statusCode === 200 && body) {
+                        const detail = extractJobDetail(body);
+
+                        allJobs[jobIndex] = {
+                            ...allJobs[jobIndex],
+                            title: detail.title || allJobs[jobIndex].title,
+                            company: detail.company || allJobs[jobIndex].company,
+                            salary: detail.salary || allJobs[jobIndex].salary,
+                            date_posted: detail.date_posted || null,
+                            job_type: detail.job_type || null,
+                            description_html: detail.description_html || null,
+                            description_text: detail.description_text || null,
+                        };
+
+                        stats.gotSuccess++;
+                        log.debug(`⚡ [got] Fetched: ${job.url.slice(0, 60)}`);
+                    } else {
+                        // Blocked or error - add to fallback queue
+                        log.debug(`🚫 [got] Blocked (${statusCode}): ${job.url.slice(0, 50)}`);
+                        failedDetailUrls.push({ url: job.url, jobIndex });
+                        stats.gotFailed++;
+                    }
+                } catch (err) {
+                    log.debug(`❌ [got] Error: ${job.url.slice(0, 50)} - ${err.message}`);
+                    failedDetailUrls.push({ url: job.url, jobIndex });
+                    stats.gotFailed++;
                 }
-            },
-            failedRequestHandler: async ({ request }) => {
-                log.debug(`Detail failed: ${request.url.slice(0, 50)}`);
-            },
-        });
+            }));
 
-        // Run detail crawler
-        const detailRequests = allJobs.slice(0, results_wanted).map((job, i) => ({
-            url: job.url,
-            userData: { jobIndex: i },
-        }));
-        await detailCrawler.run(detailRequests);
+            // Small delay between batches
+            if (i + batchSize < jobsToFetch.length) {
+                await sleep(200 + Math.random() * 300);
+            }
+        }
+
+        log.info(`📊 got-scraping results: ${stats.gotSuccess} success, ${stats.gotFailed} need fallback`);
+
+        // ============ PLAYWRIGHT FALLBACK FOR FAILED DETAILS ============
+        if (failedDetailUrls.length > 0) {
+            log.info(`🔄 Retrying ${failedDetailUrls.length} failed details with Playwright...`);
+
+            const fallbackCrawler = new PlaywrightCrawler({
+                proxyConfiguration: proxyConfig,
+                maxConcurrency: 2,
+                navigationTimeoutSecs: 45,
+                requestHandlerTimeoutSecs: 60,
+                maxRequestRetries: 2,
+                useSessionPool: true,
+                launchContext: {
+                    launcher: firefox,
+                    launchOptions: await camoufoxLaunchOptions({
+                        headless: true,
+                        proxy: proxyUrl ? { server: proxyUrl } : undefined,
+                        geoip: true,
+                    }),
+                },
+                preNavigationHooks: [
+                    async ({ page }) => {
+                        await page.route('**/*', (route) => {
+                            const type = route.request().resourceType();
+                            if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+                            return route.continue();
+                        });
+                    },
+                ],
+                requestHandler: async ({ page, request }) => {
+                    await page.waitForLoadState('domcontentloaded');
+                    await sleep(500 + Math.random() * 500);
+
+                    const html = await page.content();
+                    const detail = extractJobDetail(html);
+                    const jobIndex = request.userData.jobIndex;
+
+                    stats.playwrightFallback++;
+
+                    if (allJobs[jobIndex]) {
+                        allJobs[jobIndex] = {
+                            ...allJobs[jobIndex],
+                            title: detail.title || allJobs[jobIndex].title,
+                            company: detail.company || allJobs[jobIndex].company,
+                            salary: detail.salary || allJobs[jobIndex].salary,
+                            date_posted: detail.date_posted || null,
+                            job_type: detail.job_type || null,
+                            description_html: detail.description_html || null,
+                            description_text: detail.description_text || null,
+                        };
+                    }
+
+                    log.debug(`✅ [Playwright] Fallback success: ${request.url.slice(0, 50)}`);
+                },
+                failedRequestHandler: async ({ request }) => {
+                    log.debug(`❌ [Playwright] Fallback failed: ${request.url.slice(0, 50)}`);
+                },
+            });
+
+            const fallbackRequests = failedDetailUrls.map(item => ({
+                url: item.url,
+                userData: { jobIndex: item.jobIndex },
+            }));
+
+            await fallbackCrawler.run(fallbackRequests);
+        }
     }
 
     // ============ SAVE RESULTS ============
@@ -369,6 +481,9 @@ await Actor.main(async () => {
         stats.jobsSaved++;
     }
 
-    log.info('🎉 Scraping completed', stats);
+    log.info('🎉 Hybrid scraping completed', {
+        ...stats,
+        summary: `${stats.gotSuccess} fast + ${stats.playwrightFallback} fallback = ${stats.jobsSaved} saved`
+    });
     await Actor.setValue('STATS', stats);
 });
