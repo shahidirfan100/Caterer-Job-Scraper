@@ -1,6 +1,6 @@
 {
   "title": "Caterer Job Scraper",
-  "description": "Scrape hospitality and catering jobs from Caterer.com. Uses hybrid Playwright + HTTP approach for maximum speed and stealth.",
+  "description": "Scrape hospitality and catering jobs from Caterer.com. Uses hybrid Cheerio + Playwright approach (no detail visits needed).",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -30,7 +30,7 @@
       "description": "The maximum number of jobs to collect.",
       "minimum": 1,
       "maximum": 500,
-      "default": 20,
+      "default": 50,
       "editor": "number"
     },
     "max_pages": {
@@ -40,16 +40,7 @@
       "minimum": 1,
       "maximum": 20,
       "editor": "number",
-      "default": 5
-    },
-    "max_detail_concurrency": {
-      "title": "Detail page concurrency",
-      "type": "integer",
-      "description": "Number of parallel requests for fetching job details. Lower = stealthier, higher = faster.",
-      "minimum": 1,
-      "maximum": 5,
-      "default": 3,
-      "editor": "number"
+      "default": 10
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",

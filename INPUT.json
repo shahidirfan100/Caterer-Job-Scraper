@@ -1,9 +1,8 @@
 {
   "keyword": "chef",
-  "location": "london",
+  "location": "",
   "results_wanted": 20,
-  "max_pages": 3,
-  "max_detail_concurrency": 3,
+  "max_pages": 2,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": [
