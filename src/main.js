@@ -1,11 +1,10 @@
-// Caterer.com Job Scraper v5.0 - Hybrid Mode
+// Caterer.com Job Scraper v5.1 - Hybrid Mode
 // Primary: Cheerio (fast HTTP) for data extraction
-// Fallback: Playwright browser only when blocked
+// Fallback: PlaywrightCrawler (proper Apify integration) when blocked
 // Batch saves all jobs from listing pages
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
-import { chromium } from 'playwright';
+import { CheerioCrawler, PlaywrightCrawler, Dataset } from 'crawlee';
 
 // ============================================================================
 // CONSTANTS
@@ -188,70 +187,6 @@ const buildStartUrl = (kw, loc) => {
 };
 
 // ============================================================================
-// PLAYWRIGHT FALLBACK (for blocked pages)
-// ============================================================================
-
-async function fetchWithPlaywright(url, proxyUrl) {
-    log.info(`🎭 Using Playwright for: ${url}`);
-
-    const launchOptions = {
-        headless: true,
-        args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
-    };
-
-    if (proxyUrl) {
-        try {
-            const proxyParsed = new URL(proxyUrl);
-            launchOptions.proxy = {
-                server: `${proxyParsed.protocol}//${proxyParsed.host}`,
-                username: proxyParsed.username,
-                password: proxyParsed.password,
-            };
-        } catch (e) {
-            log.warning('Failed to parse proxy URL:', e.message);
-        }
-    }
-
-    const browser = await chromium.launch(launchOptions);
-
-    try {
-        const context = await browser.newContext({
-            userAgent: getRandomUserAgent(),
-        });
-
-        const page = await context.newPage();
-
-        // Stealth
-        await page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
-
-        // Block heavy resources
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                return route.abort();
-            }
-            return route.continue();
-        });
-
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(2000);
-
-        // Extract state directly from browser
-        const state = await page.evaluate(() => {
-            return window.__PRELOADED_STATE__?.['app-unifiedResultlist'] || null;
-        });
-
-        await browser.close();
-        return state;
-    } catch (e) {
-        await browser.close();
-        throw e;
-    }
-}
-
-// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -259,7 +194,7 @@ async function main() {
     try {
         await Actor.init();
         log.info('═══════════════════════════════════════════════════════');
-        log.info('  Caterer.com Scraper v5.0 - Hybrid Mode');
+        log.info('  Caterer.com Scraper v5.1 - Hybrid Mode');
         log.info('═══════════════════════════════════════════════════════');
 
         const input = (await Actor.getInput()) || {};
@@ -278,12 +213,15 @@ async function main() {
         const initialUrl = startUrl || startUrls[0] || buildStartUrl(keyword, location);
         log.info(`Start URL: ${initialUrl}`);
 
-        // Setup proxy
-        let proxyConf, proxyUrl;
+        // Setup proxy - use RESIDENTIAL group for better success
+        let proxyConf;
         try {
-            const proxyConfig = input.proxyConfiguration || { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] };
+            const proxyConfig = input.proxyConfiguration || {
+                useApifyProxy: true,
+                apifyProxyGroups: ['RESIDENTIAL'],
+                apifyProxyCountry: 'GB'
+            };
             proxyConf = await Actor.createProxyConfiguration(proxyConfig);
-            proxyUrl = await proxyConf.newUrl();
             log.info('✅ Proxy ready');
         } catch (e) {
             log.warning('⚠️ Proxy failed:', e.message);
@@ -292,7 +230,7 @@ async function main() {
         // State
         let saved = 0;
         const pushedUrls = new Set();
-        const stats = { pages: 0, extracted: 0, saved: 0, playwrightUsed: 0 };
+        const stats = { pages: 0, extracted: 0, saved: 0, playwrightUsed: 0, cheerioUsed: 0 };
 
         // Process function for both Cheerio and Playwright results
         async function processJobs(state, pageNo) {
@@ -329,41 +267,66 @@ async function main() {
             return extractPagination(state);
         }
 
-        // Create Cheerio crawler
-        let crawler;
+        // Track blocked pages for Playwright fallback
         const blockedPages = [];
+        let lastPagination = null;
 
-        crawler = new CheerioCrawler({
+        // ====================================================================
+        // PHASE 1: Try CheerioCrawler first (fast HTTP)
+        // ====================================================================
+        log.info('🚀 Phase 1: Starting Cheerio crawler...');
+
+        const cheerioCrawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
             maxRequestRetries: 2,
-            maxConcurrency: 3,
+            maxConcurrency: 2,
             requestHandlerTimeoutSecs: 30,
+
+            // Use session pool for better anti-blocking
+            useSessionPool: true,
+            sessionPoolOptions: {
+                maxPoolSize: 10,
+                sessionOptions: {
+                    maxUsageCount: 5,
+                },
+            },
 
             preNavigationHooks: [
                 async ({ request }) => {
                     request.headers = {
                         'User-Agent': getRandomUserAgent(),
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
-                        'Referer': request.url.includes('page=') ? initialUrl : 'https://www.google.com/',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1',
                     };
 
-                    // Delay for pagination
-                    if (request.url.includes('page=')) {
-                        await sleep(1500 + Math.random() * 1000);
+                    // Add delay for non-first requests
+                    if (request.userData.pageNo > 1) {
+                        await sleep(2000 + Math.random() * 2000);
                     }
                 },
             ],
 
             async requestHandler({ $, request, response }) {
-                const pageNo = Number(new URL(request.url).searchParams.get('page')) || 1;
-                log.info(`📄 Page ${pageNo}: ${request.url}`);
+                const pageNo = request.userData.pageNo || 1;
+                log.info(`📄 [Cheerio] Page ${pageNo}: ${request.url}`);
 
                 // Check for blocking
-                const bodyText = $('body').text();
-                if (response.statusCode === 403 || bodyText.includes('Access Denied') || bodyText.length < 1000) {
-                    log.warning(`⚠️ Blocked on page ${pageNo}, will retry with Playwright`);
+                const bodyText = $('body').text() || '';
+                const bodyLength = bodyText.length;
+
+                if (response.statusCode === 403 ||
+                    bodyText.includes('Access Denied') ||
+                    bodyText.includes('blocked') ||
+                    bodyLength < 5000) {
+                    log.warning(`⚠️ Cheerio blocked on page ${pageNo} (status: ${response.statusCode}, body: ${bodyLength} chars)`);
                     blockedPages.push({ url: request.url, pageNo });
                     return;
                 }
@@ -376,54 +339,138 @@ async function main() {
                     return;
                 }
 
+                stats.cheerioUsed++;
                 const pagination = await processJobs(state, pageNo);
+                lastPagination = pagination;
 
-                // Enqueue next page
+                // Enqueue next page if needed
                 if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && pagination && pageNo < pagination.pageCount) {
                     const nextUrl = new URL(initialUrl);
                     nextUrl.searchParams.set('page', pageNo + 1);
-                    await crawler.addRequests([{ url: nextUrl.href }]);
+                    await cheerioCrawler.addRequests([{
+                        url: nextUrl.href,
+                        userData: { pageNo: pageNo + 1 }
+                    }]);
                     log.info(`→ Queued page ${pageNo + 1}`);
                 }
             },
 
             async failedRequestHandler({ request }) {
-                const pageNo = Number(new URL(request.url).searchParams.get('page')) || 1;
-                log.warning(`❌ Cheerio failed for page ${pageNo}, will try Playwright`);
+                const pageNo = request.userData.pageNo || 1;
+                log.warning(`❌ Cheerio failed for page ${pageNo}`);
                 blockedPages.push({ url: request.url, pageNo });
             },
         });
 
         // Run Cheerio crawler
-        log.info('🚀 Starting Cheerio crawler...');
-        await crawler.run([initialUrl]);
+        await cheerioCrawler.run([{ url: initialUrl, userData: { pageNo: 1 } }]);
 
-        // Fallback: Use Playwright for blocked pages
+        // ====================================================================
+        // PHASE 2: Use PlaywrightCrawler for blocked pages (proper Apify integration)
+        // ====================================================================
         if (blockedPages.length > 0 && saved < RESULTS_WANTED) {
-            log.info(`🎭 Retrying ${blockedPages.length} blocked page(s) with Playwright...`);
+            log.info(`🎭 Phase 2: Retrying ${blockedPages.length} blocked page(s) with Playwright...`);
 
-            for (const { url, pageNo } of blockedPages) {
-                if (saved >= RESULTS_WANTED) break;
+            const playwrightCrawler = new PlaywrightCrawler({
+                proxyConfiguration: proxyConf,
+                maxRequestRetries: 2,
+                maxConcurrency: 1,
+                navigationTimeoutSecs: 45,
+                requestHandlerTimeoutSecs: 60,
 
-                try {
+                // Use session pool
+                useSessionPool: true,
+                sessionPoolOptions: {
+                    maxPoolSize: 5,
+                },
+
+                // Browser configuration
+                launchContext: {
+                    launchOptions: {
+                        headless: true,
+                        args: [
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-dev-shm-usage',
+                            '--no-sandbox',
+                            '--disable-setuid-sandbox',
+                        ],
+                    },
+                },
+
+                // Pre-navigation hooks for stealth
+                preNavigationHooks: [
+                    async ({ page, request }) => {
+                        // Add stealth scripts
+                        await page.addInitScript(() => {
+                            // Hide webdriver
+                            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+                            // Override permissions
+                            const originalQuery = window.navigator.permissions.query;
+                            window.navigator.permissions.query = (parameters) =>
+                                parameters.name === 'notifications'
+                                    ? Promise.resolve({ state: Notification.permission })
+                                    : originalQuery(parameters);
+                        });
+
+                        // Block heavy resources to speed up
+                        await page.route('**/*', (route) => {
+                            const type = route.request().resourceType();
+                            if (['image', 'media', 'font'].includes(type)) {
+                                return route.abort();
+                            }
+                            return route.continue();
+                        });
+
+                        // Add delay
+                        await sleep(1000 + Math.random() * 1000);
+                    },
+                ],
+
+                async requestHandler({ page, request }) {
+                    const pageNo = request.userData.pageNo || 1;
+                    log.info(`🎭 [Playwright] Page ${pageNo}: ${request.url}`);
+
+                    // Wait for page to stabilize
+                    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
                     await sleep(2000);
-                    const state = await fetchWithPlaywright(url, proxyUrl);
-                    stats.playwrightUsed++;
 
-                    if (state) {
-                        const pagination = await processJobs(state, pageNo);
+                    // Try to extract state
+                    const state = await page.evaluate(() => {
+                        return window.__PRELOADED_STATE__?.['app-unifiedResultlist'] || null;
+                    });
 
-                        // If more pages needed, continue with Playwright
-                        if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && pagination && pageNo < pagination.pageCount) {
-                            const nextUrl = new URL(initialUrl);
-                            nextUrl.searchParams.set('page', pageNo + 1);
-                            blockedPages.push({ url: nextUrl.href, pageNo: pageNo + 1 });
-                        }
+                    if (!state) {
+                        log.warning(`⚠️ No state found on page ${pageNo} with Playwright`);
+                        return;
                     }
-                } catch (e) {
-                    log.error(`❌ Playwright failed for page ${pageNo}: ${e.message}`);
-                }
-            }
+
+                    stats.playwrightUsed++;
+                    const pagination = await processJobs(state, pageNo);
+
+                    // Enqueue next page if needed
+                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && pagination && pageNo < pagination.pageCount) {
+                        const nextUrl = new URL(initialUrl);
+                        nextUrl.searchParams.set('page', pageNo + 1);
+                        await playwrightCrawler.addRequests([{
+                            url: nextUrl.href,
+                            userData: { pageNo: pageNo + 1 }
+                        }]);
+                        log.info(`→ Queued page ${pageNo + 1} (Playwright)`);
+                    }
+                },
+
+                async failedRequestHandler({ request, error }) {
+                    const pageNo = request.userData.pageNo || 1;
+                    log.error(`❌ Playwright failed for page ${pageNo}: ${error.message}`);
+                },
+            });
+
+            // Run Playwright for blocked pages
+            await playwrightCrawler.run(blockedPages.map(p => ({
+                url: p.url,
+                userData: { pageNo: p.pageNo }
+            })));
         }
 
         log.info('═══════════════════════════════════════════════════════');
